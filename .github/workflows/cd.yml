@@ -1,0 +1,78 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_production:
+        description: "Also deploy production (requires environment approval)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-staging:
+    name: Deploy (staging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: staging
+    if: ${{ github.ref == 'refs/heads/main' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy (staging)
+        run: |
+          if [ -x ./infra/deploy.sh ]; then
+            ./infra/deploy.sh staging
+          else
+            echo "No ./infra/deploy.sh; skipping deploy step (template only)."
+          fi
+
+      - name: Post-deploy smoke (staging)
+        if: ${{ vars.BASE_URL != '' && vars.SMOKE_TARGET_URL != '' }}
+        run: |
+          python3 docker/e2e/smoke.py \
+            --base-url "${{ vars.BASE_URL }}" \
+            --target-url "${{ vars.SMOKE_TARGET_URL }}" \
+            --timeout 60
+
+      - name: Post-deploy smoke skipped (staging)
+        if: ${{ vars.BASE_URL == '' || vars.SMOKE_TARGET_URL == '' }}
+        run: echo "Skipping smoke: set env vars BASE_URL and SMOKE_TARGET_URL in the 'staging' environment."
+
+  deploy-production:
+    name: Deploy (production)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    needs: [deploy-staging]
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_production == 'true' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy (production)
+        run: |
+          if [ -x ./infra/deploy.sh ]; then
+            ./infra/deploy.sh production
+          else
+            echo "No ./infra/deploy.sh; skipping deploy step (template only)."
+          fi
+
+      - name: Post-deploy smoke (production)
+        if: ${{ vars.BASE_URL != '' && vars.SMOKE_TARGET_URL != '' }}
+        run: |
+          python3 docker/e2e/smoke.py \
+            --base-url "${{ vars.BASE_URL }}" \
+            --target-url "${{ vars.SMOKE_TARGET_URL }}" \
+            --timeout 60
+
+      - name: Post-deploy smoke skipped (production)
+        if: ${{ vars.BASE_URL == '' || vars.SMOKE_TARGET_URL == '' }}
+        run: echo "Skipping smoke: set env vars BASE_URL and SMOKE_TARGET_URL in the 'production' environment."

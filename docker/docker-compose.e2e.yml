@@ -1,0 +1,16 @@
+services:
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    image: local/backend:ci
+    environment:
+      DJANGO_DEBUG: "1"
+      DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1"
+      DJANGO_SECRET_KEY: "dev-only-not-a-secret"
+    ports:
+      - "${E2E_BACKEND_PORT:-8000}:8000"
+
+  test-target:
+    image: hashicorp/http-echo:1.0.0
+    command: ["-listen=:8080", "-text=hello from test-target"]
