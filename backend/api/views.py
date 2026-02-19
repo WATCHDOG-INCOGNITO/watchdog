@@ -1,166 +1,118 @@
-import uuid
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
-from rest_framework import status
+from rest_framework import status, viewsets
+from django.db import connection
 
-# =========================================================
-# ✅ 임시 메모리 저장소 (서버 재시작 시 초기화됨)
-# =========================================================
-SCAN_RUNS = {}                # run_id -> scan_run dict
-FINDINGS = {}                 # run_id -> list[finding]
-BLOBS = {}                    # blob_id -> blob dict
+from .models import (
+    ScanRun, RequestCatalog, Candidate, Finding, EvidenceBlob,
+    FindingEvidenceLink, AgentTask, VerificationLoop, Hypothesis,
+    VisualAnalysis, IDORTestSession, WAFBypassAttempt,
+    VulnerabilityEntry, PayloadPattern, ReportArchive,
+)
+from .serializers import (
+    ScanRunSerializer, RequestCatalogSerializer, CandidateSerializer,
+    FindingSerializer, EvidenceBlobSerializer, FindingEvidenceLinkSerializer,
+    AgentTaskSerializer, VerificationLoopSerializer, HypothesisSerializer,
+    VisualAnalysisSerializer, IDORTestSessionSerializer, WAFBypassAttemptSerializer,
+    VulnerabilityEntrySerializer, PayloadPatternSerializer, ReportArchiveSerializer,
+)
 
-# ✅ 선택 B 확장: 스키마 전 단계 Stub
-REQUEST_CATALOG = {}          # run_id -> list[request_item]
-CANDIDATES = {}               # run_id -> list[candidate]
-FINDING_EVIDENCE_LINKS = {}   # finding_id -> list[link]
 
-
-# =========================================================
+# ==========================================================
 # Health Check
-# =========================================================
+# ==========================================================
 @api_view(["GET"])
 def health(request):
-    return Response({"ok": True})
+    db_alive = False
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            db_alive = cursor.fetchone()[0] == 1
+    except Exception:
+        pass
+    return Response({"ok": True, "db_alive": db_alive})
 
 
-# =========================================================
-# 1. Scan Run 생성 (POST /api/scan-runs/)
-# =========================================================
+# ==========================================================
+# Scan Run
+# ==========================================================
 @api_view(["POST"])
 def create_scan_run(request):
-    run_id = str(uuid.uuid4())
-    target_url = request.data.get("target_url", "http://example.com")
-
-    SCAN_RUNS[run_id] = {
-        "run_id": run_id,
-        "target_url": target_url,
-        "status": "queued",
-        "message": "stub response: scan started"
+    data = {
+        "target_url": request.data.get("target_url", "http://example.com"),
+        "mode": request.data.get("mode", "hybrid-lite"),
+        "request_budget_total": request.data.get("request_budget_total", 10),
+        "config": request.data.get("config"),
     }
+    serializer = ScanRunSerializer(data=data)
+    serializer.is_valid(raise_exception=True)
+    scan_run = serializer.save()
 
-    # 🔹 데모용 더미 finding 1개 생성
-    FINDINGS[run_id] = [
-        {
-            "finding_id": f"F-{run_id[:8]}",
-            "title": "Dummy SQL Injection",
-            "severity": "high",
-            "confidence": 0.3,
-            "evidence_ids": []
-        }
-    ]
-
-    # 선택 B: run 생성 시 '요청 카탈로그' 더미 1개도 기본으로 넣어둠(발표 시 흐름이 자연스러움)
-    REQUEST_CATALOG.setdefault(run_id, []).append({
-        "req_id": str(uuid.uuid4()),
-        "run_id": run_id,
-        "endpoint": "/admin",
-        "method": "GET",
-        "params": {},
-        "auth_required": False,
-        "sample_request": {"headers": {}, "body": None},
-        "source": "stub",
-        "discovered_at": "stub"
-    })
-
-    # 선택 B: run 생성 시 'candidate' 더미 1개도 기본으로 넣어둠
-    CANDIDATES.setdefault(run_id, []).append({
-        "cand_id": str(uuid.uuid4()),
-        "run_id": run_id,
-        "req_id": None,
-        "type": "signal_stub",
-        "hypothesis": "Possible SQLi based on stub rule",
-        "priority_score": 0.5,
-        "required_auth_context": None,
-        "features": {
-            "signal_rules_hit": ["stub_rule_1"],
-            "llm_score": 0.12,
-            "reason_refs": []
-        },
-        "created_at": "stub"
-    })
-
-    return Response(SCAN_RUNS[run_id], status=status.HTTP_201_CREATED)
+    return Response({
+        "run_id": str(scan_run.run_id),
+        "target_url": scan_run.target_url,
+        "status": scan_run.status,
+        "message": "scan created",
+    }, status=status.HTTP_201_CREATED)
 
 
-# =========================================================
-# 2. Scan Run 상태 조회 (GET /api/scan-runs/{run_id}/)
-# =========================================================
 @api_view(["GET"])
 def get_scan_run(request, run_id: str):
-    data = SCAN_RUNS.get(run_id)
-    if not data:
+    try:
+        scan_run = ScanRun.objects.get(run_id=run_id)
+    except ScanRun.DoesNotExist:
         return Response({"error": "run_id not found"}, status=status.HTTP_404_NOT_FOUND)
-
-    # 상태가 바뀌는 척 (stub)
-    return Response({
-        "run_id": run_id,
-        "status": "running",
-        "progress": 30
-    })
+    return Response(ScanRunSerializer(scan_run).data)
 
 
-# =========================================================
-# 3. Findings 조회 (GET /api/findings/?run_id=...)
-# =========================================================
+# ==========================================================
+# Findings
+# ==========================================================
 @api_view(["GET"])
 def list_findings(request):
     run_id = request.query_params.get("run_id")
     if not run_id:
         return Response({"error": "run_id query param is required"}, status=status.HTTP_400_BAD_REQUEST)
-
+    findings = Finding.objects.filter(scan_run_id=run_id)
     return Response({
         "run_id": run_id,
-        "findings": FINDINGS.get(run_id, [])
+        "findings": FindingSerializer(findings, many=True).data,
     })
 
 
-# =========================================================
-# 4. Evidence Blob 생성 (POST /api/evidence-blobs/)
-# =========================================================
+# ==========================================================
+# Evidence Blobs
+# ==========================================================
 @api_view(["POST"])
 def create_evidence_blob(request):
-    blob_id = str(uuid.uuid4())
+    serializer = EvidenceBlobSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    blob = serializer.save()
+    return Response({
+        "blob_id": str(blob.blob_id),
+        "kind": blob.kind,
+        "storage_ref": blob.storage_ref,
+        "sha256": blob.sha256,
+        "byte_size": blob.byte_size,
+    }, status=status.HTTP_201_CREATED)
 
-    BLOBS[blob_id] = {
-        "blob_id": blob_id,
-        "kind": request.data.get("kind", "log"),
-        "storage_ref": request.data.get("storage_ref", "local://dummy"),
-        "sha256": None,
-        "byte_size": None,
-    }
 
-    return Response(BLOBS[blob_id], status=status.HTTP_201_CREATED)
-
-
-# =========================================================
-# 5. Request Catalog 생성/조회 (스키마 전 단계 Stub)
-#    - POST /api/request-catalog/
-#    - GET  /api/request-catalog/?run_id=...
-# =========================================================
+# ==========================================================
+# Request Catalog
+# ==========================================================
 @api_view(["POST"])
 def create_request_catalog_item(request):
     run_id = request.data.get("run_id")
     if not run_id:
         return Response({"error": "run_id is required"}, status=status.HTTP_400_BAD_REQUEST)
-    if run_id not in SCAN_RUNS:
+    if not ScanRun.objects.filter(run_id=run_id).exists():
         return Response({"error": "run_id not found"}, status=status.HTTP_404_NOT_FOUND)
-
-    req_id = str(uuid.uuid4())
-    item = {
-        "req_id": req_id,
-        "run_id": run_id,
-        "endpoint": request.data.get("endpoint", "/admin"),
-        "method": request.data.get("method", "GET"),
-        "params": request.data.get("params", {}),
-        "auth_required": bool(request.data.get("auth_required", False)),
-        "sample_request": request.data.get("sample_request", {"headers": {}, "body": None}),
-        "source": request.data.get("source", "stub"),
-        "discovered_at": "stub"
-    }
-
-    REQUEST_CATALOG.setdefault(run_id, []).append(item)
-    return Response(item, status=status.HTTP_201_CREATED)
+    data = request.data.copy()
+    data["scan_run"] = run_id
+    serializer = RequestCatalogSerializer(data=data)
+    serializer.is_valid(raise_exception=True)
+    serializer.save()
+    return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
 @api_view(["GET"])
@@ -168,45 +120,29 @@ def list_request_catalog(request):
     run_id = request.query_params.get("run_id")
     if not run_id:
         return Response({"error": "run_id query param is required"}, status=status.HTTP_400_BAD_REQUEST)
-
+    items = RequestCatalog.objects.filter(scan_run_id=run_id)
     return Response({
         "run_id": run_id,
-        "requests": REQUEST_CATALOG.get(run_id, [])
+        "requests": RequestCatalogSerializer(items, many=True).data,
     })
 
 
-# =========================================================
-# 6. Candidates 생성/조회 (스키마 전 단계 Stub)
-#    - POST /api/candidates/
-#    - GET  /api/candidates/?run_id=...
-# =========================================================
+# ==========================================================
+# Candidates
+# ==========================================================
 @api_view(["POST"])
 def create_candidate(request):
     run_id = request.data.get("run_id")
     if not run_id:
         return Response({"error": "run_id is required"}, status=status.HTTP_400_BAD_REQUEST)
-    if run_id not in SCAN_RUNS:
+    if not ScanRun.objects.filter(run_id=run_id).exists():
         return Response({"error": "run_id not found"}, status=status.HTTP_404_NOT_FOUND)
-
-    cand_id = str(uuid.uuid4())
-    cand = {
-        "cand_id": cand_id,
-        "run_id": run_id,
-        "req_id": request.data.get("req_id"),  # request_catalog과 연결 가능(없어도 됨)
-        "type": request.data.get("type", "signal_stub"),
-        "hypothesis": request.data.get("hypothesis", "Possible SQLi based on stub rule"),
-        "priority_score": float(request.data.get("priority_score", 0.5)),
-        "required_auth_context": request.data.get("required_auth_context"),
-        "features": request.data.get("features", {
-            "signal_rules_hit": ["stub_rule_1"],
-            "llm_score": 0.12,
-            "reason_refs": []
-        }),
-        "created_at": "stub"
-    }
-
-    CANDIDATES.setdefault(run_id, []).append(cand)
-    return Response(cand, status=status.HTTP_201_CREATED)
+    data = request.data.copy()
+    data["scan_run"] = run_id
+    serializer = CandidateSerializer(data=data)
+    serializer.is_valid(raise_exception=True)
+    serializer.save()
+    return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
 @api_view(["GET"])
@@ -214,49 +150,34 @@ def list_candidates(request):
     run_id = request.query_params.get("run_id")
     if not run_id:
         return Response({"error": "run_id query param is required"}, status=status.HTTP_400_BAD_REQUEST)
-
+    items = Candidate.objects.filter(scan_run_id=run_id)
     return Response({
         "run_id": run_id,
-        "candidates": CANDIDATES.get(run_id, [])
+        "candidates": CandidateSerializer(items, many=True).data,
     })
 
 
-# =========================================================
-# 7. Finding ↔ Evidence Link 생성/조회 (스키마 전 단계 Stub)
-#    - POST /api/finding-evidence-links/
-#    - GET  /api/finding-evidence-links/?finding_id=...
-# =========================================================
+# ==========================================================
+# Finding-Evidence Links
+# ==========================================================
 @api_view(["POST"])
 def create_finding_evidence_link(request):
     finding_id = request.data.get("finding_id")
     blob_id = request.data.get("blob_id")
     role = request.data.get("role", "supporting")
-
     if not finding_id or not blob_id:
         return Response({"error": "finding_id and blob_id are required"}, status=status.HTTP_400_BAD_REQUEST)
-
-    if blob_id not in BLOBS:
+    if not EvidenceBlob.objects.filter(blob_id=blob_id).exists():
         return Response({"error": "blob_id not found"}, status=status.HTTP_404_NOT_FOUND)
-
-    link_id = str(uuid.uuid4())
-    link = {
-        "id": link_id,
-        "finding_id": finding_id,
-        "blob_id": blob_id,
-        "role": role
-    }
-
-    FINDING_EVIDENCE_LINKS.setdefault(finding_id, []).append(link)
-
-    # (선택) finding의 evidence_ids에도 blob_id 반영하면 더 자연스러움
-    # finding이 어느 run에 속하는지 모르므로, 모든 run의 finding에서 찾아 갱신
-    for run_id, flist in FINDINGS.items():
-        for f in flist:
-            if f.get("finding_id") == finding_id:
-                if blob_id not in f.get("evidence_ids", []):
-                    f.setdefault("evidence_ids", []).append(blob_id)
-
-    return Response(link, status=status.HTTP_201_CREATED)
+    link = FindingEvidenceLink.objects.create(
+        finding_id=finding_id, blob_id=blob_id, role=role,
+    )
+    return Response({
+        "id": str(link.link_id),
+        "finding_id": str(link.finding_id),
+        "blob_id": str(link.blob_id),
+        "role": link.role,
+    }, status=status.HTTP_201_CREATED)
 
 
 @api_view(["GET"])
@@ -264,8 +185,48 @@ def list_finding_evidence_links(request):
     finding_id = request.query_params.get("finding_id")
     if not finding_id:
         return Response({"error": "finding_id query param is required"}, status=status.HTTP_400_BAD_REQUEST)
-
+    links = FindingEvidenceLink.objects.filter(finding_id=finding_id)
     return Response({
         "finding_id": finding_id,
-        "links": FINDING_EVIDENCE_LINKS.get(finding_id, [])
+        "links": FindingEvidenceLinkSerializer(links, many=True).data,
     })
+
+
+# ==========================================================
+# ViewSets (신규: /api/v1/)
+# ==========================================================
+
+class AgentTaskViewSet(viewsets.ModelViewSet):
+    queryset = AgentTask.objects.all()
+    serializer_class = AgentTaskSerializer
+    lookup_field = "task_id"
+
+
+class VerificationLoopViewSet(viewsets.ModelViewSet):
+    queryset = VerificationLoop.objects.all()
+    serializer_class = VerificationLoopSerializer
+    lookup_field = "loop_id"
+
+
+class HypothesisViewSet(viewsets.ModelViewSet):
+    queryset = Hypothesis.objects.all()
+    serializer_class = HypothesisSerializer
+    lookup_field = "hypothesis_id"
+
+
+class VulnerabilityEntryViewSet(viewsets.ModelViewSet):
+    queryset = VulnerabilityEntry.objects.all()
+    serializer_class = VulnerabilityEntrySerializer
+    lookup_field = "vuln_id"
+
+
+class PayloadPatternViewSet(viewsets.ModelViewSet):
+    queryset = PayloadPattern.objects.filter(is_active=True)
+    serializer_class = PayloadPatternSerializer
+    lookup_field = "pattern_id"
+
+
+class ReportArchiveViewSet(viewsets.ModelViewSet):
+    queryset = ReportArchive.objects.all()
+    serializer_class = ReportArchiveSerializer
+    lookup_field = "report_id"
