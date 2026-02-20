@@ -41,6 +41,35 @@ def _healthz(base: str) -> bool:
     return False
 
 
+def _extract_run_id(body: dict | str) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    if "run_id" in body:
+        return str(body["run_id"])
+    if "id" in body:
+        return str(body["id"])
+    data = body.get("data")
+    if isinstance(data, dict):
+        if "run_id" in data:
+            return str(data["run_id"])
+        if "id" in data:
+            return str(data["id"])
+    return None
+
+
+def _extract_items(body: dict | str, legacy_key: str) -> list | None:
+    if not isinstance(body, dict):
+        return None
+    if isinstance(body.get(legacy_key), list):
+        return body[legacy_key]
+    data = body.get("data")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and isinstance(data.get(legacy_key), list):
+        return data[legacy_key]
+    return None
+
+
 def _create_run(base: str, target_url: str) -> tuple[str, str] | tuple[None, None]:
     # Legacy-style API (used in early pipeline examples)
     st, body = _req(
@@ -49,13 +78,15 @@ def _create_run(base: str, target_url: str) -> tuple[str, str] | tuple[None, Non
         body={"target_url": target_url, "budget": {"max_requests": 50}},
         timeout=10,
     )
-    if st in (200, 201) and isinstance(body, dict) and "id" in body:
-        return "runs", str(body["id"])
+    run_id = _extract_run_id(body)
+    if st in (200, 201) and run_id:
+        return "runs", run_id
 
     # Django/DRF stub backend API
     st, body = _req("POST", f"{base}/api/scan-runs/", body={"target_url": target_url}, timeout=10)
-    if st in (200, 201) and isinstance(body, dict) and "run_id" in body:
-        return "scan-runs", str(body["run_id"])
+    run_id = _extract_run_id(body)
+    if st in (200, 201) and run_id:
+        return "scan-runs", run_id
 
     return None, None
 
@@ -107,9 +138,10 @@ def main(argv: list[str]) -> int:
                 print(f"GET /runs/{run_id} returned unexpected body: {run}", file=sys.stderr)
                 return 1
 
-            status = str(run.get("status", ""))
+            run_data = run.get("data") if isinstance(run.get("data"), dict) else run
+            status = str(run_data.get("status", ""))
             if status == "done":
-                result = run.get("result")
+                result = run_data.get("result")
                 if not isinstance(result, dict) or int(result.get("status_code", 0)) != 200:
                     print(f"run done but result is unexpected: {run}", file=sys.stderr)
                     return 1
@@ -127,16 +159,30 @@ def main(argv: list[str]) -> int:
             print(f"GET /api/scan-runs/{run_id}/ failed: status={st} body={run}", file=sys.stderr)
             return 1
 
-        # poll findings until at least 1 finding exists
+        # poll until at least one minimal output exists (findings or candidates)
         while time.time() < deadline:
             st, body = _req("GET", f"{base}/api/findings/?run_id={run_id}", timeout=10)
-            if st != 200 or not isinstance(body, dict):
+            if st == 200 and isinstance(body, dict):
+                findings = _extract_items(body, "findings")
+                if isinstance(findings, list) and len(findings) >= 1:
+                    return 0
+            elif st not in (0, 400, 404):
                 print(f"GET /api/findings failed: status={st} body={body}", file=sys.stderr)
                 return 1
 
-            findings = body.get("findings")
-            if isinstance(findings, list) and len(findings) >= 1:
-                return 0
+            candidate_paths = (
+                f"/api/scan-runs/{run_id}/candidates/",
+                f"/api/candidates/list/?run_id={run_id}",
+            )
+            for candidate_path in candidate_paths:
+                st, body = _req("GET", f"{base}{candidate_path}", timeout=10)
+                if st == 200 and isinstance(body, dict):
+                    candidates = _extract_items(body, "candidates")
+                    if isinstance(candidates, list) and len(candidates) >= 1:
+                        return 0
+                elif st not in (0, 400, 404):
+                    print(f"GET {candidate_path} failed: status={st} body={body}", file=sys.stderr)
+                    return 1
 
             time.sleep(args.poll_interval)
 

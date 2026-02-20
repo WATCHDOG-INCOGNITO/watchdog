@@ -1,387 +1,223 @@
-import uuid
 from django.db import models
+import uuid
 
 
-# ==========================================================
-# Scan 관련
-# ==========================================================
+class ScopePolicy(models.Model):
+    """
+    views.py stub policy dict와 키 호환을 목표로 함.
+
+    {
+      "scope_policy_id": "...uuid...",
+      "name": "...",
+      "allowed_hosts": [...],
+      "max_runs": int | None,
+      "_created_runs": int
+    }
+    """
+    scope_policy_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=100, default="default-policy")
+    allowed_hosts = models.JSONField(default=list, blank=True)
+    max_runs = models.IntegerField(null=True, blank=True)
+    created_runs = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def to_dict(self) -> dict:
+        return {
+            "scope_policy_id": str(self.scope_policy_id),
+            "name": self.name,
+            "allowed_hosts": self.allowed_hosts or [],
+            "max_runs": self.max_runs,
+            "_created_runs": int(self.created_runs or 0),
+        }
+
 
 class ScanRun(models.Model):
+    """
+    views.py stub run dict와 키 호환을 목표로 함.
+
+    {
+      "run_id": "...uuid...",
+      "target_url": "...",
+      "scope_policy_id": "...uuid..." | None,
+      "status": "running"|"success"|"failed",
+      "progress": int,
+      "error_log": [ {error_type, subtype, message}, ... ]
+    }
+    """
+
     class Status(models.TextChoices):
-        QUEUED = "queued"
         RUNNING = "running"
-        FINISHED = "finished"
+        SUCCESS = "success"
         FAILED = "failed"
 
-    class Mode(models.TextChoices):
-        HYBRID_MAX = "hybrid-max"
-        HYBRID_LITE = "hybrid-lite"
-
     run_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    target_url = models.TextField()
-    mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.HYBRID_LITE)
-    status = models.CharField(max_length=16, choices=Status.choices, default=Status.QUEUED)
-    created_at = models.DateTimeField(auto_now_add=True)
-    finished_at = models.DateTimeField(null=True, blank=True)
+    target_url = models.URLField()
 
-    request_budget_total = models.IntegerField(default=10)
-    request_budget_used = models.IntegerField(default=0)
-    llm_calls_count = models.IntegerField(default=0)
-    llm_tokens_used = models.IntegerField(default=0)
-    llm_cost_usd = models.DecimalField(max_digits=10, decimal_places=4, default=0)
+    scope_policy = models.ForeignKey(
+        ScopePolicy,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="scan_runs",
+        db_column="scope_policy_id",
+    )
 
-    config = models.JSONField(null=True, blank=True)
-    error_log = models.TextField(null=True, blank=True)
-
-    class Meta:
-        db_table = "scan_runs"
-        ordering = ["-created_at"]
-
-
-class RequestCatalog(models.Model):
-    req_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="requests")
-    endpoint = models.TextField()
-    method = models.CharField(max_length=10, default="GET")
-    params = models.JSONField(default=dict, blank=True)
-    status_code = models.IntegerField(null=True, blank=True)
-    content_type = models.CharField(max_length=128, null=True, blank=True)
-    headers = models.JSONField(null=True, blank=True)
-    body_hash = models.CharField(max_length=64, null=True, blank=True)
-    auth_required = models.BooleanField(default=False)
-    sample_request = models.JSONField(null=True, blank=True)
-    source = models.CharField(max_length=64, default="crawler")
-    discovered_from = models.TextField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.RUNNING)
+    progress = models.IntegerField(default=0)
+    error_log = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
-    class Meta:
-        db_table = "request_catalog"
+    def to_dict(self) -> dict:
+        return {
+            "run_id": str(self.run_id),
+            "target_url": self.target_url,
+            "scope_policy_id": str(self.scope_policy_id) if self.scope_policy_id else None,
+            "status": self.status,
+            "progress": int(self.progress or 0),
+            "error_log": self.error_log or [],
+        }
+
+
+# =========================================================
+# ✅ 아래부터: stub -> DB 전환용 모델들
+# =========================================================
+
+class RequestCatalogItem(models.Model):
+    """
+    run별로 발생한 HTTP 요청(시연/추후 확장용)
+    """
+    request_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    run = models.ForeignKey(
+        ScanRun,
+        on_delete=models.CASCADE,
+        related_name="request_catalog_items",
+        db_column="run_id",
+    )
+
+    method = models.CharField(max_length=16, default="GET")
+    url = models.CharField(max_length=2048, default="/")
+    headers = models.JSONField(default=dict, blank=True)
+
+    # sent_at은 지금 단계에서 None 허용
+    sent_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def to_dict(self) -> dict:
+        return {
+            "request_id": str(self.request_id),
+            "method": self.method,
+            "url": self.url,
+            "headers": self.headers or {},
+            "sent_at": self.sent_at.isoformat() if self.sent_at else None,
+        }
 
 
 class Candidate(models.Model):
-    class DetectionStage(models.TextChoices):
-        RULE = "rule"
-        LLM_SCREEN = "llm_screen"
-        LLM_DEEP = "llm_deep"
+    """
+    후보 취약점/가설(시연/추후 확장용)
+    """
+    candidate_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
-    cand_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="candidates")
-    request = models.ForeignKey(RequestCatalog, on_delete=models.SET_NULL, null=True, blank=True, related_name="candidates")
-    vuln_type = models.CharField(max_length=64, default="signal_stub")
-    hypothesis = models.TextField(null=True, blank=True)
-    priority_score = models.FloatField(default=0.0)
-    detection_stage = models.CharField(max_length=16, choices=DetectionStage.choices, default=DetectionStage.RULE)
-    required_auth_context = models.JSONField(null=True, blank=True)
-    features = models.JSONField(default=dict, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+    run = models.ForeignKey(
+        ScanRun,
+        on_delete=models.CASCADE,
+        related_name="candidates",
+        db_column="run_id",
+    )
 
-    class Meta:
-        db_table = "candidates"
-        ordering = ["-priority_score"]
-
-
-class Finding(models.Model):
-    class Severity(models.TextChoices):
-        INFO = "info"
-        LOW = "low"
-        MEDIUM = "medium"
-        HIGH = "high"
-        CRITICAL = "critical"
-
-    finding_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="findings")
-    candidate = models.ForeignKey(Candidate, on_delete=models.SET_NULL, null=True, blank=True, related_name="findings")
-    title = models.CharField(max_length=256)
-    vuln_type = models.CharField(max_length=64, null=True, blank=True)
-    severity = models.CharField(max_length=16, choices=Severity.choices, default=Severity.INFO)
+    title = models.CharField(max_length=255, default="candidate")
+    severity_raw = models.CharField(max_length=32, default="info")
     confidence = models.FloatField(default=0.0)
-    summary = models.TextField(null=True, blank=True)
-    reproduction_steps = models.TextField(null=True, blank=True)
-    llm_analysis = models.JSONField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
 
-    class Meta:
-        db_table = "findings"
+    def to_dict(self) -> dict:
+        return {
+            "candidate_id": str(self.candidate_id),
+            "title": self.title,
+            "severity_raw": self.severity_raw,
+            "confidence": float(self.confidence or 0.0),
+        }
 
 
 class EvidenceBlob(models.Model):
+    """
+    증거(로그/파일/스크린샷 등) 메타
+    storage_ref는 실제 저장소 경로/키를 가리키는 문자열
+    """
     blob_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    finding = models.ForeignKey(Finding, on_delete=models.CASCADE, null=True, blank=True, related_name="evidence_items")
-    kind = models.CharField(max_length=32, default="log")
-    storage_ref = models.TextField(default="local://dummy")
-    content = models.TextField(null=True, blank=True)
-    sha256 = models.CharField(max_length=64, null=True, blank=True)
-    byte_size = models.IntegerField(null=True, blank=True)
-    metadata = models.JSONField(null=True, blank=True)
+
+    content_type = models.CharField(max_length=255, default="text/plain")
+    storage_ref = models.CharField(max_length=2048, default="stub://storage")
+
     created_at = models.DateTimeField(auto_now_add=True)
 
-    class Meta:
-        db_table = "evidence_blobs"
+    def to_dict(self) -> dict:
+        return {
+            "blob_id": str(self.blob_id),
+            "content_type": self.content_type,
+            "storage_ref": self.storage_ref,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class Finding(models.Model):
+    """
+    확정된 취약점(시연/추후 확장용)
+    """
+    finding_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    run = models.ForeignKey(
+        ScanRun,
+        on_delete=models.CASCADE,
+        related_name="findings",
+        db_column="run_id",
+    )
+
+    title = models.CharField(max_length=255, default="finding")
+    severity_raw = models.CharField(max_length=32, default="info")
+    confidence = models.FloatField(default=0.0)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def to_dict(self) -> dict:
+        return {
+            "finding_id": str(self.finding_id),
+            "title": self.title,
+            "severity_raw": self.severity_raw,
+            "confidence": float(self.confidence or 0.0),
+        }
 
 
 class FindingEvidenceLink(models.Model):
+    """
+    finding <-> evidence 연결 테이블
+    """
     link_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    finding = models.ForeignKey(Finding, on_delete=models.CASCADE, related_name="evidence_links")
-    blob = models.ForeignKey(EvidenceBlob, on_delete=models.CASCADE, related_name="finding_links")
-    role = models.CharField(max_length=32, default="supporting")
+
+    finding = models.ForeignKey(
+        Finding,
+        on_delete=models.CASCADE,
+        related_name="evidence_links",
+        db_column="finding_id",
+    )
+
+    blob = models.ForeignKey(
+        EvidenceBlob,
+        on_delete=models.CASCADE,
+        related_name="finding_links",
+        db_column="blob_id",
+    )
+
+    role = models.CharField(max_length=64, default="evidence")
     created_at = models.DateTimeField(auto_now_add=True)
 
-    class Meta:
-        db_table = "finding_evidence_links"
-
-
-# ==========================================================
-# 다중 에이전트 / 검증 루프 / 가설
-# ==========================================================
-
-class AgentTask(models.Model):
-    class AgentType(models.TextChoices):
-        PLANNER = "planner"
-        SQLI = "sqli_agent"
-        XSS = "xss_agent"
-        IDOR = "idor_agent"
-        UPLOAD = "upload_agent"
-        SSRF = "ssrf_agent"
-
-    class TaskStatus(models.TextChoices):
-        PENDING = "pending"
-        RUNNING = "running"
-        COMPLETED = "completed"
-        FAILED = "failed"
-
-    task_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="agent_tasks")
-    assigned_agent = models.CharField(max_length=32, choices=AgentType.choices)
-    task_type = models.CharField(max_length=32)
-    target_endpoint = models.TextField(null=True, blank=True)
-    task_config = models.JSONField(null=True, blank=True)
-    status = models.CharField(max_length=16, choices=TaskStatus.choices, default=TaskStatus.PENDING)
-    result_summary = models.JSONField(null=True, blank=True)
-    parent_task = models.ForeignKey("self", on_delete=models.SET_NULL, null=True, blank=True, related_name="subtasks")
-    created_at = models.DateTimeField(auto_now_add=True)
-    completed_at = models.DateTimeField(null=True, blank=True)
-
-    class Meta:
-        db_table = "agent_tasks"
-        ordering = ["-created_at"]
-
-
-class VerificationLoop(models.Model):
-    class NextAction(models.TextChoices):
-        RETRY = "retry"
-        ESCALATE = "escalate"
-        ABORT = "abort"
-        CONFIRMED = "confirmed"
-
-    loop_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    candidate = models.ForeignKey(Candidate, on_delete=models.CASCADE, related_name="loops")
-    attempt_number = models.IntegerField(default=1)
-    payload_sent = models.TextField(null=True, blank=True)
-    response_status = models.IntegerField(null=True, blank=True)
-    response_body_hash = models.CharField(max_length=64, null=True, blank=True)
-    analysis_result = models.JSONField(null=True, blank=True)
-    next_action = models.CharField(max_length=16, choices=NextAction.choices, default=NextAction.RETRY)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "verification_loops"
-        ordering = ["candidate", "attempt_number"]
-
-
-class Hypothesis(models.Model):
-    class Result(models.TextChoices):
-        PENDING = "pending"
-        CONFIRMED = "confirmed"
-        REFUTED = "refuted"
-        INCONCLUSIVE = "inconclusive"
-
-    hypothesis_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    candidate = models.ForeignKey(Candidate, on_delete=models.CASCADE, related_name="hypotheses")
-    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="hypotheses")
-    description = models.TextField()
-    test_plan = models.JSONField(null=True, blank=True)
-    result = models.CharField(max_length=16, choices=Result.choices, default=Result.PENDING)
-    evidence_ids = models.JSONField(null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "hypotheses"
-
-
-class VisualAnalysis(models.Model):
-    analysis_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="visual_analyses")
-    page_url = models.TextField()
-    screenshot_path = models.CharField(max_length=512, null=True, blank=True)
-    identified_elements = models.JSONField(null=True, blank=True)
-    functional_inferences = models.JSONField(null=True, blank=True)
-    llm_provider = models.CharField(max_length=32, null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "visual_analysis"
-
-
-class IDORTestSession(models.Model):
-    class Verdict(models.TextChoices):
-        VULNERABLE = "vulnerable"
-        SAFE = "safe"
-        UNCERTAIN = "uncertain"
-
-    session_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="idor_sessions")
-    persona_a = models.JSONField()
-    persona_b = models.JSONField()
-    target_endpoint = models.TextField()
-    response_status = models.IntegerField(null=True, blank=True)
-    contains_sensitive_data = models.BooleanField(default=False)
-    analysis_detail = models.JSONField(null=True, blank=True)
-    verdict = models.CharField(max_length=16, choices=Verdict.choices, default=Verdict.UNCERTAIN)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "idor_test_sessions"
-
-
-class WAFBypassAttempt(models.Model):
-    class MutationType(models.TextChoices):
-        ORIGINAL = "original"
-        COMMENT_BYPASS = "comment_bypass"
-        HEX_ENCODE = "hex_encode"
-        CASE_MIX = "case_mix"
-        DOUBLE_ENCODE = "double_encode"
-        UNICODE = "unicode"
-
-    attempt_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="waf_attempts")
-    original_payload = models.TextField()
-    mutated_payload = models.TextField()
-    mutation_type = models.CharField(max_length=32, choices=MutationType.choices)
-    waf_blocked = models.BooleanField(default=True)
-    response_status = models.IntegerField(null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "waf_bypass_attempts"
-
-
-# ==========================================================
-# Knowledge DB (3종 자산)
-# ==========================================================
-
-class VulnerabilityEntry(models.Model):
-    vuln_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    cwe_id = models.CharField(max_length=16, null=True, blank=True)
-    owasp_category = models.CharField(max_length=64, null=True, blank=True)
-    title = models.CharField(max_length=256)
-    vuln_type = models.CharField(max_length=64)
-    severity_default = models.CharField(max_length=16, default="medium")
-
-    description = models.TextField(null=True, blank=True)
-    preconditions = models.TextField(null=True, blank=True)
-    impact = models.TextField(null=True, blank=True)
-    false_positive_hints = models.TextField(null=True, blank=True)
-    evidence_points = models.TextField(null=True, blank=True)
-
-    affected_components = models.JSONField(null=True, blank=True)
-    references = models.JSONField(null=True, blank=True)
-    tags = models.JSONField(null=True, blank=True)
-
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "vulnerability_entries"
-
-
-class PayloadPattern(models.Model):
-    class SafetyLevel(models.TextChoices):
-        SAFE = "safe"
-        CAUTIOUS = "cautious"
-        DESTRUCTIVE = "destructive"
-
-    pattern_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    vulnerability = models.ForeignKey(VulnerabilityEntry, on_delete=models.SET_NULL, null=True, blank=True, related_name="patterns")
-    name = models.CharField(max_length=256)
-    vuln_type = models.CharField(max_length=64)
-    category = models.CharField(max_length=64, default="detection")
-
-    request_template = models.TextField(null=True, blank=True)
-    matcher = models.JSONField(null=True, blank=True)
-    safety_notes = models.TextField(null=True, blank=True)
-
-    safety_level = models.CharField(max_length=16, choices=SafetyLevel.choices, default=SafetyLevel.SAFE)
-    request_cost = models.IntegerField(default=1)
-    requires_auth = models.BooleanField(default=False)
-    target_context = models.JSONField(null=True, blank=True)
-
-    mutation_type = models.CharField(max_length=32, default="original")
-    parent_pattern = models.ForeignKey("self", on_delete=models.SET_NULL, null=True, blank=True, related_name="mutations")
-
-    times_used = models.IntegerField(default=0)
-    times_succeeded = models.IntegerField(default=0)
-    false_positive_count = models.IntegerField(default=0)
-    avg_llm_cost = models.DecimalField(max_digits=10, decimal_places=4, default=0)
-    is_gold = models.BooleanField(default=False)
-    is_active = models.BooleanField(default=True)
-
-    source = models.CharField(max_length=64, null=True, blank=True)
-    tags = models.JSONField(null=True, blank=True)
-
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "payload_patterns"
-
-    @property
-    def success_rate(self):
-        return self.times_succeeded / self.times_used if self.times_used else 0.0
-
-    @property
-    def fp_rate(self):
-        return self.false_positive_count / self.times_used if self.times_used else 0.0
-
-
-class ReportArchive(models.Model):
-    class ValidationStatus(models.TextChoices):
-        UNVERIFIED = "unverified"
-        VERIFIED = "verified"
-        DISPUTED = "disputed"
-        DUPLICATE = "duplicate"
-
-    report_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    source = models.CharField(max_length=64)
-    source_id = models.CharField(max_length=128, null=True, blank=True)
-    source_url = models.TextField(null=True, blank=True)
-    title = models.CharField(max_length=512)
-    vuln_type = models.CharField(max_length=64, null=True, blank=True)
-    severity = models.CharField(max_length=16, null=True, blank=True)
-    target_program = models.CharField(max_length=256, null=True, blank=True)
-
-    reproduction_steps = models.TextField(null=True, blank=True)
-    evidence_summary = models.TextField(null=True, blank=True)
-    env_conditions = models.TextField(null=True, blank=True)
-    triage_comments = models.TextField(null=True, blank=True)
-
-    has_public_poc = models.BooleanField(default=False)
-    poc_urls = models.JSONField(null=True, blank=True)
-    poc_code_stored = models.BooleanField(default=False)
-    poc_hash = models.CharField(max_length=64, null=True, blank=True)
-
-    validation_status = models.CharField(max_length=32, choices=ValidationStatus.choices, default=ValidationStatus.UNVERIFIED)
-    bounty_amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    disclosed_at = models.DateTimeField(null=True, blank=True)
-    resolved_at = models.DateTimeField(null=True, blank=True)
-    severity_history = models.JSONField(null=True, blank=True)
-    lifecycle_events = models.JSONField(null=True, blank=True)
-    attachments = models.JSONField(null=True, blank=True)
-    tags = models.JSONField(null=True, blank=True)
-    references = models.JSONField(null=True, blank=True)
-
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "report_archives"
-        unique_together = [("source", "source_id")]
+    def to_dict(self) -> dict:
+        return {
+            "link_id": str(self.link_id),
+            "finding_id": str(self.finding_id),
+            "blob_id": str(self.blob_id),
+            "role": self.role,
+        }
