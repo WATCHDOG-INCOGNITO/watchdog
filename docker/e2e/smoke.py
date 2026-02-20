@@ -29,7 +29,7 @@ def _req(method: str, url: str, *, body: dict | None = None, timeout: int = 10) 
             return int(e.code), json.loads(raw.decode("utf-8"))
         except Exception:
             return int(e.code), raw.decode("utf-8", errors="replace")
-    except urllib.error.URLError as e:
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
         return 0, str(e)
 
 
