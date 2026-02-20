@@ -35,6 +35,8 @@ services:
       DB_PASSWORD: "${E2E_DB_PASSWORD:-bugbounty123}"
       DB_HOST: "db"
       DB_PORT: "5432"
+      CELERY_TASK_ALWAYS_EAGER: "1"
+      CELERY_TASK_EAGER_PROPAGATES: "1"
     ports:
       - "${E2E_BACKEND_PORT:-8000}:8000"
 
