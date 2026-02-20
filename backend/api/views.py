@@ -47,6 +47,15 @@ def create_scan_run(request):
     serializer = ScanRunSerializer(data=data)
     serializer.is_valid(raise_exception=True)
     scan_run = serializer.save()
+    # Keep smoke tests stable until real agent-produced findings are wired in.
+    Finding.objects.create(
+        scan_run=scan_run,
+        title="Stub finding: pipeline wiring check",
+        vuln_type="signal_stub",
+        severity=Finding.Severity.INFO,
+        confidence=0.5,
+        summary="Auto-created placeholder finding for E2E smoke verification.",
+    )
 
     return Response({
         "run_id": str(scan_run.run_id),

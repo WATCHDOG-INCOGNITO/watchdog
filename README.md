@@ -4,7 +4,7 @@ Watchdog는 “버그바운티 AI Agent” 형태의 시스템을 만들기 위�
 
 ## 구성(현재)
 
-- `backend/`: Django + DRF 기반 Stub API (메모리 저장, 재시작 시 초기화)
+- `backend/`: Django + DRF 기반 API (PostgreSQL 저장)
 - `agent/`: 에이전트 영역 (WIP)
 - `docker/`: 로컬 E2E docker compose + smoke 스크립트
 - `infra/`: CI/CD 권장안 및 GitHub Environments 운영 가이드
@@ -12,7 +12,7 @@ Watchdog는 “버그바운티 AI Agent” 형태의 시스템을 만들기 위�
 ## 동작 흐름(현재)
 
 1. 클라이언트/에이전트가 `POST /api/scan-runs/`로 run을 생성한다.
-2. 백엔드는 run을 메모리에 저장하고, 데모용 더미 finding을 1개 생성한다.
+2. 백엔드는 run을 PostgreSQL에 저장하고, 데모용 더미 finding을 1개 생성한다.
 3. `GET /api/scan-runs/{run_id}/`, `GET /api/findings/?run_id=...`로 최소 결과를 확인한다.
 
 API 계약 및 예시는 `backend/API_CONTRACT.md` 참고.
@@ -26,6 +26,7 @@ cd backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python manage.py migrate
 python manage.py runserver 0.0.0.0:8000
 ```
 
@@ -37,7 +38,7 @@ curl -sf http://localhost:8000/health/
 
 ### 2) E2E smoke (Docker Compose)
 
-백엔드 + 테스트 타겟 컨테이너를 띄우고 “run 생성 → 더미 결과 생성” 최소 동작을 확인한다.
+PostgreSQL + 백엔드 + 테스트 타겟 컨테이너를 띄우고 “run 생성 → 더미 결과 생성” 최소 동작을 확인한다.
 
 ```bash
 docker compose -f docker/docker-compose.e2e.yml up -d --build
@@ -65,4 +66,3 @@ docker compose -f docker/docker-compose.e2e.yml down -v
   - 배포 후 smoke(환경 변수 `BASE_URL`, `SMOKE_TARGET_URL` 설정 시)
 
 자세한 운영/설정은 `infra/readme.md` 참고.
-

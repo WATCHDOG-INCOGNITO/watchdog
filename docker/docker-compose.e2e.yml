@@ -1,16 +1,46 @@
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: "${E2E_DB_NAME:-bugbounty_agent}"
+      POSTGRES_USER: "${E2E_DB_USER:-bugbounty}"
+      POSTGRES_PASSWORD: "${E2E_DB_PASSWORD:-bugbounty123}"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${E2E_DB_USER:-bugbounty} -d ${E2E_DB_NAME:-bugbounty_agent}",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - e2e_pg_data:/var/lib/postgresql/data
+
   backend:
     build:
       context: ../backend
       dockerfile: Dockerfile
     image: local/backend:ci
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["sh", "-c", "python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:8000"]
     environment:
       DJANGO_DEBUG: "1"
       DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1"
       DJANGO_SECRET_KEY: "dev-only-not-a-secret"
+      DB_NAME: "${E2E_DB_NAME:-bugbounty_agent}"
+      DB_USER: "${E2E_DB_USER:-bugbounty}"
+      DB_PASSWORD: "${E2E_DB_PASSWORD:-bugbounty123}"
+      DB_HOST: "db"
+      DB_PORT: "5432"
     ports:
       - "${E2E_BACKEND_PORT:-8000}:8000"
 
   test-target:
     image: hashicorp/http-echo:1.0.0
     command: ["-listen=:8080", "-text=hello from test-target"]
+
+volumes:
+  e2e_pg_data:

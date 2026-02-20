@@ -43,10 +43,16 @@ API 계약은 `backend/API_CONTRACT.md` 참고.
 ## 빠른 실행 (Docker Compose)
 
 ```bash
-docker compose up -d
+docker compose -f docker/docker-compose.e2e.yml up -d --build
 ```
 
 PostgreSQL 컨테이너가 먼저 뜨고, healthcheck 통과 후 Django가 자동으로 migrate + 서버 시작한다.
+
+종료:
+
+```bash
+docker compose -f docker/docker-compose.e2e.yml down -v
+```
 
 헬스체크:
 
