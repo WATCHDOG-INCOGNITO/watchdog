@@ -7,3 +7,5 @@
 ## Backend 연동(초안)
 
 백엔드 엔드포인트 및 응답 형태는 `backend/API_CONTRACT.md`와 `backend/readme.md`를 기준으로 한다.
+
+test
