@@ -1,6 +1,6 @@
 # Watchdog Backend (Django/DRF)
 
-`backend/`는 버그바운티 AI 에이전트의 백엔드 API이다.
+`backend/backend/`는 버그바운티 AI 에이전트의 백엔드 API이다.
 PostgreSQL + Django ORM 기반으로 데이터가 영구 저장된다.
 
 ## 기술 스택
@@ -30,7 +30,7 @@ PostgreSQL + Django ORM 기반으로 데이터가 영구 저장된다.
 - `CRUD /api/v1/patterns/`
 - `CRUD /api/v1/report-archives/`
 
-API 계약은 `backend/API_CONTRACT.md` 참고.
+API 계약은 `backend/backend/API_CONTRACT.md` 참고.
 
 ## DB 테이블 (15개)
 
@@ -43,10 +43,16 @@ API 계약은 `backend/API_CONTRACT.md` 참고.
 ## 빠른 실행 (Docker Compose)
 
 ```bash
-docker compose up -d
+docker compose -f docker/docker-compose.e2e.yml up -d --build
 ```
 
 PostgreSQL 컨테이너가 먼저 뜨고, healthcheck 통과 후 Django가 자동으로 migrate + 서버 시작한다.
+
+종료:
+
+```bash
+docker compose -f docker/docker-compose.e2e.yml down -v
+```
 
 헬스체크:
 
@@ -60,7 +66,7 @@ curl -sf http://localhost:8000/health/
 PostgreSQL이 로컬에 설치되어 있어야 한다.
 
 ```bash
-cd backend
+cd backend/backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt

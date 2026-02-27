@@ -4,7 +4,7 @@ Watchdog는 “버그바운티 AI Agent” 형태의 시스템을 만들기 위�
 
 ## 구성(현재)
 
-- `backend/`: Django + DRF 기반 API (PostgreSQL 저장)
+- `backend/backend/`: Django + DRF 기반 API (PostgreSQL 저장)
 - `agent/`: 에이전트 영역 (WIP)
 - `docker/`: 로컬 E2E docker compose + smoke 스크립트
 - `infra/`: CI/CD 권장안 및 GitHub Environments 운영 가이드
@@ -15,14 +15,14 @@ Watchdog는 “버그바운티 AI Agent” 형태의 시스템을 만들기 위�
 2. 백엔드는 run을 PostgreSQL에 저장하고, 데모용 더미 finding을 1개 생성한다.
 3. `GET /api/scan-runs/{run_id}/`, `GET /api/findings/?run_id=...`로 최소 결과를 확인한다.
 
-API 계약 및 예시는 `backend/API_CONTRACT.md` 참고.
+API 계약 및 예시는 `backend/backend/API_CONTRACT.md` 참고.
 
 ## 실행 방법
 
 ### 1) 백엔드 로컬 실행 (Python)
 
 ```bash
-cd backend
+cd backend/backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
