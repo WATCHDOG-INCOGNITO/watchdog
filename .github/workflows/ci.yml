@@ -16,16 +16,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Secret scan (gitleaks)
-        uses: gitleaks/gitleaks-action@v2
-        continue-on-error: false
+      - name: Secret scan (gitleaks OSS)
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo" \
+            -w /repo \
+            zricethezav/gitleaks:v8.24.2 \
+            git --no-banner --redact --verbose
 
       - name: Build image (backend)
-        run: docker build -t local/backend:ci -f backend/Dockerfile backend
+        run: docker build -t local/backend:ci -f backend/backend/Dockerfile backend/backend
 
       - name: Trivy image scan (fail on HIGH/CRITICAL)
         uses: aquasecurity/trivy-action@0.24.0

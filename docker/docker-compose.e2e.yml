@@ -19,7 +19,7 @@ services:
 
   backend:
     build:
-      context: ../backend
+      context: ../backend/backend
       dockerfile: Dockerfile
     image: local/backend:ci
     depends_on:

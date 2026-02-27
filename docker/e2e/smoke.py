@@ -91,6 +91,21 @@ def _create_run(base: str, target_url: str) -> tuple[str, str] | tuple[None, Non
     return None, None
 
 
+def _start_scan(base: str, run_id: str) -> bool:
+    st, body = _req("POST", f"{base}/api/scan-runs/{run_id}/start/", body={}, timeout=10)
+    if st in (200, 201):
+        return True
+    if st == 400 and isinstance(body, dict):
+        msg = str(body.get("error", ""))
+        if "already" in msg:
+            return True
+    if st == 404:
+        return False
+    if st == 0:
+        return False
+    return False
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(
         description=(
@@ -159,6 +174,8 @@ def main(argv: list[str]) -> int:
             print(f"GET /api/scan-runs/{run_id}/ failed: status={st} body={run}", file=sys.stderr)
             return 1
 
+        _start_scan(base, run_id)
+
         # poll until at least one minimal output exists (findings or candidates)
         while time.time() < deadline:
             st, body = _req("GET", f"{base}/api/findings/?run_id={run_id}", timeout=10)
@@ -182,6 +199,20 @@ def main(argv: list[str]) -> int:
                         return 0
                 elif st not in (0, 400, 404):
                     print(f"GET {candidate_path} failed: status={st} body={body}", file=sys.stderr)
+                    return 1
+
+            request_paths = (
+                f"/api/request-catalog/list/?run_id={run_id}",
+                f"/api/scan-runs/{run_id}/request-catalog/",
+            )
+            for request_path in request_paths:
+                st, body = _req("GET", f"{base}{request_path}", timeout=10)
+                if st == 200 and isinstance(body, dict):
+                    requests = _extract_items(body, "requests")
+                    if isinstance(requests, list) and len(requests) >= 1:
+                        return 0
+                elif st not in (0, 400, 404):
+                    print(f"GET {request_path} failed: status={st} body={body}", file=sys.stderr)
                     return 1
 
             time.sleep(args.poll_interval)

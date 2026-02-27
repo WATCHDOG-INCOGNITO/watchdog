@@ -16,7 +16,7 @@
 - 로컬 테스트 타겟(테스트용) 컨테이너를 띄우고
 - runner가 “run 생성 → 최소 결과 생성”을 확인(타임아웃 포함)
 
-이 리포의 백엔드(`backend/`)는 Django/DRF 기반의 Stub API 구현이며, E2E smoke는 아래 최소 흐름을 검증한다.
+이 리포의 백엔드(`backend/backend/`)는 Django/DRF 기반의 Stub API 구현이며, E2E smoke는 아래 최소 흐름을 검증한다.
 
 - Health check
 - Scan Run 생성
