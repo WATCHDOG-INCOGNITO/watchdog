@@ -44,6 +44,10 @@ urlpatterns = [
     path("api/findings/<str:finding_id>/detail/", views.finding_detail),
     path("api/scan-runs/<str:run_id>/summary/", views.scan_findings_summary),
 
+    # LLM 분석
+    path("api/scan-runs/<str:run_id>/llm-analyze/", views.llm_analyze_candidates),
+    path("api/llm/analyze/", views.llm_analyze_single),
+
     # ViewSets
     path("api/v1/", include(router.urls)),
 ]

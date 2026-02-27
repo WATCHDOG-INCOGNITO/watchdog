@@ -322,3 +322,44 @@ def scan_findings_summary(request, run_id: str):
     from .storage_service import get_scan_findings_summary
     result = get_scan_findings_summary(run_id=run_id)
     return Response(result)
+
+
+# ==========================================================
+# LLM 분석 API
+# ==========================================================
+
+@api_view(["POST"])
+def llm_analyze_candidates(request, run_id: str):
+    """특정 스캔의 candidate를 Claude로 분석"""
+    try:
+        scan_run = ScanRun.objects.get(run_id=run_id)
+    except ScanRun.DoesNotExist:
+        return Response({"error": "run_id not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    max_candidates = request.data.get("max_candidates", 10)
+
+    from .services import run_llm_screen
+    import os
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return Response({"error": "ANTHROPIC_API_KEY not set"}, status=status.HTTP_400_BAD_REQUEST)
+
+    thread = threading.Thread(target=run_llm_screen, args=(scan_run, max_candidates), daemon=True)
+    thread.start()
+
+    return Response({
+        "run_id": str(run_id),
+        "message": "LLM analysis started",
+        "max_candidates": max_candidates,
+    })
+
+
+@api_view(["POST"])
+def llm_analyze_single(request):
+    """단일 candidate를 Claude로 분석 (즉시 응답)"""
+    import os
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return Response({"error": "ANTHROPIC_API_KEY not set"}, status=status.HTTP_400_BAD_REQUEST)
+
+    from .llm_router import analyze_candidate
+    result = analyze_candidate(request.data)
+    return Response(result)
