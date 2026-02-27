@@ -184,7 +184,7 @@ def run_rule_filter(scan_run: ScanRun):
 
 
 def run_scan(scan_run: ScanRun):
-    """전체 스캔 파이프라인 (크롤링 → 필터링)"""
+    """전체 스캔 파이프라인 (크롤링 → 필터링 → LLM 분석)"""
     try:
         scan_run.status = "running"
         scan_run.save(update_fields=["status"])
@@ -195,7 +195,10 @@ def run_scan(scan_run: ScanRun):
         # 2. 규칙 기반 필터링
         run_rule_filter(scan_run)
 
-        # 3. 완료
+        # 3. LLM 분석 (2단계: llm_screen)
+        run_llm_screen(scan_run)
+
+        # 4. 완료
         scan_run.status = "finished"
         scan_run.finished_at = timezone.now()
         scan_run.save(update_fields=["status", "finished_at"])
@@ -208,3 +211,90 @@ def run_scan(scan_run: ScanRun):
         scan_run.save(update_fields=["status", "error_log"])
         logger.error(f"[{scan_run.run_id}] 스캔 실패: {e}")
         raise
+
+
+def run_llm_screen(scan_run: ScanRun, max_candidates=10):
+    """
+    규칙 기반으로 뽑힌 candidate 중 상위 N개를 Claude로 분석한다.
+    결과에 따라 candidate의 detection_stage, priority_score, features를 업데이트.
+    """
+    import os
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        logger.warning(f"[{scan_run.run_id}] ANTHROPIC_API_KEY 없음, LLM 분석 건너뜀")
+        return
+
+    from .llm_router import batch_analyze_candidates
+
+    logger.info(f"[{scan_run.run_id}] LLM 스크리닝 시작")
+
+    # priority 높은 순으로 candidate 가져오기
+    candidates = Candidate.objects.filter(
+        scan_run=scan_run,
+        detection_stage="rule",
+        status="open",
+    ).select_related("request").order_by("-priority_score")[:max_candidates]
+
+    if not candidates:
+        logger.info(f"[{scan_run.run_id}] 분석할 candidate 없음")
+        return
+
+    # candidate → dict 변환
+    cand_data_list = []
+    cand_objects = []
+    for cand in candidates:
+        cand_data_list.append({
+            "endpoint": cand.request.endpoint if cand.request else "/",
+            "method": cand.request.method if cand.request else "GET",
+            "params": cand.request.params if cand.request else {},
+            "vuln_type": cand.vuln_type,
+            "hypothesis": cand.hypothesis,
+            "features": cand.features,
+        })
+        cand_objects.append(cand)
+
+    # Claude 분석
+    results = batch_analyze_candidates(cand_data_list, max_count=max_candidates)
+
+    # 결과 반영
+    total_tokens = 0
+    for result, cand in zip(results, cand_objects):
+        risk = result.get("risk_level", "unknown")
+        action = result.get("next_action", "escalate")
+        llm_confidence = result.get("confidence", 0.0)
+
+        # detection_stage 업데이트
+        cand.detection_stage = "llm_screen"
+
+        # LLM 분석 결과를 features에 추가
+        cand.features["llm_analysis"] = {
+            "risk_level": risk,
+            "confidence": llm_confidence,
+            "analysis": result.get("analysis", ""),
+            "suggested_payloads": result.get("suggested_payloads", []),
+            "next_action": action,
+            "reasoning": result.get("reasoning", ""),
+        }
+
+        # priority_score 재계산 (규칙 점수 + LLM 점수 가중 평균)
+        rule_score = cand.priority_score
+        cand.priority_score = (rule_score * 0.4) + (llm_confidence * 0.6)
+
+        # dismiss 판정이면 상태 변경
+        if action == "dismiss" or risk == "none":
+            cand.status = "false_positive"
+
+        cand.save(update_fields=["detection_stage", "features", "priority_score", "status"])
+
+        usage = result.get("_usage", {})
+        total_tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+
+    # LLM 비용 기록
+    from decimal import Decimal
+    scan_run.llm_calls_count += len(results)
+    scan_run.llm_tokens_used += total_tokens
+    # 대략적 비용 계산 (Sonnet 기준: input $3/MTok, output $15/MTok)
+    scan_run.llm_cost_usd += Decimal(str(round(total_tokens * 0.005 / 1000, 4)))
+    scan_run.save(update_fields=["llm_calls_count", "llm_tokens_used", "llm_cost_usd"])
+
+    logger.info(f"[{scan_run.run_id}] LLM 스크리닝 완료: "
+                f"{len(results)}개 분석, {total_tokens} tokens")

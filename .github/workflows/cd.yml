@@ -43,8 +43,7 @@ jobs:
 
       - name: Post-deploy smoke skipped (staging)
         if: ${{ vars.BASE_URL == '' || vars.SMOKE_TARGET_URL == '' }}
-        run: |
-          echo "Skipping smoke: set env vars BASE_URL and SMOKE_TARGET_URL in the 'staging' environment."
+        run: echo "Skipping smoke: set env vars BASE_URL and SMOKE_TARGET_URL in the 'staging' environment."
 
   deploy-production:
     name: Deploy (production)
@@ -76,5 +75,4 @@ jobs:
 
       - name: Post-deploy smoke skipped (production)
         if: ${{ vars.BASE_URL == '' || vars.SMOKE_TARGET_URL == '' }}
-        run: |
-          echo "Skipping smoke: set env vars BASE_URL and SMOKE_TARGET_URL in the 'production' environment."
+        run: echo "Skipping smoke: set env vars BASE_URL and SMOKE_TARGET_URL in the 'production' environment."
