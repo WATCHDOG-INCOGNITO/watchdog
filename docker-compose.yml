@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bugbounty_agent
+      POSTGRES_USER: bugbounty
+      POSTGRES_PASSWORD: bugbounty123
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bugbounty -d bugbounty_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build: ./backend/backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DJANGO_SECRET_KEY: "change-this-in-production"
+      DJANGO_DEBUG: "1"
+      DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1,0.0.0.0"
+      DB_NAME: bugbounty_agent
+      DB_USER: bugbounty
+      DB_PASSWORD: bugbounty123
+      DB_HOST: db
+      DB_PORT: "5432"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py runserver 0.0.0.0:8000"
+
+volumes:
+  pgdata:
