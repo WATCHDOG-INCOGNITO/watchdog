@@ -1,5 +1,9 @@
 import threading
 
+
+from django.http import JsonResponse, HttpResponse
+from .reporting import build_report, serialize_report_json, serialize_report_md
+
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status, viewsets
@@ -9,7 +13,7 @@ from .models import (
     ScanRun, RequestCatalog, Candidate, Finding, EvidenceBlob,
     FindingEvidenceLink, AgentTask, VerificationLoop, Hypothesis,
     VisualAnalysis, IDORTestSession, WAFBypassAttempt,
-    VulnerabilityEntry, PayloadPattern, ReportArchive,
+    VulnerabilityEntry, PayloadPattern, ReportArchive, RunReport,
 )
 from .serializers import (
     ScanRunSerializer, RequestCatalogSerializer, CandidateSerializer,
@@ -363,3 +367,53 @@ def llm_analyze_single(request):
     from .llm_router import analyze_candidate
     result = analyze_candidate(request.data)
     return Response(result)
+
+@api_view(["GET", "POST"])
+def scan_run_report(request, run_id):
+    """
+    POST /api/scan-runs/{run_id}/report/  -> generate & store
+    GET  /api/scan-runs/{run_id}/report/?format=json|md -> fetch stored
+    """
+    run_id = str(run_id)
+
+    if request.method == "POST":
+        report = build_report(run_id)
+        json_text = serialize_report_json(report)
+        md_text = serialize_report_md(report)
+
+        scan_run = ScanRun.objects.get(run_id=run_id)
+        rr, _ = RunReport.objects.update_or_create(
+            scan_run=scan_run,
+            defaults={"json": json_text, "markdown": md_text},
+        )
+
+        return Response(
+            {
+                "run_id": run_id,
+                "report_id": str(rr.report_id),
+                "created_at": rr.created_at.isoformat() if rr.created_at else None,
+                "updated_at": rr.updated_at.isoformat() if rr.updated_at else None,
+                "message": "report generated",
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    # GET
+    rr = RunReport.objects.filter(scan_run__run_id=run_id).order_by("-updated_at").first()
+    if not rr:
+        return Response(
+            {"detail": "report not generated yet. POST this endpoint first."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    fmt = (request.query_params.get("export") or request.query_params.get("out") or "json").lower().strip()
+
+    # ✅ md는 여기서 무조건 처리
+    # if fmt in ("md", "markdown"):
+    #     return HttpResponse(rr.markdown, content_type="text/markdown; charset=utf-8")
+    if fmt in ("md", "markdown"):
+        return HttpResponse(rr.markdown, content_type="text/markdown; charset=utf-8")
+    return HttpResponse(rr.json, content_type="application/json; charset=utf-8")
+
+    # ✅ json 기본
+    return HttpResponse(rr.json, content_type="application/json; charset=utf-8")
