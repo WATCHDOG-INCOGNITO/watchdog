@@ -152,3 +152,44 @@ POST /api/v1/patterns/
 }
 
 응답에 success_rate, fp_rate가 자동 계산되어 포함된다.
+
+---
+
+### Scan Run Report (P5)
+
+설명
+- run_id 기준으로 리포트를 생성/저장하고, 저장된 리포트를 JSON/Markdown으로 조회한다.
+
+1) Report 생성 (Generate & Store)
+Request
+POST /api/scan-runs/{run_id}/report/
+Content-Type
+application/json
+
+Body
+{}
+
+Success Response (201)
+{
+  "run_id": "<run_id>",
+  "report_id": "<uuid>",
+  "created_at": "<iso8601>",
+  "updated_at": "<iso8601>",
+  "message": "report generated"
+}
+
+2) Report 조회 (JSON 기본)
+Request
+GET /api/scan-runs/{run_id}/report/
+
+Success Response (200)
+- Content-Type: application/json
+- Body: report.json (예: run_id, target_url, status, generated_at, candidates, findings, evidence ...)
+
+3) Report 조회 (Markdown)
+Request
+GET /api/scan-runs/{run_id}/report/?export=md
+
+Success Response (200)
+- Content-Type: text/markdown
+- Body: report.md
