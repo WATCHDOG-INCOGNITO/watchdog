@@ -21,6 +21,7 @@ urlpatterns = [
 
     # Findings
     path("api/findings/", views.list_findings),
+    path("api/findings/<str:finding_id>/", views.get_finding),
 
     # Evidence Blobs
     path("api/evidence-blobs/", views.create_evidence_blob),

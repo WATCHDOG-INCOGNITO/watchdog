@@ -103,6 +103,13 @@ def list_findings(request):
         "findings": FindingSerializer(findings, many=True).data,
     })
 
+@api_view(["GET"])
+def get_finding(request, finding_id: str):
+    try:
+        finding = Finding.objects.get(finding_id=finding_id)
+    except Finding.DoesNotExist:
+        return Response({"error": "finding_id not found"}, status=status.HTTP_404_NOT_FOUND)
+    return Response(FindingSerializer(finding).data)
 
 # ==========================================================
 # Evidence Blobs
