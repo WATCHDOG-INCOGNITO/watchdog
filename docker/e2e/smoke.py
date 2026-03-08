@@ -237,6 +237,10 @@ def main(argv: list[str]) -> int:
 
         # poll until at least one minimal output exists (findings or candidates or request-catalog)
         while time.time() < deadline:
+            has_findings = False
+            has_candidates = False
+            has_requests = False
+
             # 1) findings
             st, body = _req("GET", f"{base}/api/findings/?run_id={run_id}", timeout=10)
             if st == 200 and isinstance(body, dict):
@@ -276,6 +280,11 @@ def main(argv: list[str]) -> int:
                 elif st not in (0, 400, 404):
                     print(f"GET {request_path} failed: status={st} body={body}", file=sys.stderr)
                     return 1
+                
+            # P5 stricter condition:
+            # request가 있고, 후보 또는 finding까지 있어야 report 단계로 진행
+            if has_requests and (has_candidates or has_findings):
+                return 0 if _check_report(base, run_id, deadline, args.poll_interval) else 1
 
             time.sleep(args.poll_interval)
 
