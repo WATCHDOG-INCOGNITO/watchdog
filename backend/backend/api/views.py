@@ -363,3 +363,60 @@ def llm_analyze_single(request):
     from .llm_router import analyze_candidate
     result = analyze_candidate(request.data)
     return Response(result)
+
+
+# ==========================================================
+# Verification API (검증 루프)
+# ==========================================================
+
+@api_view(["POST"])
+def start_verification(request, run_id: str):
+    """스캔의 candidate들을 검증 (실제 페이로드 전송)"""
+    try:
+        scan_run = ScanRun.objects.get(run_id=run_id)
+    except ScanRun.DoesNotExist:
+        return Response({"error": "run_id not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    max_candidates = request.data.get("max_candidates", 5)
+    min_confidence = request.data.get("min_confidence", 0.3)
+
+    from .verifier import run_verification_for_scan
+    thread = threading.Thread(
+        target=run_verification_for_scan,
+        args=(scan_run,),
+        kwargs={"max_candidates": max_candidates, "min_confidence": min_confidence},
+        daemon=True,
+    )
+    thread.start()
+
+    return Response({
+        "run_id": str(run_id),
+        "message": "verification started",
+        "max_candidates": max_candidates,
+    })
+
+
+@api_view(["POST"])
+def verify_single_candidate(request, cand_id: str):
+    """단일 candidate를 즉시 검증 (동기)"""
+    try:
+        candidate = Candidate.objects.select_related("scan_run", "request").get(cand_id=cand_id)
+    except Candidate.DoesNotExist:
+        return Response({"error": "candidate not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    if candidate.status not in ("open", "verifying"):
+        return Response({"error": f"candidate status is '{candidate.status}'"}, status=status.HTTP_400_BAD_REQUEST)
+
+    from .verifier import run_verification_loop
+    result = run_verification_loop(candidate, candidate.scan_run)
+    return Response(result)
+
+
+@api_view(["GET"])
+def list_verification_loops(request, cand_id: str):
+    """candidate의 검증 루프 이력 조회"""
+    loops = VerificationLoop.objects.filter(candidate_id=cand_id).order_by("attempt_number")
+    return Response({
+        "cand_id": cand_id,
+        "loops": VerificationLoopSerializer(loops, many=True).data,
+    })
