@@ -198,7 +198,10 @@ def run_scan(scan_run: ScanRun):
         # 3. LLM 분석 (2단계: llm_screen)
         run_llm_screen(scan_run)
 
-        # 4. 완료
+        # 4. 검증 루프 (3단계: 실제 페이로드 전송)
+        run_verify(scan_run)
+
+        # 5. 완료
         scan_run.status = "finished"
         scan_run.finished_at = timezone.now()
         scan_run.save(update_fields=["status", "finished_at"])
@@ -298,3 +301,25 @@ def run_llm_screen(scan_run: ScanRun, max_candidates=10):
 
     logger.info(f"[{scan_run.run_id}] LLM 스크리닝 완료: "
                 f"{len(results)}개 분석, {total_tokens} tokens")
+
+
+def run_verify(scan_run: ScanRun, max_candidates=5):
+    """
+    검증 루프: LLM 스크리닝 통과한 candidate에 실제 페이로드를 보내서 검증한다.
+    """
+    from .verifier import run_verification_for_scan
+
+    logger.info(f"[{scan_run.run_id}] 검증 루프 시작")
+    results = run_verification_for_scan(
+        scan_run=scan_run,
+        max_candidates=max_candidates,
+        min_confidence=0.3,
+    )
+    verified = sum(1 for r in results if r["verified"])
+    logger.info(f"[{scan_run.run_id}] 검증 완료: {verified}/{len(results)} 확정")
+
+    # request_budget_used 업데이트 (대략적으로)
+    scan_run.request_budget_used += len(results) * 5  # candidate당 평균 5 요청
+    scan_run.save(update_fields=["request_budget_used"])
+
+    return results
