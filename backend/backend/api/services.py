@@ -20,15 +20,17 @@ logger = logging.getLogger(__name__)
 # 파라미터 이름 기반 의심 패턴
 SUSPICIOUS_PARAM_PATTERNS = [
     # SQLi 의심
-    (r"(?i)(id|uid|user_id|pid|no|idx|seq|num|page|limit|offset|sort|order|column)", "sqli"),
+    (r"(?i)^(id|uid|user_id|pid|no|idx|seq|num|page|limit|offset|sort|order|column)$", "sqli"),
     # XSS 의심
-    (r"(?i)(q|query|search|keyword|name|title|msg|message|comment|text|content|input|value|data|redirect|url|next|return|callback)", "xss"),
+    (r"(?i)^(q|query|search|keyword|name|title|msg|message|comment|text|content|input|value|data)$", "xss"),
     # IDOR 의심
-    (r"(?i)(id|uid|user_id|account|profile|doc|file|order|invoice)", "idor"),
+    (r"(?i)^(id|uid|user_id|account|profile|doc|order|invoice)$", "idor"),
+    # LFI 의심
+    (r"(?i)^(file|path|page|include|template|doc|dir|folder|src|source|lang|locale)$", "lfi"),
     # SSRF 의심
-    (r"(?i)(url|uri|link|src|source|target|dest|redirect|proxy|fetch|load|request|path|file)", "ssrf"),
+    (r"(?i)^(url|uri|link|target|dest|redirect|proxy|fetch|load|request|next|return|callback)$", "ssrf"),
     # 파일 업로드 의심
-    (r"(?i)(file|upload|attach|image|photo|document|import)", "upload"),
+    (r"(?i)^(upload|attach|image|photo|document|import)$", "upload"),
 ]
 
 # 엔드포인트 경로 기반 의심 패턴
@@ -42,8 +44,12 @@ SUSPICIOUS_PATH_PATTERNS = [
     (r"(?i)/user", "idor"),
     (r"(?i)/redirect", "ssrf"),
     (r"(?i)/callback", "ssrf"),
-    (r"(?i)/download", "ssrf"),
+    (r"(?i)/download", "lfi"),
     (r"(?i)/export", "ssrf"),
+    (r"(?i)/read", "lfi"),
+    (r"(?i)/fetch", "ssrf"),
+    (r"(?i)/include", "lfi"),
+    (r"(?i)/file", "lfi"),
 ]
 
 
@@ -88,8 +94,9 @@ def calculate_priority(param_hits, path_hits):
     total = len(param_hits) + len(path_hits)
     if total == 0:
         return 0.0
-    # 파라미터 히트가 더 가중치 높음
-    score = (len(param_hits) * 0.15) + (len(path_hits) * 0.1)
+    score = (len(param_hits) * 0.25) + (len(path_hits) * 0.15)
+    if total >= 2:
+        score += 0.10
     return min(score, 1.0)
 
 
@@ -216,7 +223,7 @@ def run_scan(scan_run: ScanRun):
         raise
 
 
-def run_llm_screen(scan_run: ScanRun, max_candidates=10):
+def run_llm_screen(scan_run: ScanRun, max_candidates=20):
     """
     규칙 기반으로 뽑힌 candidate 중 상위 N개를 Claude로 분석한다.
     결과에 따라 candidate의 detection_stage, priority_score, features를 업데이트.
@@ -303,7 +310,7 @@ def run_llm_screen(scan_run: ScanRun, max_candidates=10):
                 f"{len(results)}개 분석, {total_tokens} tokens")
 
 
-def run_verify(scan_run: ScanRun, max_candidates=5):
+def run_verify(scan_run: ScanRun, max_candidates=10):
     """
     검증 루프: LLM 스크리닝 통과한 candidate에 실제 페이로드를 보내서 검증한다.
     """
@@ -313,7 +320,7 @@ def run_verify(scan_run: ScanRun, max_candidates=5):
     results = run_verification_for_scan(
         scan_run=scan_run,
         max_candidates=max_candidates,
-        min_confidence=0.3,
+        min_confidence=0.15,
     )
     verified = sum(1 for r in results if r["verified"])
     logger.info(f"[{scan_run.run_id}] 검증 완료: {verified}/{len(results)} 확정")

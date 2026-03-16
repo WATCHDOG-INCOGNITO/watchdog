@@ -49,25 +49,37 @@ TIME_THRESHOLD = 2.5     # time-based blind 판정 임계값 (초)
 class ResponseAnalyzer:
     """HTTP 응답을 분석하여 취약점 존재 여부를 판정"""
 
-    # SQLi 에러 시그니처
     SQLI_ERROR_PATTERNS = [
+        # MySQL
         r"(?i)you have an error in your sql syntax",
         r"(?i)warning.*mysql",
+        r"(?i)com\.mysql\.jdbc",
+        # PostgreSQL
+        r"(?i)pg_query\(\).*ERROR",
+        r"(?i)org\.postgresql",
+        r"(?i)unterminated.*string",
+        # MSSQL
         r"(?i)unclosed quotation mark",
         r"(?i)quoted string not properly terminated",
-        r"(?i)pg_query\(\).*ERROR",
-        r"(?i)SQLite3::query",
+        r"(?i)Incorrect syntax near",
+        r"(?i)microsoft.*odbc.*driver",
+        # Oracle
         r"(?i)ORA-\d{5}",
+        # SQLite
+        r"(?i)unrecognized token",
+        r"(?i)near\s+[\"'].*?[\"']\s*:\s*syntax error",
+        r"(?i)sqlite3?\.\w*Error",
+        r"(?i)OperationalError",
+        r"(?i)no such table",
+        r"(?i)no such column",
+        r"(?i)SELECTs to the left and right.*do not have the same",
+        # Generic
         r"(?i)SQLSTATE\[",
         r"(?i)syntax error.*near",
-        r"(?i)Incorrect syntax near",
-        r"(?i)com\.mysql\.jdbc",
-        r"(?i)org\.postgresql",
-        r"(?i)microsoft.*odbc.*driver",
         r"(?i)JDBCException",
         r"(?i)SQL.*exception",
-        r"(?i)unterminated.*string",
         r"(?i)division by zero",
+        r"(?i)UNION.*SELECT",
     ]
 
     # SSRF 내부 접근 성공 시그니처
@@ -227,6 +239,101 @@ def verify_sqli(executor: AttackExecutor, candidate: Candidate, endpoint: str,
                         "response_status": resp["status_code"],
                         "error_pattern": error_match,
                         "response_snippet": resp["body"][:500],
+                    }, ensure_ascii=False),
+                    "role": "primary",
+                })
+                return results
+
+            # UNION 성공 탐지: baseline보다 데이터가 많으면 UNION이 동작한 것
+            if "UNION" in pl["payload"] and not resp.get("error"):
+                if resp["content_length"] > baseline_resp.get("content_length", 0) * 1.3:
+                    results["verified"] = True
+                    results["confidence"] = 0.80
+                    results["detail"] = (
+                        f"UNION-based SQLi: param={target_param}, "
+                        f"response grew {baseline_resp.get('content_length', 0)} → {resp['content_length']}"
+                    )
+                    results["evidence"].append({
+                        "kind": "request",
+                        "content": json.dumps({
+                            "payload": pl["payload"],
+                            "param": target_param,
+                            "baseline_length": baseline_resp.get("content_length", 0),
+                            "injected_length": resp["content_length"],
+                            "response_snippet": resp["body"][:500],
+                        }, ensure_ascii=False),
+                        "role": "primary",
+                    })
+                    return results
+
+        # === Stage 1b: Numeric injection (따옴표 없는 쿼리 대응) ===
+        tautology_payload = f"{params.get(target_param, '1')} OR 1=1"
+        resp_taut = executor.inject_param(endpoint, method, params, target_param, tautology_payload)
+        time.sleep(DELAY_BETWEEN)
+        if not resp_taut.get("error") and resp_taut["status_code"] == 200:
+            bl = baseline_resp.get("content_length", 0)
+            tl = resp_taut["content_length"]
+            length_grew = tl > bl * 1.15 and (tl - bl) > 50
+            # 데이터 항목 수 비교 (HTML 리스트, JSON 배열 등)
+            bl_items = baseline_resp.get("body", "").count("<li>") + baseline_resp.get("body", "").count("<tr>")
+            taut_items = resp_taut["body"].count("<li>") + resp_taut["body"].count("<tr>")
+            items_grew = taut_items > bl_items and bl_items > 0
+
+            if length_grew or items_grew:
+                results["verified"] = True
+                results["confidence"] = 0.80
+                results["detail"] = (
+                    f"Tautology SQLi: param={target_param}, "
+                    f"OR 1=1 returned more data (len: {bl}→{tl}, items: {bl_items}→{taut_items})"
+                )
+                results["evidence"].append({
+                    "kind": "request",
+                    "content": json.dumps({
+                        "payload": tautology_payload,
+                        "param": target_param,
+                        "baseline_length": bl,
+                        "tautology_length": tl,
+                        "baseline_items": bl_items,
+                        "tautology_items": taut_items,
+                        "response_snippet": resp_taut["body"][:500],
+                    }, ensure_ascii=False),
+                    "role": "primary",
+                })
+                return results
+
+        # 따옴표 기반 tautology (문자열 파라미터 대응)
+        str_tautology = "' OR '1'='1"
+        resp_str_taut = executor.inject_param(endpoint, method, params, target_param, str_tautology)
+        time.sleep(DELAY_BETWEEN)
+        if not resp_str_taut.get("error") and resp_str_taut["status_code"] == 200:
+            # 에러 먼저 체크
+            err = ResponseAnalyzer.check_sqli_error(resp_str_taut["body"])
+            if err:
+                results["verified"] = True
+                results["confidence"] = 0.85
+                results["detail"] = f"Error-based SQLi (string tautology): param={target_param}, error='{err}'"
+                results["evidence"].append({
+                    "kind": "request",
+                    "content": json.dumps({
+                        "payload": str_tautology, "param": target_param,
+                        "error_pattern": err, "response_snippet": resp_str_taut["body"][:500],
+                    }, ensure_ascii=False),
+                    "role": "primary",
+                })
+                return results
+            # 길이/항목 비교
+            sl = resp_str_taut["content_length"]
+            bl = baseline_resp.get("content_length", 0)
+            if sl > bl * 1.15 and (sl - bl) > 50:
+                results["verified"] = True
+                results["confidence"] = 0.75
+                results["detail"] = f"String tautology SQLi: param={target_param}, len {bl}→{sl}"
+                results["evidence"].append({
+                    "kind": "request",
+                    "content": json.dumps({
+                        "payload": str_tautology, "param": target_param,
+                        "baseline_length": bl, "tautology_length": sl,
+                        "response_snippet": resp_str_taut["body"][:500],
                     }, ensure_ascii=False),
                     "role": "primary",
                 })
@@ -617,6 +724,7 @@ VERIFY_DISPATCH = {
     "xss": verify_xss,
     "idor": verify_idor,
     "ssrf": verify_ssrf,
+    "lfi": verify_upload_lfi,
     "upload": verify_upload_lfi,
 }
 
@@ -677,6 +785,25 @@ def run_verification_loop(candidate: Candidate, scan_run: ScanRun) -> dict:
 
     result = verify_func(executor, candidate, endpoint, method, flat_params)
 
+    # Rule-based 미확정 + evidence 있으면 → LLM 폴백
+    if not result["verified"] and result.get("evidence"):
+        logger.info(f"[{candidate.cand_id}] rule 미확정, LLM 폴백 검증 시도")
+        last_evidence = result["evidence"][-1]
+        try:
+            ev_content = json.loads(last_evidence.get("content", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            ev_content = {}
+        llm_result = llm_verify_response(
+            {"method": method, "endpoint": endpoint, "vuln_type": vuln_type},
+            ev_content.get("payload", ""),
+            {"status_code": ev_content.get("response_status"), "elapsed": 0,
+             "body": ev_content.get("response_snippet", "")},
+        )
+        if llm_result.get("verified") and llm_result.get("confidence", 0) >= 0.7:
+            result["verified"] = True
+            result["confidence"] = llm_result["confidence"]
+            result["detail"] = f"LLM-verified: {llm_result.get('analysis', '')}"
+
     # VerificationLoop 기록
     if result["verified"]:
         next_action = "confirmed"
@@ -733,22 +860,38 @@ def run_verification_for_scan(scan_run: ScanRun, max_candidates: int = 10,
                               min_confidence: float = 0.3) -> list:
     """
     스캔의 전체 candidate를 순회하며 검증 루프 실행.
-
-    Args:
-        scan_run: 대상 스캔
-        max_candidates: 최대 검증 candidate 수
-        min_confidence: 최소 priority_score 임계값
-
-    Returns:
-        list of verification results
+    vuln_type별로 최소 2개씩 검증 기회를 보장한다.
     """
-    candidates = Candidate.objects.filter(
-        scan_run=scan_run,
-        status="open",
-        priority_score__gte=min_confidence,
-    ).select_related("request").order_by("-priority_score")[:max_candidates]
+    all_candidates = list(
+        Candidate.objects.filter(
+            scan_run=scan_run,
+            status="open",
+            priority_score__gte=min_confidence,
+        ).select_related("request").order_by("-priority_score")
+    )
 
-    logger.info(f"[{scan_run.run_id}] 검증 루프 시작: {len(candidates)}개 candidate")
+    # vuln_type별 분산 선택: 유형별 상위 2개 우선 확보
+    by_type = {}
+    for c in all_candidates:
+        by_type.setdefault(c.vuln_type, []).append(c)
+
+    selected_ids = set()
+    per_type_min = max(2, max_candidates // max(len(by_type), 1))
+    for vt, cands in by_type.items():
+        for c in cands[:per_type_min]:
+            selected_ids.add(c.cand_id)
+
+    # 남은 슬롯은 priority 순으로 채움
+    for c in all_candidates:
+        if len(selected_ids) >= max_candidates:
+            break
+        selected_ids.add(c.cand_id)
+
+    candidates = [c for c in all_candidates if c.cand_id in selected_ids]
+    candidates.sort(key=lambda c: c.priority_score, reverse=True)
+
+    logger.info(f"[{scan_run.run_id}] 검증 루프 시작: {len(candidates)}개 candidate "
+                f"(유형: {dict((k, len(v)) for k, v in by_type.items())})")
 
     results = []
     for i, cand in enumerate(candidates):
