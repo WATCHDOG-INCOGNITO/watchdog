@@ -49,6 +49,11 @@ urlpatterns = [
     path("api/scan-runs/<str:run_id>/llm-analyze/", views.llm_analyze_candidates),
     path("api/llm/analyze/", views.llm_analyze_single),
 
+    # Verification (검증 루프)
+    path("api/scan-runs/<str:run_id>/verify/", views.start_verification),
+    path("api/candidates/<str:cand_id>/verify/", views.verify_single_candidate),
+    path("api/candidates/<str:cand_id>/loops/", views.list_verification_loops),
+
     # ViewSets
     path("api/v1/", include(router.urls)),
 
