@@ -51,4 +51,7 @@ urlpatterns = [
 
     # ViewSets
     path("api/v1/", include(router.urls)),
+
+    # Reporting
+    path("api/scan-runs/<str:run_id>/report/", views.scan_run_report),
 ]

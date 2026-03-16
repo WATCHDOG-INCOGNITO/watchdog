@@ -393,3 +393,18 @@ class ReportArchive(models.Model):
     class Meta:
         db_table = "report_archives"
         unique_together = [("source", "source_id")]
+
+class RunReport(models.Model):
+    """Stored, reproducible report artifacts for a ScanRun (P5)."""
+
+    report_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan_run = models.OneToOneField(ScanRun, on_delete=models.CASCADE, related_name="report")
+
+    markdown = models.TextField()
+    json = models.TextField()
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "run_reports"
