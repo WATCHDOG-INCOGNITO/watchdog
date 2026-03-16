@@ -21,6 +21,7 @@ urlpatterns = [
 
     # Findings
     path("api/findings/", views.list_findings),
+    path("api/findings/create/", views.create_finding),
     path("api/findings/<str:finding_id>/", views.get_finding),
 
     # Evidence Blobs
@@ -37,6 +38,9 @@ urlpatterns = [
     # Finding-Evidence Links
     path("api/finding-evidence-links/", views.create_finding_evidence_link),
     path("api/finding-evidence-links/list/", views.list_finding_evidence_links),
+
+    # Candidate → Finding 승격
+    path("api/candidates/<str:cand_id>/promote/", views.promote_candidate_to_finding),
 
     # P4 Storage API
     path("api/candidates/<str:cand_id>/confirm/", views.confirm_candidate),
