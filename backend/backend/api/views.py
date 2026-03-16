@@ -24,6 +24,11 @@ from .serializers import (
 )
 
 
+ALLOWED_EVIDENCE_ROLES = {
+    "primary_proof", "supporting", "poc", "screenshot", "log", "evidence",
+}
+
+
 # ==========================================================
 # Health Check
 # ==========================================================
@@ -115,6 +120,55 @@ def get_finding(request, finding_id: str):
         return Response({"error": "finding_id not found"}, status=status.HTTP_404_NOT_FOUND)
     return Response(FindingSerializer(finding).data)
 
+
+@api_view(["POST"])
+def create_finding(request):
+    """Finding 직접 생성"""
+    run_id = request.data.get("run_id")
+    if not run_id:
+        return Response({"error": "run_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        run = ScanRun.objects.get(run_id=run_id)
+    except ScanRun.DoesNotExist:
+        return Response({"error": "run_id not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    finding = Finding.objects.create(
+        scan_run=run,
+        title=request.data.get("title", "finding"),
+        severity=request.data.get("severity_raw", "info"),
+        confidence=float(request.data.get("confidence", 0.0) or 0.0),
+    )
+    return Response(FindingSerializer(finding).data, status=status.HTTP_201_CREATED)
+
+
+@api_view(["POST"])
+def promote_candidate_to_finding(request, cand_id: str):
+    """Candidate를 Finding으로 승격"""
+    try:
+        cand = Candidate.objects.get(cand_id=cand_id)
+    except Candidate.DoesNotExist:
+        return Response({"error": "candidate not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    title = request.data.get("title", cand.vuln_type)
+    severity = request.data.get("severity_raw", "info")
+    confidence = float(request.data.get("confidence", cand.priority_score) or 0.0)
+
+    finding = Finding.objects.create(
+        scan_run=cand.scan_run,
+        candidate=cand,
+        title=title,
+        severity=severity,
+        confidence=confidence,
+    )
+    cand.status = "confirmed"
+    cand.save(update_fields=["status"])
+
+    return Response({
+        "candidate_id": str(cand.cand_id),
+        "finding": FindingSerializer(finding).data,
+    }, status=status.HTTP_201_CREATED)
+
+
 # ==========================================================
 # Evidence Blobs
 # ==========================================================
@@ -204,6 +258,11 @@ def create_finding_evidence_link(request):
         return Response({"error": "finding_id and blob_id are required"}, status=status.HTTP_400_BAD_REQUEST)
     if not EvidenceBlob.objects.filter(blob_id=blob_id).exists():
         return Response({"error": "blob_id not found"}, status=status.HTTP_404_NOT_FOUND)
+    if role not in ALLOWED_EVIDENCE_ROLES:
+        return Response(
+            {"error": f"invalid role: {role}", "allowed": sorted(ALLOWED_EVIDENCE_ROLES)},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     link = FindingEvidenceLink.objects.create(
         finding_id=finding_id, blob_id=blob_id, role=role,
     )
