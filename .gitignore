@@ -23,3 +23,7 @@ media/
 
 # Logs
 *.log
+
+# Local test targets
+docker/wargame/
+docker-compose.test.yml
