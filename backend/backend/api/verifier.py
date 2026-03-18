@@ -617,6 +617,7 @@ VERIFY_DISPATCH = {
     "xss": verify_xss,
     "idor": verify_idor,
     "ssrf": verify_ssrf,
+    "lfi": verify_upload_lfi,
     "upload": verify_upload_lfi,
 }
 
@@ -676,6 +677,25 @@ def run_verification_loop(candidate: Candidate, scan_run: ScanRun) -> dict:
     attempt_num = VerificationLoop.objects.filter(candidate=candidate).count() + 1
 
     result = verify_func(executor, candidate, endpoint, method, flat_params)
+
+    # Rule-based 미확정 + evidence 있으면 → LLM 폴백
+    if not result["verified"] and result.get("evidence"):
+        logger.info(f"[{candidate.cand_id}] rule 미확정, LLM 폴백 검증 시도")
+        last_evidence = result["evidence"][-1]
+        try:
+            ev_content = json.loads(last_evidence.get("content", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            ev_content = {}
+        llm_result = llm_verify_response(
+            {"method": method, "endpoint": endpoint, "vuln_type": vuln_type},
+            ev_content.get("payload", ""),
+            {"status_code": ev_content.get("response_status"), "elapsed": 0,
+             "body": ev_content.get("response_snippet", "")},
+        )
+        if llm_result.get("verified") and llm_result.get("confidence", 0) >= 0.7:
+            result["verified"] = True
+            result["confidence"] = llm_result["confidence"]
+            result["detail"] = f"LLM-verified: {llm_result.get('analysis', '')}"
 
     # VerificationLoop 기록
     if result["verified"]:

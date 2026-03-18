@@ -175,6 +175,7 @@ def get_payloads(vuln_type: str, stage: int = 1) -> list:
         "xss": XSS_PAYLOADS,
         "idor": IDOR_PAYLOADS,
         "ssrf": SSRF_PAYLOADS,
+        "lfi": UPLOAD_LFI_PAYLOADS,
         "upload": UPLOAD_LFI_PAYLOADS,
     }
 
@@ -198,6 +199,7 @@ def get_all_payloads(vuln_type: str) -> dict:
         "xss": XSS_PAYLOADS,
         "idor": IDOR_PAYLOADS,
         "ssrf": SSRF_PAYLOADS,
+        "lfi": UPLOAD_LFI_PAYLOADS,
         "upload": UPLOAD_LFI_PAYLOADS,
     }
     return payload_map.get(vuln_type, {})
