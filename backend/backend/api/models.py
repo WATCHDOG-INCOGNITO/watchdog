@@ -394,11 +394,9 @@ class ReportArchive(models.Model):
         db_table = "report_archives"
         unique_together = [("source", "source_id")]
 
-
 # ==========================================================
 # Report (P5)
 # ==========================================================
-
 class RunReport(models.Model):
     """Stored, reproducible report artifacts for a ScanRun (P5)."""
 
@@ -413,3 +411,4 @@ class RunReport(models.Model):
 
     class Meta:
         db_table = "run_reports"
+

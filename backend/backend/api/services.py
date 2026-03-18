@@ -1,34 +1,120 @@
 """
 스캔 서비스
-크롤링 실행 → request_catalog 저장 → 규칙 기반 필터링 → candidates 저장
+크롤링 실행 → JS 분석 → request_catalog 저장 → 규칙 기반 필터링
+→ 보안 헤더 점검 → candidates 저장
 """
 
 import logging
 import re
 from django.utils import timezone
 
-from .models import ScanRun, RequestCatalog, Candidate
+from .models import ScanRun, RequestCatalog, Candidate, Finding
 from .crawler import Crawler
 
 logger = logging.getLogger(__name__)
 
 
 # ==========================================================
+# 보안 헤더 점검
+# ==========================================================
+
+SECURITY_HEADERS_CHECK = {
+    "Strict-Transport-Security": {
+        "title": "HSTS 헤더 누락",
+        "severity": "medium",
+        "summary": "Strict-Transport-Security 헤더가 설정되지 않아 "
+                   "HTTPS 다운그레이드 공격에 취약할 수 있습니다.",
+    },
+    "X-Frame-Options": {
+        "title": "X-Frame-Options 헤더 누락",
+        "severity": "medium",
+        "summary": "X-Frame-Options 헤더가 없어 클릭재킹(Clickjacking) 공격에 "
+                   "취약할 수 있습니다.",
+    },
+    "Content-Security-Policy": {
+        "title": "Content-Security-Policy 헤더 누락",
+        "severity": "medium",
+        "summary": "CSP가 설정되지 않아 XSS 공격의 영향을 완화할 수 없습니다.",
+    },
+    "X-Content-Type-Options": {
+        "title": "X-Content-Type-Options 헤더 누락",
+        "severity": "low",
+        "summary": "X-Content-Type-Options: nosniff 가 없어 "
+                   "MIME 타입 스니핑 공격에 노출될 수 있습니다.",
+    },
+    "Referrer-Policy": {
+        "title": "Referrer-Policy 헤더 누락",
+        "severity": "low",
+        "summary": "Referrer-Policy가 설정되지 않아 민감한 URL 정보가 "
+                   "외부로 유출될 수 있습니다.",
+    },
+    "Permissions-Policy": {
+        "title": "Permissions-Policy 헤더 누락",
+        "severity": "info",
+        "summary": "Permissions-Policy가 설정되지 않아 브라우저 기능 "
+                   "(카메라, 마이크 등) 접근을 제한하지 않습니다.",
+    },
+}
+
+
+def run_security_header_check(scan_run: ScanRun, headers: dict):
+    """응답 헤더에서 보안 헤더 누락을 점검하여 Finding으로 생성."""
+    if not headers:
+        logger.info(f"[{scan_run.run_id}] 응답 헤더 없음, 보안 헤더 점검 건너뜀")
+        return []
+
+    header_keys_lower = {k.lower(): v for k, v in headers.items()}
+    findings = []
+
+    for header_name, info in SECURITY_HEADERS_CHECK.items():
+        if header_name.lower() not in header_keys_lower:
+            finding = Finding.objects.create(
+                scan_run=scan_run,
+                title=info["title"],
+                vuln_type="security_header",
+                severity=info["severity"],
+                confidence=1.0,
+                summary=info["summary"],
+                reproduction_steps=f"응답 헤더에 {header_name}이 없습니다.",
+            )
+            findings.append(finding)
+
+    server_header = header_keys_lower.get("server", "")
+    if server_header and re.search(r"[\d.]+", server_header):
+        Finding.objects.create(
+            scan_run=scan_run,
+            title="서버 버전 정보 노출",
+            vuln_type="info_disclosure",
+            severity="low",
+            confidence=1.0,
+            summary=f"Server 헤더에서 버전 정보가 노출됩니다: {server_header}",
+            reproduction_steps=f"응답 헤더: Server: {server_header}",
+        )
+
+    logger.info(f"[{scan_run.run_id}] 보안 헤더 점검 완료: {len(findings)}개 이슈")
+    return findings
+
+
+# ==========================================================
 # 규칙 기반 필터링 (1단계: 비용 제로)
 # ==========================================================
 
-# 파라미터 이름 기반 의심 패턴
+    # 파라미터 이름 기반 의심 패턴
 SUSPICIOUS_PARAM_PATTERNS = [
     # SQLi 의심
-    (r"(?i)(id|uid|user_id|pid|no|idx|seq|num|page|limit|offset|sort|order|column)", "sqli"),
+    (r"(?i)^(id|uid|user_id|pid|no|idx|seq|num|page|limit|offset|sort|order|column)$", "sqli"),
     # XSS 의심
-    (r"(?i)(q|query|search|keyword|name|title|msg|message|comment|text|content|input|value|data|redirect|url|next|return|callback)", "xss"),
+    (r"(?i)^(q|query|search|keyword|name|title|msg|message|comment|text|content|input|value|data)$", "xss"),
     # IDOR 의심
-    (r"(?i)(id|uid|user_id|account|profile|doc|file|order|invoice)", "idor"),
+    (r"(?i)^(id|uid|user_id|account|profile|doc|order|invoice)$", "idor"),
+    # LFI 의심
+    (r"(?i)^(file|path|page|include|template|doc|dir|folder|src|source|lang|locale)$", "lfi"),
     # SSRF 의심
-    (r"(?i)(url|uri|link|src|source|target|dest|redirect|proxy|fetch|load|request|path|file)", "ssrf"),
+    (r"(?i)^(url|uri|link|target|dest|redirect|proxy|fetch|load|request|next|return|callback)$", "ssrf"),
     # 파일 업로드 의심
-    (r"(?i)(file|upload|attach|image|photo|document|import)", "upload"),
+    (r"(?i)^(upload|attach|image|photo|document|import)$", "upload"),
+    # 사용자 열거 의심 (인증 관련 쿼리 파라미터)
+    (r"(?i)^(studentNumber|student_id|email|username|phone|phoneNumber)$", "idor"),
 ]
 
 # 엔드포인트 경로 기반 의심 패턴
@@ -42,8 +128,29 @@ SUSPICIOUS_PATH_PATTERNS = [
     (r"(?i)/user", "idor"),
     (r"(?i)/redirect", "ssrf"),
     (r"(?i)/callback", "ssrf"),
-    (r"(?i)/download", "ssrf"),
+    (r"(?i)/download", "lfi"),
     (r"(?i)/export", "ssrf"),
+    (r"(?i)/read", "lfi"),
+    (r"(?i)/fetch", "ssrf"),
+    (r"(?i)/include", "lfi"),
+    (r"(?i)/file", "lfi"),
+    # SPA API 패턴
+    (r"(?i)/auth/", "sqli"),
+    (r"(?i)/auth/login", "sqli"),
+    (r"(?i)/auth/register", "sqli"),
+    (r"(?i)/auth/check", "idor"),
+    (r"(?i)/group/\d+", "idor"),
+    (r"(?i)/member", "idor"),
+    (r"(?i)/mentee", "idor"),
+    (r"(?i)/mentor", "idor"),
+    (r"(?i)/image/", "lfi"),
+    (r"(?i)/notification", "idor"),
+    (r"(?i)/activity", "idor"),
+    (r"(?i)/assignment", "idor"),
+    (r"(?i)/v[0-9]/", "sqli"),
+    (r"(?i)/delete", "idor"),
+    (r"(?i)/create", "idor"),
+    (r"(?i)/update", "idor"),
 ]
 
 
@@ -88,8 +195,9 @@ def calculate_priority(param_hits, path_hits):
     total = len(param_hits) + len(path_hits)
     if total == 0:
         return 0.0
-    # 파라미터 히트가 더 가중치 높음
-    score = (len(param_hits) * 0.15) + (len(path_hits) * 0.1)
+    score = (len(param_hits) * 0.25) + (len(path_hits) * 0.15)
+    if total >= 2:
+        score += 0.10
     return min(score, 1.0)
 
 
@@ -98,37 +206,15 @@ def calculate_priority(param_hits, path_hits):
 # ==========================================================
 
 def run_crawl(scan_run: ScanRun):
-    """크롤링 실행 → request_catalog에 저장 (SPA 자동 감지)"""
+    """크롤링 + JS 분석 실행 → request_catalog에 저장"""
     logger.info(f"[{scan_run.run_id}] 크롤링 시작: {scan_run.target_url}")
 
-    # config에서 force_spa 옵션 확인
-    config = scan_run.config or {}
-    force_spa = config.get("force_spa", False)
-
-    # SPA 감지
-    from .spa_crawler import detect_spa, SPACrawler
-
-    is_spa = force_spa or detect_spa(scan_run.target_url)
-
-    if is_spa:
-        logger.info(f"[{scan_run.run_id}] SPA {'(강제)' if force_spa else '(자동 감지)'} → Playwright 크롤러 사용")
-        crawler = SPACrawler(
-            target_url=scan_run.target_url,
-            max_depth=3,
-            max_pages=100,
-            timeout=30,
-            headless=True,
-            click_explore=True,
-        )
-    else:
-        logger.info(f"[{scan_run.run_id}] Traditional 사이트 → BFS 크롤러 사용")
-        crawler = Crawler(
-            target_url=scan_run.target_url,
-            max_depth=3,
-            max_pages=100,
-            timeout=10,
-        )
-
+    crawler = Crawler(
+        target_url=scan_run.target_url,
+        max_depth=3,
+        max_pages=200,
+        timeout=10,
+    )
     endpoints = crawler.crawl()
 
     # DB에 저장
@@ -139,20 +225,23 @@ def run_crawl(scan_run: ScanRun):
             endpoint=ep["endpoint"],
             method=ep["method"],
             params=ep["params"],
-            status_code=ep["status_code"],
-            content_type=ep["content_type"],
-            headers=ep["headers"],
-            body_hash=ep["body_hash"],
-            auth_required=ep["auth_required"],
-            source=ep["source"],
-            discovered_from=ep["discovered_from"],
+            status_code=ep.get("status_code"),
+            content_type=ep.get("content_type"),
+            headers=ep.get("headers"),
+            body_hash=ep.get("body_hash"),
+            auth_required=ep.get("auth_required", False),
+            source=ep.get("source", "crawler"),
+            discovered_from=ep.get("discovered_from", ""),
         )
         catalog_items.append(item)
 
     RequestCatalog.objects.bulk_create(catalog_items)
-    logger.info(f"[{scan_run.run_id}] {len(catalog_items)}개 엔드포인트 저장 완료")
 
-    return catalog_items
+    js_count = sum(1 for ep in endpoints if "js_" in ep.get("source", ""))
+    logger.info(f"[{scan_run.run_id}] {len(catalog_items)}개 엔드포인트 저장 "
+                f"(BFS: {len(catalog_items) - js_count}, JS 분석: {js_count})")
+
+    return catalog_items, crawler.response_headers
 
 
 def run_rule_filter(scan_run: ScanRun):
@@ -206,24 +295,27 @@ def run_rule_filter(scan_run: ScanRun):
 
 
 def run_scan(scan_run: ScanRun):
-    """전체 스캔 파이프라인 (크롤링 → 필터링 → LLM 분석)"""
+    """전체 스캔 파이프라인 (크롤링 → JS분석 → 필터링 → 보안헤더 → LLM → 검증)"""
     try:
         scan_run.status = "running"
         scan_run.save(update_fields=["status"])
 
-        # 1. 크롤링
-        run_crawl(scan_run)
+        # 1. 크롤링 + JS 번들 분석
+        _catalog, response_headers = run_crawl(scan_run)
 
-        # 2. 규칙 기반 필터링
+        # 2. 보안 헤더 점검
+        run_security_header_check(scan_run, response_headers)
+
+        # 3. 규칙 기반 필터링
         run_rule_filter(scan_run)
 
-        # 3. LLM 분석 (2단계: llm_screen)
+        # 4. LLM 분석 (2단계: llm_screen)
         run_llm_screen(scan_run)
 
-        # 4. 검증 루프 (3단계: 실제 페이로드 전송)
+        # 5. 검증 루프 (3단계: 실제 페이로드 전송)
         run_verify(scan_run)
 
-        # 5. 완료
+        # 6. 완료
         scan_run.status = "finished"
         scan_run.finished_at = timezone.now()
         scan_run.save(update_fields=["status", "finished_at"])
@@ -238,7 +330,7 @@ def run_scan(scan_run: ScanRun):
         raise
 
 
-def run_llm_screen(scan_run: ScanRun, max_candidates=10):
+def run_llm_screen(scan_run: ScanRun, max_candidates=20):
     """
     규칙 기반으로 뽑힌 candidate 중 상위 N개를 Claude로 분석한다.
     결과에 따라 candidate의 detection_stage, priority_score, features를 업데이트.
@@ -323,7 +415,6 @@ def run_llm_screen(scan_run: ScanRun, max_candidates=10):
 
     logger.info(f"[{scan_run.run_id}] LLM 스크리닝 완료: "
                 f"{len(results)}개 분석, {total_tokens} tokens")
-
 
 def run_verify(scan_run: ScanRun, max_candidates=5):
     """
