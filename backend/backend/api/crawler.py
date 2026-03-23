@@ -1,7 +1,6 @@
 """
 BFS 크롤러 모듈
 타겟 URL에서 엔드포인트를 수집하고 request_catalog에 저장한다.
-JS 번들을 분석하여 SPA 내부의 API 경로도 추출한다.
 """
 
 import logging
@@ -12,30 +11,20 @@ from collections import deque
 import requests
 from bs4 import BeautifulSoup
 
-from .js_analyzer import (
-    extract_endpoints_from_js,
-    expand_parameterized_endpoints,
-    detect_auth_endpoints,
-)
-
 logger = logging.getLogger(__name__)
 
-
 class Crawler:
-    """BFS 기반 웹 크롤러 + JS 번들 분석"""
+    """BFS 기반 웹 크롤러"""
 
     def __init__(self, target_url, max_depth=3, max_pages=100, timeout=10):
         self.target_url = target_url.rstrip("/")
         self.base_domain = urlparse(target_url).netloc
-        self.base_path = urlparse(target_url).path.rstrip("/")
         self.max_depth = max_depth
         self.max_pages = max_pages
         self.timeout = timeout
 
         self.visited = set()
         self.results = []          # 수집된 엔드포인트 목록
-        self.js_endpoints = []     # JS 분석으로 발견된 엔드포인트
-        self.response_headers = {} # 첫 응답 헤더 (보안 헤더 분석용)
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "WatchdogScanner/1.0",
@@ -129,99 +118,11 @@ class Crawler:
             logger.warning(f"요청 실패: {url} - {e}")
             return None
 
-    def _analyze_js_bundle(self, js_url: str, js_body: str):
-        """JS 번들을 분석하여 API 엔드포인트를 추출."""
-        if len(js_body) < 500:
-            return
-
-        try:
-            raw_eps = extract_endpoints_from_js(js_body, base_url=self.target_url)
-            raw_eps = detect_auth_endpoints(raw_eps)
-            expanded = expand_parameterized_endpoints(raw_eps)
-            self.js_endpoints.extend(expanded)
-            logger.info(f"JS 분석: {js_url} → {len(raw_eps)}개 원본 + "
-                        f"{len(expanded) - len(raw_eps)}개 확장 엔드포인트")
-        except Exception as e:
-            logger.warning(f"JS 분석 실패 ({js_url}): {e}")
-
-    def _probe_js_endpoints(self, seen_endpoints: set):
-        """JS에서 발견한 엔드포인트를 실제로 프로빙하여 결과에 추가."""
-        if not self.js_endpoints:
-            return
-
-        base = f"https://{self.base_domain}"
-        probed = 0
-        added = 0
-        max_probe = 80
-
-        # SPA fallback body_hash 수집 (첫 HTML 응답과 동일하면 fallback)
-        spa_hashes = set()
-        for r in self.results:
-            if (r.get("source") == "crawler"
-                    and r.get("content_type", "").startswith("text/html")
-                    and r.get("body_hash")):
-                spa_hashes.add(r["body_hash"])
-
-        for ep in self.js_endpoints:
-            if probed >= max_probe:
-                break
-
-            path = ep["endpoint"]
-            method = ep.get("method", "GET")
-            dedup_key = (method, path, tuple(sorted(ep.get("params", {}).keys())))
-            if dedup_key in seen_endpoints:
-                continue
-            seen_endpoints.add(dedup_key)
-
-            url = f"{base}{path}"
-            try:
-                if method in ("GET", "HEAD"):
-                    resp = self.session.get(url, timeout=self.timeout, allow_redirects=False)
-                else:
-                    resp = self.session.request(
-                        method, url, timeout=self.timeout,
-                        allow_redirects=False, json={},
-                    )
-                status = resp.status_code
-                ct = resp.headers.get("Content-Type", "")
-                hdrs = dict(resp.headers)
-                body_hash = hashlib.sha256(resp.content).hexdigest()[:16]
-                probed += 1
-            except requests.RequestException as e:
-                logger.debug(f"JS 프로빙 실패: {method} {url} - {e}")
-                continue
-
-            # SPA fallback 감지: body_hash가 원본 HTML과 동일하면 건너뜀
-            if body_hash in spa_hashes and status == 200 and "text/html" in ct:
-                continue
-
-            # 404이면서 text/html이면 SPA의 catch-all → 건너뜀
-            if status == 404 and "text/html" in ct:
-                continue
-
-            self.results.append({
-                "endpoint": path,
-                "method": method,
-                "params": ep.get("params", {}),
-                "status_code": status,
-                "content_type": ct,
-                "headers": hdrs,
-                "body_hash": body_hash,
-                "auth_required": status in (401, 403),
-                "source": ep.get("source", "js_analysis"),
-                "discovered_from": ep.get("discovered_from", ""),
-            })
-            added += 1
-
-        logger.info(f"JS 프로빙 완료: {probed}개 시도, {added}개 유효, "
-                    f"{len(self.results)}개 총 엔드포인트")
-
     def crawl(self):
-        """BFS 크롤링 + JS 번들 분석 실행"""
+        """BFS 크롤링 실행"""
         queue = deque([(self.target_url, 0)])  # (url, depth)
         self.visited.add(self.normalize_url(self.target_url))
         seen_endpoints = set()  # (method, endpoint, params_key) 중복 방지
-        js_urls_analyzed = set()
 
         while queue and len(self.results) < self.max_pages:
             url, depth = queue.popleft()
@@ -233,10 +134,6 @@ class Crawler:
             page = self.fetch_page(url)
             if not page:
                 continue
-
-            # 첫 번째 HTML 응답 헤더 저장 (보안 헤더 분석용)
-            if not self.response_headers and "text/html" in page.get("content_type", ""):
-                self.response_headers = page["headers"]
 
             parsed = urlparse(url)
             endpoint = parsed.path or "/"
@@ -259,14 +156,8 @@ class Crawler:
                     "discovered_from": url,
                 })
 
-            # JS 파일이면 번들 분석
-            ct = page.get("content_type", "")
-            if ("javascript" in ct or endpoint.endswith(".js")) and url not in js_urls_analyzed:
-                js_urls_analyzed.add(url)
-                self._analyze_js_bundle(url, page["body"])
-
             # HTML 페이지만 파싱
-            if "text/html" not in ct:
+            if "text/html" not in page.get("content_type", ""):
                 continue
 
             # 폼 추출 → POST 엔드포인트 저장 (중복 제거)
@@ -299,9 +190,6 @@ class Crawler:
                     self.visited.add(normalized)
                     queue.append((link, depth + 1))
 
-        # BFS 완료 후, JS에서 발견한 엔드포인트를 프로빙
-        self._probe_js_endpoints(seen_endpoints)
-
-        logger.info(f"크롤링 완료: {len(self.results)}개 엔드포인트 수집 "
-                    f"(JS 분석: {len(self.js_endpoints)}개)")
+        logger.info(f"크롤링 완료: {len(self.results)}개 엔드포인트 수집")
         return self.results
+

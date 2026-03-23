@@ -1,10 +1,7 @@
 import uuid
 from django.db import models
 
-
-# ==========================================================
 # Scan 관련
-# ==========================================================
 
 class ScanRun(models.Model):
     class Status(models.TextChoices):
@@ -37,7 +34,6 @@ class ScanRun(models.Model):
         db_table = "scan_runs"
         ordering = ["-created_at"]
 
-
 class RequestCatalog(models.Model):
     req_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="requests")
@@ -56,7 +52,6 @@ class RequestCatalog(models.Model):
 
     class Meta:
         db_table = "request_catalog"
-
 
 class Candidate(models.Model):
     class DetectionStage(models.TextChoices):
@@ -87,7 +82,6 @@ class Candidate(models.Model):
         db_table = "candidates"
         ordering = ["-priority_score"]
 
-
 class Finding(models.Model):
     class Severity(models.TextChoices):
         INFO = "info"
@@ -111,7 +105,6 @@ class Finding(models.Model):
     class Meta:
         db_table = "findings"
 
-
 class EvidenceBlob(models.Model):
     blob_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     finding = models.ForeignKey(Finding, on_delete=models.CASCADE, null=True, blank=True, related_name="evidence_items")
@@ -126,7 +119,6 @@ class EvidenceBlob(models.Model):
     class Meta:
         db_table = "evidence_blobs"
 
-
 class FindingEvidenceLink(models.Model):
     link_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     finding = models.ForeignKey(Finding, on_delete=models.CASCADE, related_name="evidence_links")
@@ -137,10 +129,7 @@ class FindingEvidenceLink(models.Model):
     class Meta:
         db_table = "finding_evidence_links"
 
-
-# ==========================================================
 # 다중 에이전트 / 검증 루프 / 가설
-# ==========================================================
 
 class AgentTask(models.Model):
     class AgentType(models.TextChoices):
@@ -173,7 +162,6 @@ class AgentTask(models.Model):
         db_table = "agent_tasks"
         ordering = ["-created_at"]
 
-
 class VerificationLoop(models.Model):
     class NextAction(models.TextChoices):
         RETRY = "retry"
@@ -195,7 +183,6 @@ class VerificationLoop(models.Model):
         db_table = "verification_loops"
         ordering = ["candidate", "attempt_number"]
 
-
 class Hypothesis(models.Model):
     class Result(models.TextChoices):
         PENDING = "pending"
@@ -215,7 +202,6 @@ class Hypothesis(models.Model):
     class Meta:
         db_table = "hypotheses"
 
-
 class VisualAnalysis(models.Model):
     analysis_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="visual_analyses")
@@ -228,7 +214,6 @@ class VisualAnalysis(models.Model):
 
     class Meta:
         db_table = "visual_analysis"
-
 
 class IDORTestSession(models.Model):
     class Verdict(models.TextChoices):
@@ -249,7 +234,6 @@ class IDORTestSession(models.Model):
 
     class Meta:
         db_table = "idor_test_sessions"
-
 
 class WAFBypassAttempt(models.Model):
     class MutationType(models.TextChoices):
@@ -272,10 +256,7 @@ class WAFBypassAttempt(models.Model):
     class Meta:
         db_table = "waf_bypass_attempts"
 
-
-# ==========================================================
 # Knowledge DB (3종 자산)
-# ==========================================================
 
 class VulnerabilityEntry(models.Model):
     vuln_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -300,7 +281,6 @@ class VulnerabilityEntry(models.Model):
 
     class Meta:
         db_table = "vulnerability_entries"
-
 
 class PayloadPattern(models.Model):
     class SafetyLevel(models.TextChoices):
@@ -350,7 +330,6 @@ class PayloadPattern(models.Model):
     def fp_rate(self):
         return self.false_positive_count / self.times_used if self.times_used else 0.0
 
-
 class ReportArchive(models.Model):
     class ValidationStatus(models.TextChoices):
         UNVERIFIED = "unverified"
@@ -394,9 +373,8 @@ class ReportArchive(models.Model):
         db_table = "report_archives"
         unique_together = [("source", "source_id")]
 
-# ==========================================================
 # Report (P5)
-# ==========================================================
+
 class RunReport(models.Model):
     """Stored, reproducible report artifacts for a ScanRun (P5)."""
 

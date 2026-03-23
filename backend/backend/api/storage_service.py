@@ -12,10 +12,8 @@ from .models import Candidate, Finding, EvidenceBlob, FindingEvidenceLink
 
 logger = logging.getLogger(__name__)
 
-
 class StorageError(Exception):
     pass
-
 
 def confirm_candidate(cand_id, severity=None, title=None, summary=None,
                       reproduction_steps=None, confidence=None, evidence_list=None):
@@ -117,7 +115,6 @@ def confirm_candidate(cand_id, severity=None, title=None, summary=None,
         "evidence": created_evidence,
     }
 
-
 def dismiss_candidate(cand_id, reason="false_positive"):
     """
     candidate를 오탐/폐기 처리한다.
@@ -142,7 +139,6 @@ def dismiss_candidate(cand_id, reason="false_positive"):
 
     logger.info(f"Candidate {cand_id} dismissed ({reason})")
     return {"candidate_id": str(cand_id), "status": reason}
-
 
 def attach_evidence(finding_id, evidence_data):
     """
@@ -187,7 +183,6 @@ def attach_evidence(finding_id, evidence_data):
     logger.info(f"Finding {finding_id}: {len(created)} evidence 추가")
     return {"finding_id": str(finding_id), "evidence_added": created}
 
-
 def get_finding_detail(finding_id):
     """finding + 전체 evidence를 한 번에 조회"""
     try:
@@ -226,7 +221,6 @@ def get_finding_detail(finding_id):
         "evidence": evidence,
     }
 
-
 def get_scan_findings_summary(run_id):
     """스캔 전체 결과 요약 (P5 리포트용)"""
     findings = Finding.objects.filter(scan_run_id=run_id).select_related("candidate")
@@ -261,10 +255,7 @@ def get_scan_findings_summary(run_id):
 
     return summary
 
-
-# ==========================================================
 # 내부 유틸
-# ==========================================================
 
 def _estimate_severity(vuln_type, priority_score):
     """vuln_type + priority_score로 severity 추정"""
@@ -283,3 +274,4 @@ def _estimate_severity(vuln_type, priority_score):
         if priority_score >= 0.5:
             return "medium"
         return "low"
+

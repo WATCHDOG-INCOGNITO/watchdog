@@ -40,7 +40,6 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: 1
           ignore-unfixed: true
-          trivyignores: .trivyignore
 
       - name: Generate SBOM (syft, SPDX-JSON)
         run: |

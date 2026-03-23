@@ -9,7 +9,6 @@ venv/
 # Env files
 .env
 .env.*
-api-key
 
 # Django / SQLite
 db.sqlite3
@@ -23,7 +22,3 @@ media/
 
 # Logs
 *.log
-
-# Local test targets
-docker/wargame/
-docker-compose.test.yml

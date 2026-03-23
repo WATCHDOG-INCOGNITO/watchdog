@@ -1,10 +1,6 @@
 import threading
 import json as json_mod
 
-
-from django.http import JsonResponse, HttpResponse
-from .reporting import build_report, serialize_report_json, serialize_report_md
-
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status, viewsets
@@ -26,12 +22,10 @@ from .serializers import (
 )
 from .reporting import build_report, serialize_report_json, serialize_report_md
 
-
 class StandardPagination(PageNumberPagination):
     page_size = 20
     page_size_query_param = "page_size"
     max_page_size = 100
-
 
 def _paginate(request, queryset, serializer_class):
     paginator = StandardPagination()
@@ -50,7 +44,6 @@ def health(request):
     except Exception:
         pass
     return Response({"ok": True, "db_alive": db_alive})
-
 
 @api_view(["GET", "POST"])
 def scan_runs(request):
@@ -73,7 +66,6 @@ def scan_runs(request):
         "message": "scan created",
     }, status=status.HTTP_201_CREATED)
 
-
 @api_view(["POST"])
 def start_scan(request, run_id):
     try:
@@ -87,7 +79,6 @@ def start_scan(request, run_id):
     threading.Thread(target=run_scan, args=(scan_run,), daemon=True).start()
     return Response({"run_id": str(scan_run.run_id), "status": "running", "message": "scan started"})
 
-
 @api_view(["GET"])
 def get_scan_run(request, run_id):
     try:
@@ -95,7 +86,6 @@ def get_scan_run(request, run_id):
     except ScanRun.DoesNotExist:
         return Response({"error": "run_id not found"}, status=status.HTTP_404_NOT_FOUND)
     return Response(ScanRunSerializer(scan_run).data)
-
 
 @api_view(["POST"])
 def create_request_catalog_item(request):
@@ -111,14 +101,12 @@ def create_request_catalog_item(request):
     serializer.save()
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-
 @api_view(["GET"])
 def list_request_catalog(request):
     run_id = request.query_params.get("run_id")
     if not run_id:
         return Response({"error": "run_id query param is required"}, status=status.HTTP_400_BAD_REQUEST)
     return _paginate(request, RequestCatalog.objects.filter(scan_run_id=run_id), RequestCatalogSerializer)
-
 
 @api_view(["POST"])
 def create_candidate(request):
@@ -134,14 +122,12 @@ def create_candidate(request):
     serializer.save()
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-
 @api_view(["GET"])
 def list_candidates(request):
     run_id = request.query_params.get("run_id")
     if not run_id:
         return Response({"error": "run_id query param is required"}, status=status.HTTP_400_BAD_REQUEST)
     return _paginate(request, Candidate.objects.filter(scan_run_id=run_id), CandidateSerializer)
-
 
 @api_view(["GET"])
 def get_candidate(request, cand_id):
@@ -151,14 +137,12 @@ def get_candidate(request, cand_id):
         return Response({"error": "candidate not found"}, status=status.HTTP_404_NOT_FOUND)
     return Response(CandidateSerializer(cand).data)
 
-
 @api_view(["GET"])
 def list_findings(request):
     run_id = request.query_params.get("run_id")
     if not run_id:
         return Response({"error": "run_id query param is required"}, status=status.HTTP_400_BAD_REQUEST)
     return _paginate(request, Finding.objects.filter(scan_run_id=run_id), FindingSerializer)
-
 
 @api_view(["GET"])
 def get_finding(request, finding_id):
@@ -167,7 +151,6 @@ def get_finding(request, finding_id):
     except Finding.DoesNotExist:
         return Response({"error": "finding_id not found"}, status=status.HTTP_404_NOT_FOUND)
     return Response(FindingSerializer(finding).data)
-
 
 @api_view(["POST"])
 def create_evidence_blob(request):
@@ -181,7 +164,6 @@ def create_evidence_blob(request):
         "sha256": blob.sha256,
         "byte_size": blob.byte_size,
     }, status=status.HTTP_201_CREATED)
-
 
 @api_view(["POST"])
 def create_finding_evidence_link(request):
@@ -200,7 +182,6 @@ def create_finding_evidence_link(request):
         "role": link.role,
     }, status=status.HTTP_201_CREATED)
 
-
 @api_view(["GET"])
 def list_finding_evidence_links(request):
     finding_id = request.query_params.get("finding_id")
@@ -210,42 +191,35 @@ def list_finding_evidence_links(request):
         FindingEvidenceLink.objects.filter(finding_id=finding_id), many=True
     ).data)
 
-
 class AgentTaskViewSet(viewsets.ModelViewSet):
     queryset = AgentTask.objects.all()
     serializer_class = AgentTaskSerializer
     lookup_field = "task_id"
-
 
 class VerificationLoopViewSet(viewsets.ModelViewSet):
     queryset = VerificationLoop.objects.all()
     serializer_class = VerificationLoopSerializer
     lookup_field = "loop_id"
 
-
 class HypothesisViewSet(viewsets.ModelViewSet):
     queryset = Hypothesis.objects.all()
     serializer_class = HypothesisSerializer
     lookup_field = "hypothesis_id"
-
 
 class VulnerabilityEntryViewSet(viewsets.ModelViewSet):
     queryset = VulnerabilityEntry.objects.all()
     serializer_class = VulnerabilityEntrySerializer
     lookup_field = "vuln_id"
 
-
 class PayloadPatternViewSet(viewsets.ModelViewSet):
     queryset = PayloadPattern.objects.filter(is_active=True)
     serializer_class = PayloadPatternSerializer
     lookup_field = "pattern_id"
 
-
 class ReportArchiveViewSet(viewsets.ModelViewSet):
     queryset = ReportArchive.objects.all()
     serializer_class = ReportArchiveSerializer
     lookup_field = "report_id"
-
 
 @api_view(["POST"])
 def confirm_candidate(request, cand_id):
@@ -264,7 +238,6 @@ def confirm_candidate(request, cand_id):
     except StorageError as e:
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-
 @api_view(["POST"])
 def dismiss_candidate(request, cand_id):
     from .storage_service import dismiss_candidate as do_dismiss, StorageError
@@ -273,7 +246,6 @@ def dismiss_candidate(request, cand_id):
         return Response(result)
     except StorageError as e:
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
 
 @api_view(["POST"])
 def attach_evidence(request, finding_id):
@@ -284,7 +256,6 @@ def attach_evidence(request, finding_id):
     except StorageError as e:
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-
 @api_view(["GET"])
 def finding_detail(request, finding_id):
     from .storage_service import get_finding_detail, StorageError
@@ -293,12 +264,10 @@ def finding_detail(request, finding_id):
     except StorageError as e:
         return Response({"error": str(e)}, status=status.HTTP_404_NOT_FOUND)
 
-
 @api_view(["GET"])
 def scan_findings_summary(request, run_id):
     from .storage_service import get_scan_findings_summary
     return Response(get_scan_findings_summary(run_id=run_id))
-
 
 @api_view(["POST"])
 def llm_analyze_candidates(request, run_id):
@@ -316,7 +285,6 @@ def llm_analyze_candidates(request, run_id):
     threading.Thread(target=run_llm_screen, args=(scan_run, max_candidates), daemon=True).start()
     return Response({"run_id": str(run_id), "message": "LLM analysis started", "max_candidates": max_candidates})
 
-
 @api_view(["POST"])
 def llm_analyze_single(request):
     import os
@@ -324,7 +292,6 @@ def llm_analyze_single(request):
         return Response({"error": "ANTHROPIC_API_KEY not set"}, status=status.HTTP_400_BAD_REQUEST)
     from .llm_router import analyze_candidate
     return Response(analyze_candidate(request.data))
-
 
 @api_view(["POST"])
 def start_verification(request, run_id):
@@ -344,7 +311,6 @@ def start_verification(request, run_id):
     ).start()
     return Response({"run_id": str(run_id), "message": "verification started", "max_candidates": max_candidates})
 
-
 @api_view(["POST"])
 def verify_single_candidate(request, cand_id):
     try:
@@ -357,12 +323,10 @@ def verify_single_candidate(request, cand_id):
     from .verifier import run_verification_loop
     return Response(run_verification_loop(candidate, candidate.scan_run))
 
-
 @api_view(["GET"])
 def list_verification_loops(request, cand_id):
     loops = VerificationLoop.objects.filter(candidate_id=cand_id).order_by("attempt_number")
     return Response({"cand_id": cand_id, "loops": VerificationLoopSerializer(loops, many=True).data})
-
 
 @api_view(["GET", "POST"])
 def scan_run_report(request, run_id):
@@ -391,3 +355,4 @@ def scan_run_report(request, run_id):
     if fmt in ("md", "markdown"):
         return Response({"run_id": run_id, "format": "md", "content": rr.markdown})
     return Response({"run_id": run_id, "format": "json", "content": json_mod.loads(rr.json)})
+

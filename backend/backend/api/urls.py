@@ -21,30 +21,12 @@ urlpatterns = [
     path("api/scan-runs/<str:run_id>/verify/", views.start_verification),
     path("api/scan-runs/<str:run_id>/report/", views.scan_run_report),
 
-    # Findings
-    path("api/findings/", views.list_findings),
-    path("api/findings/create/", views.create_finding),
-    path("api/findings/<str:finding_id>/", views.get_finding),
-
-    # Evidence Blobs
-    path("api/evidence-blobs/", views.create_evidence_blob),
-
-    # Request Catalog
     path("api/request-catalog/", views.create_request_catalog_item),
     path("api/request-catalog/list/", views.list_request_catalog),
 
     path("api/candidates/", views.create_candidate),
     path("api/candidates/list/", views.list_candidates),
     path("api/candidates/<str:cand_id>/", views.get_candidate),
-
-    # Finding-Evidence Links
-    path("api/finding-evidence-links/", views.create_finding_evidence_link),
-    path("api/finding-evidence-links/list/", views.list_finding_evidence_links),
-
-    # Candidate → Finding 승격
-    path("api/candidates/<str:cand_id>/promote/", views.promote_candidate_to_finding),
-
-    # P4 Storage API
     path("api/candidates/<str:cand_id>/confirm/", views.confirm_candidate),
     path("api/candidates/<str:cand_id>/dismiss/", views.dismiss_candidate),
     path("api/candidates/<str:cand_id>/verify/", views.verify_single_candidate),
@@ -61,14 +43,6 @@ urlpatterns = [
 
     path("api/llm/analyze/", views.llm_analyze_single),
 
-    # Verification (검증 루프)
-    path("api/scan-runs/<str:run_id>/verify/", views.start_verification),
-    path("api/candidates/<str:cand_id>/verify/", views.verify_single_candidate),
-    path("api/candidates/<str:cand_id>/loops/", views.list_verification_loops),
-
-    # ViewSets
     path("api/v1/", include(router.urls)),
-
-    # Reporting
-    path("api/scan-runs/<str:run_id>/report/", views.scan_run_report),
 ]
+

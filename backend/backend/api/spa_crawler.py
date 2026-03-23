@@ -21,7 +21,6 @@ from collections import deque
 
 logger = logging.getLogger(__name__)
 
-
 # API 엔드포인트 추출용 정규식
 API_PATTERNS = [
     # fetch/axios 호출
@@ -45,7 +44,6 @@ METHOD_PATTERN = re.compile(
     r"""(?:axios\.(\w+)\s*\()""",
     re.I | re.S,
 )
-
 
 class SPACrawler:
     """Playwright 기반 SPA 크롤러"""
@@ -447,7 +445,6 @@ class SPACrawler:
 
         return self.results
 
-
 def detect_spa(url, timeout=10):
     """
     URL이 SPA인지 판별.
@@ -531,3 +528,4 @@ def detect_spa(url, timeout=10):
     except Exception as e:
         logger.warning(f"SPA 판별 실패: {url} - {e}")
         return False
+
