@@ -27,3 +27,7 @@ media/
 # Local test targets
 docker/wargame/
 docker-compose.test.yml
+
+# GCP credentials
+gcp-key1.json
+*gcp*key*.json

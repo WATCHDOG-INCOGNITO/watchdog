@@ -9,7 +9,7 @@ services:
       POSTGRES_USER: bugbounty
       POSTGRES_PASSWORD: bugbounty123
     ports:
-      - "5432:5432"
+      - "15432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -27,12 +27,19 @@ services:
       DJANGO_SECRET_KEY: "change-this-in-production"
       DJANGO_DEBUG: "1"
       DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1,0.0.0.0"
-      DB_NAME: bugbounty_agent
-      DB_USER: bugbounty
-      DB_PASSWORD: bugbounty123
-      DB_HOST: db
+      DB_NAME: postgres
+      DB_USER: postgres
+      DB_PASSWORD: Watchdog12321!
+      DB_HOST: 34.64.149.118
       DB_PORT: "5432"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+
+      GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-key1.json
+      GCS_BUCKET_NAME: watchdog-evidence
+
+    volumes:
+      - ./gcp-key1.json:/app/gcp-key1.json:ro
+
     depends_on:
       db:
         condition: service_healthy
