@@ -6,17 +6,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
-
 @dataclass
 class ReportResult:
     run_id: str
     md_text: str
     json_obj: Dict[str, Any]
 
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 def build_report(run_id: str) -> ReportResult:
     """
@@ -36,9 +33,7 @@ def build_report(run_id: str) -> ReportResult:
 
     scan_run = ScanRun.objects.get(run_id=run_id)
 
-    # ----------------------------
     # Querysets
-    # ----------------------------
     candidates_qs = Candidate.objects.filter(scan_run_id=run_id).select_related("request")
     findings_qs = Finding.objects.filter(scan_run_id=run_id)
 
@@ -58,9 +53,7 @@ def build_report(run_id: str) -> ReportResult:
     blob_ids = set(direct_blob_ids) | set(linked_blob_ids)
     evidences_qs = EvidenceBlob.objects.filter(blob_id__in=blob_ids)
 
-    # ----------------------------
     # Items limits (payload 보호)
-    # ----------------------------
     TOP_CANDIDATES = 5
     MAX_FINDINGS = 50
     MAX_EVIDENCES = 50
@@ -176,10 +169,8 @@ def build_report(run_id: str) -> ReportResult:
 
     return ReportResult(run_id=run_id, md_text=md_text, json_obj=json_obj)
 
-
 def serialize_report_json(report: ReportResult) -> str:
     return json.dumps(report.json_obj, ensure_ascii=False, indent=2)
-
 
 def serialize_report_md(report: ReportResult) -> str:
     return report.md_text

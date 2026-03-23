@@ -10,30 +10,17 @@ http://127.0.0.1:8000
 
 ### 기존 엔드포인트
 
-### 기존 엔드포인트
-
 GET /health/
-
 POST /api/scan-runs/
 GET /api/scan-runs/{run_id}/
-POST /api/scan-runs/{run_id}/start/
-
 GET /api/findings/?run_id={run_id}
-
 POST /api/evidence-blobs/
-
 POST /api/request-catalog/
 GET /api/request-catalog/list/?run_id={run_id}
-
 POST /api/candidates/
 GET /api/candidates/list/?run_id={run_id}
-
 POST /api/finding-evidence-links/
 GET /api/finding-evidence-links/list/?finding_id={finding_id}
-
-POST /api/scan-runs/{run_id}/report/
-GET /api/scan-runs/{run_id}/report/
-GET /api/scan-runs/{run_id}/report/?export=md
 
 ### 신규 엔드포인트 (/api/v1/)
 
@@ -165,97 +152,3 @@ POST /api/v1/patterns/
 }
 
 응답에 success_rate, fp_rate가 자동 계산되어 포함된다.
-
----
-
-### Scan Run Report (P5)
-
-설명
-- run_id 기준으로 리포트를 생성/저장하고, 저장된 리포트를 JSON 또는 Markdown 형식으로 조회한다.
-- 산출물은 report.json(머신용) / report.md(사람용) 두 형식이다.
-
-1) Report 생성
-Request
-POST /api/scan-runs/{run_id}/report/
-Content-Type: application/json
-
-Request Body
-{}
-
-Success Response (201)
-{
-  "run_id": "<run_id>",
-  "report_id": "<uuid>",
-  "created_at": "<iso8601>",
-  "updated_at": "<iso8601>",
-  "message": "report generated"
-}
-
-Failure Response (404)
-{ "error": "run_id not found" }
-
-2) Report 조회 (JSON 기본)
-Request
-GET /api/scan-runs/{run_id}/report/
-
-Success Response (200)
-Content-Type: application/json
-
-Response Body 예시
-{
-  "run_id": "<run_id>",
-  "target_url": "http://test-target:8080",
-  "status": "completed",
-  "generated_at": "<iso8601>",
-  "candidates": {
-    "count": 1,
-    "top": []
-  },
-  "findings": {
-    "count": 0,
-    "by_severity": {
-      "info": 0,
-      "low": 0,
-      "medium": 0,
-      "high": 0,
-      "critical": 0
-    },
-    "items": []
-  },
-  "evidence": {
-    "count": 0,
-    "items": []
-  },
-  "notes": "generated"
-}
-
-Failure Response (404)
-{ "detail": "report not generated yet. POST this endpoint first." }
-
-3) Report 조회 (Markdown)
-Request
-GET /api/scan-runs/{run_id}/report/?export=md
-
-Success Response (200)
-Content-Type: text/markdown
-
-Response Body 예시
-# Watchdog Report
-
-## Run
-- run_id: `<run_id>`
-- target_url: `<target_url>`
-- status: `<status>`
-- generated_at: `<iso8601>`
-
-## Candidates
-- count: <number>
-
-## Findings
-- count: <number>
-
-## Evidence
-- count: <number>
-
-Failure Response (404)
-{ "detail": "report not generated yet. POST this endpoint first." }
