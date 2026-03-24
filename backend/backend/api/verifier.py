@@ -326,6 +326,11 @@ def run_verification_loop(candidate, scan_run):
     return output
 
 def run_verification_for_scan(scan_run, max_candidates=10, min_confidence=0.3):
+    import os
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        logger.warning(f"[{scan_run.run_id}] ANTHROPIC_API_KEY 없음, 검증 건너뜀")
+        return []
+
     candidates = Candidate.objects.filter(
         scan_run=scan_run, status="open", priority_score__gte=min_confidence,
     ).select_related("request").order_by("-priority_score")[:max_candidates]
