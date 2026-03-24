@@ -2,14 +2,12 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# 시스템 패키지 + 보안 도구
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-    libpq-dev curl wget git unzip nmap nikto whatweb dirb \
+    libpq-dev curl wget git unzip nmap \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 
-# Go 기반 도구 (nuclei, httpx, katana, dalfox 등)
 RUN curl -sL https://github.com/projectdiscovery/nuclei/releases/latest/download/nuclei_linux_amd64.zip -o /tmp/nuclei.zip \
   && unzip -o /tmp/nuclei.zip -d /usr/local/bin/ && rm /tmp/nuclei.zip && chmod +x /usr/local/bin/nuclei || true
 
@@ -35,8 +33,13 @@ ENV PYTHONUNBUFFERED=1
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Playwright Chromium
-RUN playwright install --with-deps chromium
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libnss3 libnspr4 libatk1.0-0t64 \
+    libatk-bridge2.0-0t64 libcups2t64 libdrm2 libxkbcommon0 libxcomposite1 \
+    libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 \
+    libxfixes3 fonts-unifont \
+  && apt-get clean && rm -rf /var/lib/apt/lists/* \
+  && playwright install chromium
 
 COPY . /app
 

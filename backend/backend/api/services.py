@@ -226,7 +226,7 @@ def run_scan(scan_run: ScanRun):
         logger.error(f"[{scan_run.run_id}] 스캔 실패: {e}")
         raise
 
-def run_llm_screen(scan_run: ScanRun, max_candidates=10):
+def run_llm_screen(scan_run: ScanRun, max_candidates=9999):
     """
     규칙 기반으로 뽑힌 candidate 중 상위 N개를 Claude로 분석한다.
     결과에 따라 candidate의 detection_stage, priority_score, features를 업데이트.
@@ -312,7 +312,7 @@ def run_llm_screen(scan_run: ScanRun, max_candidates=10):
     logger.info(f"[{scan_run.run_id}] LLM 스크리닝 완료: "
                 f"{len(results)}개 분석, {total_tokens} tokens")
 
-def run_verify(scan_run: ScanRun, max_candidates=5):
+def run_verify(scan_run: ScanRun, max_candidates=9999):
     """
     검증 루프: LLM 스크리닝 통과한 candidate에 실제 페이로드를 보내서 검증한다.
     """
