@@ -27,12 +27,16 @@ services:
       DJANGO_SECRET_KEY: "change-this-in-production"
       DJANGO_DEBUG: "1"
       DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1,0.0.0.0"
-      DB_NAME: bugbounty_agent
-      DB_USER: bugbounty
-      DB_PASSWORD: bugbounty123
-      DB_HOST: db
-      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-bugbounty_agent}
+      DB_USER: ${DB_USER:-bugbounty}
+      DB_PASSWORD: ${DB_PASSWORD:-bugbounty123}
+      DB_HOST: ${DB_HOST:-db}
+      DB_PORT: ${DB_PORT:-5432}
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+      GCS_BUCKET_NAME: ${GCS_BUCKET_NAME:-}
+    volumes:
+      - ./gcp-key1.json:/app/gcp-key1.json:ro
     depends_on:
       db:
         condition: service_healthy
