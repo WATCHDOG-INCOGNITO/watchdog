@@ -22,3 +22,8 @@ media/
 
 # Logs
 *.log
+
+# 민감 파일
+.env
+gcp-key1.json
+*.json.key

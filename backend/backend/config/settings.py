@@ -97,3 +97,7 @@ USE_TZ = True
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+
+# GCS 증거 저장소 설정
+GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "")
+GOOGLE_APPLICATION_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")

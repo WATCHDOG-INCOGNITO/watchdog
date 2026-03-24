@@ -275,3 +275,31 @@ def _estimate_severity(vuln_type, priority_score):
             return "medium"
         return "low"
 
+
+
+# ── GCS 증거 업로드 ──
+
+def upload_evidence_to_gcs(blob: "EvidenceBlob", content_bytes: bytes) -> str:
+    """EvidenceBlob의 content를 GCS에 업로드하고 storage_ref를 반환한다."""
+    from django.conf import settings
+    bucket_name = getattr(settings, "GCS_BUCKET_NAME", "")
+    if not bucket_name:
+        return "local://auto"
+
+    try:
+        from google.cloud import storage as gcs_storage
+        client = gcs_storage.Client()
+        bucket = client.bucket(bucket_name)
+        gcs_path = f"evidence/{blob.finding_id}/{blob.blob_id}/{blob.kind}"
+        gcs_blob = bucket.blob(gcs_path)
+        gcs_blob.upload_from_string(content_bytes, content_type="application/json")
+        ref = f"gs://{bucket_name}/{gcs_path}"
+        blob.storage_ref = ref
+        blob.save(update_fields=["storage_ref"])
+        return ref
+    except ImportError:
+        return "local://auto"
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"GCS upload failed: {e}")
+        return "local://auto"
