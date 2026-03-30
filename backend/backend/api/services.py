@@ -196,6 +196,12 @@ def run_rule_filter(scan_run: ScanRun):
 
 def run_scan(scan_run: ScanRun):
     """전체 스캔 파이프라인 (크롤링 → 필터링 → LLM 분석)"""
+    # MCP 모드 분기
+    config = scan_run.config or {}
+    if config.get("mode") == "mcp":
+        from .mcp_agent import run_mcp_scan
+        return run_mcp_scan(scan_run)
+
     try:
         scan_run.status = "running"
         scan_run.save(update_fields=["status"])
