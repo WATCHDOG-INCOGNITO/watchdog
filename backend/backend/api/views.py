@@ -75,9 +75,31 @@ def start_scan(request, run_id):
     if scan_run.status != "queued":
         return Response({"error": f"scan is already {scan_run.status}"}, status=status.HTTP_400_BAD_REQUEST)
 
+    # config.mode == "mcp"이면 MCP 에이전트 루프 사용
+    config = scan_run.config or {}
+    if config.get("mode") == "mcp":
+        from .mcp_agent import run_mcp_scan
+        threading.Thread(target=run_mcp_scan, args=(scan_run,), daemon=True).start()
+        return Response({"run_id": str(scan_run.run_id), "status": "running", "message": "MCP agent scan started"})
+
     from .services import run_scan
     threading.Thread(target=run_scan, args=(scan_run,), daemon=True).start()
     return Response({"run_id": str(scan_run.run_id), "status": "running", "message": "scan started"})
+
+
+@api_view(["POST"])
+def start_mcp_scan(request, run_id):
+    """MCP 에이전트 루프를 사용하는 스캔 시작 엔드포인트."""
+    try:
+        scan_run = ScanRun.objects.get(run_id=run_id)
+    except ScanRun.DoesNotExist:
+        return Response({"error": "run_id not found"}, status=status.HTTP_404_NOT_FOUND)
+    if scan_run.status != "queued":
+        return Response({"error": f"scan is already {scan_run.status}"}, status=status.HTTP_400_BAD_REQUEST)
+
+    from .mcp_agent import run_mcp_scan
+    threading.Thread(target=run_mcp_scan, args=(scan_run,), daemon=True).start()
+    return Response({"run_id": str(scan_run.run_id), "status": "running", "message": "MCP agent scan started"})
 
 @api_view(["GET"])
 def get_scan_run(request, run_id):

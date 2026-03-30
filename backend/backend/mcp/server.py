@@ -11,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP(
     "Watchdog Security Scanner",
-    description=(
+    instructions=(
         "AI-powered web vulnerability scanner. "
         "Tools: sqlmap(SQLi), nuclei(templates), dalfox(XSS), "
         "Chrome DevTools(SPA/network), HTTP requests, "
