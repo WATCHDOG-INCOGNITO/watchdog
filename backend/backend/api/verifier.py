@@ -21,6 +21,7 @@ import requests
 from django.utils import timezone
 
 from .models import Candidate, ScanRun, VerificationLoop
+from .scan_control import ScanStopped, raise_if_stop_requested
 from .storage_service import confirm_candidate
 from .llm_router import (
     generate_initial_payloads,
@@ -103,6 +104,7 @@ def _flat_params(params):
     return flat
 
 def run_verification_loop(candidate, scan_run):
+    raise_if_stop_requested(scan_run)
     vuln_type = candidate.vuln_type
     req = candidate.request
     if not req:
@@ -121,209 +123,217 @@ def run_verification_loop(candidate, scan_run):
 
     logger.info(f"[{candidate.cand_id}] LLM 주도 검증 시작: {method} {endpoint} ({vuln_type})")
 
-    # 1단계: LLM에게 초기 페이로드 생성 요청
-    plan = generate_initial_payloads(vuln_type, endpoint, method, params, context)
-    strategy = plan.get("strategy", "unknown")
-    stages = plan.get("stages", [])
-    total_tokens = 0
+    try:
+        # 1단계: LLM에게 초기 페이로드 생성 요청
+        plan = generate_initial_payloads(vuln_type, endpoint, method, params, context)
+        strategy = plan.get("strategy", "unknown")
+        stages = plan.get("stages", [])
+        total_tokens = 0
 
-    usage = plan.get("_usage", {})
-    total_tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-
-    if not stages:
-        logger.warning(f"[{candidate.cand_id}] LLM이 페이로드를 생성하지 못함")
-        candidate.status = "open"
-        candidate.save(update_fields=["status"])
-        return {"verified": False, "confidence": 0.0, "detail": "LLM failed to generate payloads",
-                "attempts": 0, "finding_id": None}
-
-    # 모든 stage의 payload를 flat list로
-    all_payloads = []
-    for stage in stages:
-        for pl in stage.get("payloads", []):
-            pl["_stage"] = stage.get("stage", "unknown")
-            all_payloads.append(pl)
-
-    attempt_history = []
-    verified = False
-    final_confidence = 0.0
-    final_detail = ""
-    evidence_list = []
-    attempt_num = 0
-
-    # 2단계: 페이로드 실행 + LLM 분석 루프
-    pending_payloads = list(all_payloads)
-
-    while pending_payloads and attempt_num < MAX_ATTEMPTS:
-        pl = pending_payloads.pop(0)
-        attempt_num += 1
-        param_name = pl.get("param", list(params.keys())[0] if params else "q")
-        payload_value = pl.get("value", "")
-        pl_method = pl.get("method", method).upper()
-
-        logger.info(f"[{candidate.cand_id}] attempt {attempt_num}/{MAX_ATTEMPTS}: "
-                     f"{param_name}={payload_value[:60]}")
-
-        # 실제 요청 전송
-        other_params = {k: v for k, v in params.items() if k != param_name}
-        resp = executor.execute(endpoint, pl_method, param_name, payload_value, other_params)
-        time.sleep(DELAY_BETWEEN)
-
-        if resp.get("error"):
-            attempt_history.append({"payload": payload_value, "status_code": None,
-                                     "indicator_matched": False, "error": resp["error"]})
-            continue
-
-        # 로컬 indicator 체크
-        indicator_matched = _check_indicator(resp, pl.get("success_indicator"))
-
-        attempt_record = {
-            "payload": payload_value,
-            "param": param_name,
-            "stage": pl.get("_stage", "unknown"),
-            "status_code": resp["status_code"],
-            "elapsed": resp["elapsed"],
-            "content_length": resp["content_length"],
-            "indicator_matched": indicator_matched,
-        }
-
-        # LLM에게 응답 분석 + 다음 행동 결정 요청
-        decision = analyze_response_and_decide(
-            vuln_type, endpoint, pl_method,
-            payload_sent=pl,
-            response_data=resp,
-            attempt_history=attempt_history,
-        )
-
-        usage = decision.get("_usage", {})
+        usage = plan.get("_usage", {})
         total_tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
 
-        attempt_record["llm_analysis"] = decision.get("analysis", "")
-        attempt_record["llm_vulnerable"] = decision.get("vulnerable")
-        attempt_record["llm_confidence"] = decision.get("confidence", 0.0)
-        attempt_history.append(attempt_record)
+        if not stages:
+            logger.warning(f"[{candidate.cand_id}] LLM이 페이로드를 생성하지 못함")
+            candidate.status = "open"
+            candidate.save(update_fields=["status"])
+            return {"verified": False, "confidence": 0.0, "detail": "LLM failed to generate payloads",
+                    "attempts": 0, "finding_id": None}
 
-        # VerificationLoop 기록
-        VerificationLoop.objects.create(
-            candidate=candidate,
-            attempt_number=attempt_num,
-            payload_sent=payload_value[:1000],
-            response_status=resp["status_code"],
-            response_body_hash=resp["body_hash"],
-            analysis_result={
+        # 모든 stage의 payload를 flat list로
+        all_payloads = []
+        for stage in stages:
+            for pl in stage.get("payloads", []):
+                pl["_stage"] = stage.get("stage", "unknown")
+                all_payloads.append(pl)
+
+        attempt_history = []
+        verified = False
+        final_confidence = 0.0
+        final_detail = ""
+        evidence_list = []
+        attempt_num = 0
+
+        # 2단계: 페이로드 실행 + LLM 분석 루프
+        pending_payloads = list(all_payloads)
+
+        while pending_payloads and attempt_num < MAX_ATTEMPTS:
+            raise_if_stop_requested(scan_run)
+            pl = pending_payloads.pop(0)
+            attempt_num += 1
+            param_name = pl.get("param", list(params.keys())[0] if params else "q")
+            payload_value = pl.get("value", "")
+            pl_method = pl.get("method", method).upper()
+
+            logger.info(f"[{candidate.cand_id}] attempt {attempt_num}/{MAX_ATTEMPTS}: "
+                         f"{param_name}={payload_value[:60]}")
+
+            # 실제 요청 전송
+            other_params = {k: v for k, v in params.items() if k != param_name}
+            resp = executor.execute(endpoint, pl_method, param_name, payload_value, other_params)
+            raise_if_stop_requested(scan_run)
+            time.sleep(DELAY_BETWEEN)
+
+            if resp.get("error"):
+                attempt_history.append({"payload": payload_value, "status_code": None,
+                                         "indicator_matched": False, "error": resp["error"]})
+                continue
+
+            # 로컬 indicator 체크
+            indicator_matched = _check_indicator(resp, pl.get("success_indicator"))
+
+            attempt_record = {
+                "payload": payload_value,
+                "param": param_name,
+                "stage": pl.get("_stage", "unknown"),
+                "status_code": resp["status_code"],
+                "elapsed": resp["elapsed"],
+                "content_length": resp["content_length"],
                 "indicator_matched": indicator_matched,
-                "llm_vulnerable": decision.get("vulnerable"),
-                "llm_confidence": decision.get("confidence", 0.0),
-                "llm_analysis": decision.get("analysis", "")[:500],
-                "next_action": decision.get("next_action", ""),
-                "evidence_found": decision.get("evidence_found", ""),
-            },
-            next_action=decision.get("next_action", "abort"),
-        )
+            }
 
-        next_action = decision.get("next_action", "abort")
+            # LLM에게 응답 분석 + 다음 행동 결정 요청
+            decision = analyze_response_and_decide(
+                vuln_type, endpoint, pl_method,
+                payload_sent=pl,
+                response_data=resp,
+                attempt_history=attempt_history,
+            )
 
-        # 증거 수집
-        if decision.get("evidence_found"):
-            evidence_list.append({
-                "kind": "request",
-                "content": json.dumps({
-                    "attempt": attempt_num,
-                    "param": param_name,
-                    "payload": payload_value,
-                    "response_status": resp["status_code"],
-                    "response_time": resp["elapsed"],
-                    "evidence": decision.get("evidence_found", ""),
-                    "llm_analysis": decision.get("analysis", ""),
-                    "response_snippet": resp["body"][:500],
-                }, ensure_ascii=False),
-                "role": "primary" if decision.get("vulnerable") else "supporting",
-            })
-
-        if next_action == "abort":
-            logger.info(f"[{candidate.cand_id}] LLM abort 판정")
-            break
-
-        if next_action == "confirm" and decision.get("vulnerable"):
-            verified = True
-            final_confidence = decision.get("confidence", 0.9)
-            final_detail = decision.get("analysis", "LLM confirmed vulnerability")
-            break
-
-        # LLM이 생성한 다음 페이로드를 큐에 추가
-        next_payloads = decision.get("next_payloads", [])
-        for np in next_payloads:
-            np["_stage"] = "llm_generated"
-            pending_payloads.insert(0, np)
-
-        # WAF 차단 감지 → 우회 시도
-        if resp["status_code"] in (403, 406, 429) and payload_value:
-            logger.info(f"[{candidate.cand_id}] WAF 차단 감지, 우회 시도")
-            bypass = mutate_payload_for_bypass(payload_value, vuln_type, resp["body"][:500])
-            usage = bypass.get("_usage", {})
+            usage = decision.get("_usage", {})
             total_tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-            for m in bypass.get("mutations", [])[:3]:
-                pending_payloads.insert(0, {
-                    "param": param_name,
-                    "value": m.get("value", ""),
-                    "method": pl_method,
-                    "description": f"WAF bypass: {m.get('technique', '')}",
-                    "success_indicator": pl.get("success_indicator", {}),
-                    "_stage": "waf_bypass",
+
+            attempt_record["llm_analysis"] = decision.get("analysis", "")
+            attempt_record["llm_vulnerable"] = decision.get("vulnerable")
+            attempt_record["llm_confidence"] = decision.get("confidence", 0.0)
+            attempt_history.append(attempt_record)
+
+            # VerificationLoop 기록
+            VerificationLoop.objects.create(
+                candidate=candidate,
+                attempt_number=attempt_num,
+                payload_sent=payload_value[:1000],
+                response_status=resp["status_code"],
+                response_body_hash=resp["body_hash"],
+                analysis_result={
+                    "indicator_matched": indicator_matched,
+                    "llm_vulnerable": decision.get("vulnerable"),
+                    "llm_confidence": decision.get("confidence", 0.0),
+                    "llm_analysis": decision.get("analysis", "")[:500],
+                    "next_action": decision.get("next_action", ""),
+                    "evidence_found": decision.get("evidence_found", ""),
+                },
+                next_action=decision.get("next_action", "abort"),
+            )
+
+            next_action = decision.get("next_action", "abort")
+
+            # 증거 수집
+            if decision.get("evidence_found"):
+                evidence_list.append({
+                    "kind": "request",
+                    "content": json.dumps({
+                        "attempt": attempt_num,
+                        "param": param_name,
+                        "payload": payload_value,
+                        "response_status": resp["status_code"],
+                        "response_time": resp["elapsed"],
+                        "evidence": decision.get("evidence_found", ""),
+                        "llm_analysis": decision.get("analysis", ""),
+                        "response_snippet": resp["body"][:500],
+                    }, ensure_ascii=False),
+                    "role": "primary" if decision.get("vulnerable") else "supporting",
                 })
 
-    # 3단계: 최종 판정
-    if not verified and attempt_history:
-        verdict = make_final_verdict(vuln_type, f"{method} {endpoint}", attempt_history)
-        usage = verdict.get("_usage", {})
-        total_tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            if next_action == "abort":
+                logger.info(f"[{candidate.cand_id}] LLM abort 판정")
+                break
 
-        if verdict.get("verdict") == "confirmed":
-            verified = True
-            final_confidence = verdict.get("confidence", 0.8)
-            final_detail = verdict.get("summary", "LLM final verdict: confirmed")
-        elif verdict.get("verdict") == "likely":
-            final_confidence = verdict.get("confidence", 0.5)
-            final_detail = verdict.get("summary", "LLM final verdict: likely")
+            if next_action == "confirm" and decision.get("vulnerable"):
+                verified = True
+                final_confidence = decision.get("confidence", 0.9)
+                final_detail = decision.get("analysis", "LLM confirmed vulnerability")
+                break
+
+            # LLM이 생성한 다음 페이로드를 큐에 추가
+            next_payloads = decision.get("next_payloads", [])
+            for np in next_payloads:
+                np["_stage"] = "llm_generated"
+                pending_payloads.insert(0, np)
+
+            # WAF 차단 감지 → 우회 시도
+            if resp["status_code"] in (403, 406, 429) and payload_value:
+                logger.info(f"[{candidate.cand_id}] WAF 차단 감지, 우회 시도")
+                bypass = mutate_payload_for_bypass(payload_value, vuln_type, resp["body"][:500])
+                usage = bypass.get("_usage", {})
+                total_tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+                for m in bypass.get("mutations", [])[:3]:
+                    pending_payloads.insert(0, {
+                        "param": param_name,
+                        "value": m.get("value", ""),
+                        "method": pl_method,
+                        "description": f"WAF bypass: {m.get('technique', '')}",
+                        "success_indicator": pl.get("success_indicator", {}),
+                        "_stage": "waf_bypass",
+                    })
+
+        # 3단계: 최종 판정
+        if not verified and attempt_history:
+            raise_if_stop_requested(scan_run)
+            verdict = make_final_verdict(vuln_type, f"{method} {endpoint}", attempt_history)
+            usage = verdict.get("_usage", {})
+            total_tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+
+            if verdict.get("verdict") == "confirmed":
+                verified = True
+                final_confidence = verdict.get("confidence", 0.8)
+                final_detail = verdict.get("summary", "LLM final verdict: confirmed")
+            elif verdict.get("verdict") == "likely":
+                final_confidence = verdict.get("confidence", 0.5)
+                final_detail = verdict.get("summary", "LLM final verdict: likely")
+            else:
+                final_confidence = verdict.get("confidence", 0.0)
+                final_detail = verdict.get("summary", "LLM final verdict: not vulnerable")
+
+        # 결과 처리
+        output = {
+            "verified": verified,
+            "confidence": final_confidence,
+            "detail": final_detail,
+            "attempts": attempt_num,
+            "finding_id": None,
+            "strategy": strategy,
+            "total_llm_tokens": total_tokens,
+        }
+
+        if verified:
+            try:
+                confirm_result = confirm_candidate(
+                    cand_id=candidate.cand_id,
+                    confidence=final_confidence,
+                    summary=final_detail,
+                    evidence_list=evidence_list,
+                )
+                output["finding_id"] = confirm_result["finding_id"]
+                logger.info(f"[{candidate.cand_id}] 취약점 확정: finding={confirm_result['finding_id']}")
+            except Exception as e:
+                logger.error(f"[{candidate.cand_id}] confirm 실패: {e}")
         else:
-            final_confidence = verdict.get("confidence", 0.0)
-            final_detail = verdict.get("summary", "LLM final verdict: not vulnerable")
+            candidate.status = "open"
+            candidate.save(update_fields=["status"])
 
-    # 결과 처리
-    output = {
-        "verified": verified,
-        "confidence": final_confidence,
-        "detail": final_detail,
-        "attempts": attempt_num,
-        "finding_id": None,
-        "strategy": strategy,
-        "total_llm_tokens": total_tokens,
-    }
+        # LLM 비용 기록
+        from decimal import Decimal
+        scan_run.llm_calls_count += attempt_num
+        scan_run.llm_tokens_used += total_tokens
+        scan_run.llm_cost_usd += Decimal(str(round(total_tokens * 0.005 / 1000, 4)))
+        scan_run.save(update_fields=["llm_calls_count", "llm_tokens_used", "llm_cost_usd"])
 
-    if verified:
-        try:
-            confirm_result = confirm_candidate(
-                cand_id=candidate.cand_id,
-                confidence=final_confidence,
-                summary=final_detail,
-                evidence_list=evidence_list,
-            )
-            output["finding_id"] = confirm_result["finding_id"]
-            logger.info(f"[{candidate.cand_id}] 취약점 확정: finding={confirm_result['finding_id']}")
-        except Exception as e:
-            logger.error(f"[{candidate.cand_id}] confirm 실패: {e}")
-    else:
+        return output
+    except ScanStopped:
         candidate.status = "open"
         candidate.save(update_fields=["status"])
-
-    # LLM 비용 기록
-    from decimal import Decimal
-    scan_run.llm_calls_count += attempt_num
-    scan_run.llm_tokens_used += total_tokens
-    scan_run.llm_cost_usd += Decimal(str(round(total_tokens * 0.005 / 1000, 4)))
-    scan_run.save(update_fields=["llm_calls_count", "llm_tokens_used", "llm_cost_usd"])
-
-    return output
+        raise
 
 def run_verification_for_scan(scan_run, max_candidates=10, min_confidence=0.3):
     import os
@@ -352,4 +362,3 @@ def run_verification_for_scan(scan_run, max_candidates=10, min_confidence=0.3):
     verified_count = sum(1 for r in results if r["verified"])
     logger.info(f"[{scan_run.run_id}] 검증 완료: {verified_count}/{len(results)} 확정")
     return results
-
