@@ -8,19 +8,20 @@ from rest_framework.pagination import PageNumberPagination
 from django.db import connection
 
 from .models import (
-    ScanRun, RequestCatalog, Candidate, Finding, EvidenceBlob,
+    ScanRun, LLMTrace, RequestCatalog, Candidate, Finding, EvidenceBlob,
     FindingEvidenceLink, AgentTask, VerificationLoop, Hypothesis,
     VisualAnalysis, IDORTestSession, WAFBypassAttempt,
     VulnerabilityEntry, PayloadPattern, ReportArchive, RunReport,
 )
 from .serializers import (
-    ScanRunSerializer, RequestCatalogSerializer, CandidateSerializer,
+    ScanRunSerializer, LLMTraceSerializer, RequestCatalogSerializer, CandidateSerializer,
     FindingSerializer, EvidenceBlobSerializer, FindingEvidenceLinkSerializer,
     AgentTaskSerializer, VerificationLoopSerializer, HypothesisSerializer,
     VisualAnalysisSerializer, IDORTestSessionSerializer, WAFBypassAttemptSerializer,
     VulnerabilityEntrySerializer, PayloadPatternSerializer, ReportArchiveSerializer,
 )
 from .reporting import build_report, serialize_report_json, serialize_report_md
+from .scan_control import request_scan_stop
 
 class StandardPagination(PageNumberPagination):
     page_size = 20
@@ -88,6 +89,24 @@ def start_scan(request, run_id):
 
 
 @api_view(["POST"])
+def stop_scan(request, run_id):
+    try:
+        scan_run = ScanRun.objects.get(run_id=run_id)
+    except ScanRun.DoesNotExist:
+        return Response({"error": "run_id not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    if scan_run.status not in ("queued", "running"):
+        return Response({"error": f"scan is already {scan_run.status}"}, status=status.HTTP_400_BAD_REQUEST)
+
+    request_scan_stop(scan_run)
+    return Response({
+        "run_id": str(scan_run.run_id),
+        "status": "stopped",
+        "message": "stop requested",
+    })
+
+
+@api_view(["POST"])
 def start_mcp_scan(request, run_id):
     """MCP 에이전트 루프를 사용하는 스캔 시작 엔드포인트."""
     try:
@@ -108,6 +127,15 @@ def get_scan_run(request, run_id):
     except ScanRun.DoesNotExist:
         return Response({"error": "run_id not found"}, status=status.HTTP_404_NOT_FOUND)
     return Response(ScanRunSerializer(scan_run).data)
+
+
+@api_view(["GET"])
+def scan_run_llm_traces(request, run_id):
+    if not ScanRun.objects.filter(run_id=run_id).exists():
+        return Response({"error": "run_id not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    queryset = LLMTrace.objects.filter(scan_run_id=run_id).order_by("-call_index", "-created_at")
+    return _paginate(request, queryset, LLMTraceSerializer)
 
 @api_view(["POST"])
 def create_request_catalog_item(request):
@@ -377,4 +405,3 @@ def scan_run_report(request, run_id):
     if fmt in ("md", "markdown"):
         return Response({"run_id": run_id, "format": "md", "content": rr.markdown})
     return Response({"run_id": run_id, "format": "json", "content": json_mod.loads(rr.json)})
-
