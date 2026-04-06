@@ -112,12 +112,24 @@ def start_mcp_scan(request, run_id):
     threading.Thread(target=run_mcp_scan, args=(scan_run,), daemon=True).start()
     return Response({"run_id": str(scan_run.run_id), "status": "running", "message": "MCP agent scan started"})
 
-@api_view(["GET"])
+@api_view(["GET", "PATCH"])
 def get_scan_run(request, run_id):
     try:
         scan_run = ScanRun.objects.get(run_id=run_id)
     except ScanRun.DoesNotExist:
         return Response({"error": "run_id not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == "PATCH":
+        allowed = {"status", "request_budget_used", "llm_calls_count", "llm_tokens_used", "llm_cost_usd", "finished_at"}
+        update_fields = []
+        for field in allowed:
+            if field in request.data:
+                setattr(scan_run, field, request.data[field])
+                update_fields.append(field)
+        if update_fields:
+            update_fields.append("updated_at")
+            scan_run.save(update_fields=update_fields)
+
     return Response(ScanRunSerializer(scan_run).data)
 
 
@@ -157,8 +169,25 @@ def create_candidate(request):
         return Response({"error": "run_id is required"}, status=status.HTTP_400_BAD_REQUEST)
     if not ScanRun.objects.filter(run_id=run_id).exists():
         return Response({"error": "run_id not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    endpoint = request.data.get("endpoint", "")
+    method = request.data.get("method", "GET")
+    params = request.data.get("params", {})
+
+    req_catalog = None
+    if endpoint:
+        req_catalog = RequestCatalog.objects.create(
+            scan_run_id=run_id,
+            endpoint=endpoint,
+            method=method.upper(),
+            params=params if isinstance(params, dict) else {},
+            source="api_manual",
+        )
+
     data = request.data.copy()
     data["scan_run"] = run_id
+    if req_catalog:
+        data["request"] = str(req_catalog.req_id)
     serializer = CandidateSerializer(data=data)
     serializer.is_valid(raise_exception=True)
     serializer.save()

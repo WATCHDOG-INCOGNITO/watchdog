@@ -15,3 +15,6 @@ db.sqlite3
 .git/
 .github/
 
+# old MCP module (replaced by watchdog_mcp/)
+mcp_tools/
+
