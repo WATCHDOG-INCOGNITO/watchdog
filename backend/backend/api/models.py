@@ -9,6 +9,7 @@ class ScanRun(models.Model):
         RUNNING = "running"
         FINISHED = "finished"
         FAILED = "failed"
+        STOPPED = "stopped"
 
     class Mode(models.TextChoices):
         HYBRID_MAX = "hybrid-max"
@@ -19,6 +20,7 @@ class ScanRun(models.Model):
     mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.HYBRID_LITE)
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.QUEUED)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
     finished_at = models.DateTimeField(null=True, blank=True)
 
     request_budget_total = models.IntegerField(default=10)
@@ -33,6 +35,35 @@ class ScanRun(models.Model):
     class Meta:
         db_table = "scan_runs"
         ordering = ["-created_at"]
+
+    def save(self, *args, **kwargs):
+        update_fields = kwargs.get("update_fields")
+        if update_fields is not None:
+            fields = set(update_fields)
+            fields.add("updated_at")
+            kwargs["update_fields"] = list(fields)
+        super().save(*args, **kwargs)
+
+
+class LLMTrace(models.Model):
+    trace_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="llm_traces")
+    call_index = models.IntegerField(default=0)
+    stage = models.CharField(max_length=32, default="analysis")
+    model = models.CharField(max_length=64, blank=True, default="")
+    prompt_preview = models.TextField(blank=True, default="")
+    response_preview = models.TextField(blank=True, default="")
+    tool_calls = models.JSONField(default=list, blank=True)
+    stop_reason = models.CharField(max_length=64, blank=True, default="")
+    input_tokens = models.IntegerField(default=0)
+    output_tokens = models.IntegerField(default=0)
+    metadata = models.JSONField(default=dict, blank=True)
+    error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "llm_traces"
+        ordering = ["-call_index", "-created_at"]
 
 class RequestCatalog(models.Model):
     req_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -389,4 +420,3 @@ class RunReport(models.Model):
 
     class Meta:
         db_table = "run_reports"
-

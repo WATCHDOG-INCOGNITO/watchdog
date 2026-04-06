@@ -36,7 +36,24 @@ for _p in _app_paths:
     if _p not in sys.path:
         sys.path.append(_p)
 
+from .error_utils import summarize_exception  # noqa: E402
+from .llm_trace_store import (  # noqa: E402
+    build_prompt_preview,
+    build_response_preview,
+    extract_tool_calls,
+    record_llm_trace,
+    summarize_tool_results,
+)
 from .models import ScanRun  # noqa: E402
+from .scan_control import (  # noqa: E402
+    ScanStopped,
+    is_stop_requested,
+    mark_scan_stopped,
+    raise_if_stop_requested,
+    register_scan,
+    stop_sleep,
+    unregister_scan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +221,7 @@ async def _run_agent_loop(scan_run: ScanRun):
 
         # ── 에이전트 루프 ──
         for turn in range(MAX_TURNS):
+            raise_if_stop_requested(scan_run)
             logger.info(f"[{scan_run.run_id}] 턴 {turn + 1}/{MAX_TURNS}")
 
             # Rate limit 재시도 (최대 3회, 지수 백오프)
@@ -219,12 +237,17 @@ async def _run_agent_loop(scan_run: ScanRun):
                     )
                     break
                 except Exception as api_err:
-                    if "rate_limit" in str(api_err).lower() or "429" in str(api_err):
+                    if (
+                        "rate_limit" in str(api_err).lower()
+                        or "429" in str(api_err)
+                        or "529" in str(api_err)
+                        or "overloaded" in str(api_err).lower()
+                    ):
                         wait = 30 * (2 ** retry)  # 30s, 60s, 120s
                         logger.warning(
                             f"[{scan_run.run_id}] Rate limit, {wait}s 대기 후 재시도 ({retry+1}/3)"
                         )
-                        time.sleep(wait)
+                        stop_sleep(scan_run, wait)
                     else:
                         raise
             if response is None:
@@ -246,6 +269,10 @@ async def _run_agent_loop(scan_run: ScanRun):
                 "llm_calls_count", "llm_tokens_used", "llm_cost_usd",
             ])
 
+            prompt_preview = build_prompt_preview(messages)
+            response_preview = build_response_preview(response.content)
+            tool_calls = extract_tool_calls(response.content)
+
             # stop_reason이 end_turn이면 종료
             if response.stop_reason == "end_turn":
                 for block in response.content:
@@ -254,6 +281,22 @@ async def _run_agent_loop(scan_run: ScanRun):
                             f"[{scan_run.run_id}] 에이전트 최종 응답: "
                             f"{block.text[:500]}"
                         )
+                await sync_to_async(record_llm_trace)(
+                    scan_run=scan_run,
+                    call_index=total_calls,
+                    stage="mcp_turn",
+                    model=MODEL,
+                    prompt_preview=prompt_preview,
+                    response_preview=response_preview,
+                    tool_calls=tool_calls,
+                    stop_reason=response.stop_reason,
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                    metadata={
+                        "turn": turn + 1,
+                        "message_count": len(messages),
+                    },
+                )
                 break
 
             # tool_use 블록 처리
@@ -261,6 +304,22 @@ async def _run_agent_loop(scan_run: ScanRun):
                 b for b in response.content if b.type == "tool_use"
             ]
             if not tool_use_blocks:
+                await sync_to_async(record_llm_trace)(
+                    scan_run=scan_run,
+                    call_index=total_calls,
+                    stage="mcp_turn",
+                    model=MODEL,
+                    prompt_preview=prompt_preview,
+                    response_preview=response_preview,
+                    tool_calls=tool_calls,
+                    stop_reason=response.stop_reason,
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                    metadata={
+                        "turn": turn + 1,
+                        "message_count": len(messages),
+                    },
+                )
                 break
 
             # assistant 메시지 추가
@@ -269,6 +328,7 @@ async def _run_agent_loop(scan_run: ScanRun):
             # 각 도구 호출을 올바른 MCP 세션으로 라우팅
             tool_results = []
             for tool_block in tool_use_blocks:
+                raise_if_stop_requested(scan_run)
                 tool_name = tool_block.name
                 tool_args = tool_block.input or {}
 
@@ -313,6 +373,24 @@ async def _run_agent_loop(scan_run: ScanRun):
                     "is_error": is_error,
                 })
 
+            await sync_to_async(record_llm_trace)(
+                scan_run=scan_run,
+                call_index=total_calls,
+                stage="mcp_turn",
+                model=MODEL,
+                prompt_preview=prompt_preview,
+                response_preview=response_preview,
+                tool_calls=tool_calls,
+                stop_reason=response.stop_reason,
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                metadata={
+                    "turn": turn + 1,
+                    "message_count": len(messages),
+                    "tool_results": summarize_tool_results(tool_results),
+                },
+            )
+
             messages.append({"role": "user", "content": tool_results})
 
         else:
@@ -330,20 +408,39 @@ async def _run_agent_loop(scan_run: ScanRun):
 
 def run_mcp_scan(scan_run: ScanRun):
     """MCP 에이전트 루프로 스캔을 실행한다 (동기 래퍼)."""
+    register_scan(scan_run.run_id)
     try:
+        if is_stop_requested(scan_run.run_id):
+            mark_scan_stopped(scan_run)
+            return
+
         scan_run.status = "running"
-        scan_run.save(update_fields=["status"])
+        scan_run.finished_at = None
+        scan_run.error_log = None
+        scan_run.save(update_fields=["status", "finished_at", "error_log"])
 
         asyncio.run(_run_agent_loop(scan_run))
 
-        scan_run.status = "finished"
-        scan_run.finished_at = timezone.now()
-        scan_run.save(update_fields=["status", "finished_at"])
+        if is_stop_requested(scan_run.run_id):
+            mark_scan_stopped(scan_run)
+            logger.info(f"[{scan_run.run_id}] MCP 스캔 중지")
+        else:
+            scan_run.status = "finished"
+            scan_run.finished_at = timezone.now()
+            scan_run.save(update_fields=["status", "finished_at"])
+            logger.info(f"[{scan_run.run_id}] MCP 스캔 완료")
 
-        logger.info(f"[{scan_run.run_id}] MCP 스캔 완료")
-
+    except ScanStopped as e:
+        mark_scan_stopped(scan_run, str(e))
+        logger.info(f"[{scan_run.run_id}] MCP 스캔 중지: {e}")
     except Exception as e:
-        scan_run.status = "failed"
-        scan_run.error_log = str(e)[:2000]
-        scan_run.save(update_fields=["status", "error_log"])
-        logger.error(f"[{scan_run.run_id}] MCP 스캔 실패: {e}", exc_info=True)
+        if is_stop_requested(scan_run.run_id):
+            mark_scan_stopped(scan_run)
+            logger.info(f"[{scan_run.run_id}] MCP 스캔 중지 중 예외 발생: {e}")
+        else:
+            scan_run.status = "failed"
+            scan_run.error_log = summarize_exception(e)
+            scan_run.save(update_fields=["status", "error_log"])
+            logger.error(f"[{scan_run.run_id}] MCP 스캔 실패: {e}", exc_info=True)
+    finally:
+        unregister_scan(scan_run.run_id)

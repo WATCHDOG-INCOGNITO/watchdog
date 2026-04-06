@@ -27,3 +27,5 @@ media/
 .env
 gcp-key1.json
 *.json.key
+
+frontend/node_modules/
