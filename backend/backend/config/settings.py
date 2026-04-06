@@ -83,6 +83,7 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.AllowAny",
     ],
+    "URL_FORMAT_OVERRIDE": None,
 }
 
 CHANNEL_LAYERS = {
