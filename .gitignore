@@ -25,6 +25,5 @@ media/
 
 # 민감 파일
 .env
-api-key
 gcp-key1.json
 *.json.key
