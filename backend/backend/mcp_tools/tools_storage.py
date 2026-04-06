@@ -1,4 +1,5 @@
 import json
+from asgiref.sync import sync_to_async
 from api.storage_service import (
     confirm_candidate as _confirm,
     dismiss_candidate as _dismiss,
@@ -11,7 +12,7 @@ from api.storage_service import (
 def register(mcp):
 
     @mcp.tool()
-    def confirm_finding(cand_id: str, severity: str = "", title: str = "",
+    async def confirm_finding(cand_id: str, severity: str = "", title: str = "",
                         summary: str = "", evidence_json: str = "[]") -> str:
         """candidate를 취약점으로 확정하고 finding을 생성한다.
         severity: critical, high, medium, low, info
@@ -23,7 +24,7 @@ def register(mcp):
             evidence = []
 
         try:
-            result = _confirm(
+            result = await sync_to_async(_confirm)(
                 cand_id=cand_id,
                 severity=severity or None,
                 title=title or None,
@@ -35,24 +36,24 @@ def register(mcp):
             return json.dumps({"error": str(e)})
 
     @mcp.tool()
-    def dismiss_candidate(cand_id: str, reason: str = "false_positive") -> str:
+    async def dismiss_candidate(cand_id: str, reason: str = "false_positive") -> str:
         """candidate를 오탐/폐기 처리한다.
         reason: false_positive 또는 dismissed
         """
         try:
-            result = _dismiss(cand_id=cand_id, reason=reason)
+            result = await sync_to_async(_dismiss)(cand_id=cand_id, reason=reason)
             return json.dumps(result)
         except StorageError as e:
             return json.dumps({"error": str(e)})
 
     @mcp.tool()
-    def save_evidence(finding_id: str, kind: str, content: str, role: str = "supporting") -> str:
+    async def save_evidence(finding_id: str, kind: str, content: str, role: str = "supporting") -> str:
         """finding에 증거를 추가한다.
         kind: request, response, log, screenshot
         role: primary, supporting
         """
         try:
-            result = _attach(finding_id=finding_id, evidence_data={
+            result = await sync_to_async(_attach)(finding_id=finding_id, evidence_data={
                 "kind": kind, "content": content, "role": role,
             })
             return json.dumps(result)
@@ -60,22 +61,22 @@ def register(mcp):
             return json.dumps({"error": str(e)})
 
     @mcp.tool()
-    def get_finding(finding_id: str) -> str:
+    async def get_finding(finding_id: str) -> str:
         """finding 상세 정보와 증거를 조회한다."""
         try:
-            result = _detail(finding_id=finding_id)
+            result = await sync_to_async(_detail)(finding_id=finding_id)
             return json.dumps(result)
         except StorageError as e:
             return json.dumps({"error": str(e)})
 
     @mcp.tool()
-    def get_scan_summary(run_id: str) -> str:
+    async def get_scan_summary(run_id: str) -> str:
         """스캔 결과 요약 (severity별, vuln_type별 카운트 + finding 목록)."""
-        result = _summary(run_id=run_id)
+        result = await sync_to_async(_summary)(run_id=run_id)
         return json.dumps(result)
 
     @mcp.tool()
-    def auto_collect_evidence(finding_id: str, request_payload: str = "",
+    async def auto_collect_evidence(finding_id: str, request_payload: str = "",
                               response_body: str = "", status_code: int = 0,
                               elapsed: float = 0.0, dom_snippet: str = "",
                               screenshot_base64: str = "", notes: str = "") -> str:
@@ -130,7 +131,7 @@ def register(mcp):
         saved = []
         for ev in evidence_items:
             try:
-                result = _attach(finding_id=finding_id, evidence_data=ev)
+                result = await sync_to_async(_attach)(finding_id=finding_id, evidence_data=ev)
                 saved.append({"kind": ev["kind"], "role": ev["role"], "saved": True})
             except StorageError as e:
                 saved.append({"kind": ev["kind"], "error": str(e)})

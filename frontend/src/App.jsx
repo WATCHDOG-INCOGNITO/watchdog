@@ -1,7 +1,7 @@
 ﻿import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = process.env.REACT_APP_API_BASE || "";
 const WS_BASE = API_BASE.replace(/^http/i, "ws");
 const STALE_AFTER_MS = 20000;
 

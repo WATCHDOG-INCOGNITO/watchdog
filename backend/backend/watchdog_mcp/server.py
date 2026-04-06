@@ -11,13 +11,15 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP(
     "Watchdog Security Scanner",
-    description=(
+    instructions=(
         "AI-powered web vulnerability scanner. "
         "Tools: sqlmap(SQLi), nuclei(templates), dalfox(XSS), "
         "Chrome DevTools(SPA/network), HTTP requests, "
         "crawling, analysis, storage, reporting. "
         "LLM이 도구를 직접 선택하고 체이닝하여 취약점을 탐지·검증한다."
     ),
+    host="0.0.0.0",
+    port=8889,
 )
 
 from .tools_security import register as register_security
@@ -37,7 +39,7 @@ register_benchmark(mcp)
 def main():
     import sys
     if "--sse" in sys.argv or os.environ.get("MCP_SSE"):
-        mcp.run(transport="sse", host="0.0.0.0", port=8889)
+        mcp.run(transport="sse")
     else:
         mcp.run()
 
