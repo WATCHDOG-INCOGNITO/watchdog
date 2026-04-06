@@ -9,7 +9,7 @@ services:
       POSTGRES_USER: bugbounty
       POSTGRES_PASSWORD: bugbounty123
     ports:
-      - "5433:5432"
+      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -23,7 +23,6 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
-      - "8889:8889"
     environment:
       DJANGO_SECRET_KEY: "change-this-in-production"
       DJANGO_DEBUG: "1"
@@ -44,6 +43,25 @@ services:
     command: >
       sh -c "python manage.py migrate --noinput &&
              python manage.py runserver 0.0.0.0:8000"
+
+  mcp:
+    build: ./backend/backend
+    restart: unless-stopped
+    ports:
+      - "8889:8889"
+    environment:
+      DJANGO_SECRET_KEY: "change-this-in-production"
+      DJANGO_DEBUG: "1"
+      DB_NAME: ${DB_NAME:-bugbounty_agent}
+      DB_USER: ${DB_USER:-bugbounty}
+      DB_PASSWORD: ${DB_PASSWORD:-bugbounty123}
+      DB_HOST: ${DB_HOST:-db}
+      DB_PORT: ${DB_PORT:-5432}
+      MCP_SSE: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: "python -m watchdog_mcp.server --sse"
 
 volumes:
   pgdata:
