@@ -76,17 +76,9 @@ def start_scan(request, run_id):
     if scan_run.status != "queued":
         return Response({"error": f"scan is already {scan_run.status}"}, status=status.HTTP_400_BAD_REQUEST)
 
-    # config.mode == "mcp"이면 MCP 에이전트 루프 사용
-    config = scan_run.config or {}
-    if config.get("mode") == "mcp":
-        from .mcp_agent import run_mcp_scan
-        threading.Thread(target=run_mcp_scan, args=(scan_run,), daemon=True).start()
-        return Response({"run_id": str(scan_run.run_id), "status": "running", "message": "MCP agent scan started"})
-
     from .services import run_scan
     threading.Thread(target=run_scan, args=(scan_run,), daemon=True).start()
     return Response({"run_id": str(scan_run.run_id), "status": "running", "message": "scan started"})
-
 
 @api_view(["POST"])
 def stop_scan(request, run_id):
