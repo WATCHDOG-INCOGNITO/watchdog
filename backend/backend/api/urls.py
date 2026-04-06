@@ -15,7 +15,12 @@ urlpatterns = [
 
     path("api/scan-runs/", views.scan_runs),
     path("api/scan-runs/<str:run_id>/", views.get_scan_run),
+    path("api/scan-runs/<str:run_id>/llm-traces/", views.scan_run_llm_traces),
     path("api/scan-runs/<str:run_id>/start/", views.start_scan),
+feat/design-func
+    path("api/scan-runs/<str:run_id>/stop/", views.stop_scan),
+    path("api/scan-runs/<str:run_id>/start-mcp/", views.start_mcp_scan),
+dev
     path("api/scan-runs/<str:run_id>/summary/", views.scan_findings_summary),
     path("api/scan-runs/<str:run_id>/llm-analyze/", views.llm_analyze_candidates),
     path("api/scan-runs/<str:run_id>/verify/", views.start_verification),
@@ -45,4 +50,3 @@ urlpatterns = [
 
     path("api/v1/", include(router.urls)),
 ]
-

@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from .models import (
-    ScanRun, RequestCatalog, Candidate, Finding, EvidenceBlob,
+    ScanRun, LLMTrace, RequestCatalog, Candidate, Finding, EvidenceBlob,
     FindingEvidenceLink, AgentTask, VerificationLoop, Hypothesis,
     VisualAnalysis, IDORTestSession, WAFBypassAttempt,
     VulnerabilityEntry, PayloadPattern, ReportArchive,
@@ -10,7 +10,14 @@ class ScanRunSerializer(serializers.ModelSerializer):
     class Meta:
         model = ScanRun
         fields = "__all__"
-        read_only_fields = ["run_id", "created_at"]
+        read_only_fields = ["run_id", "created_at", "updated_at"]
+
+
+class LLMTraceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LLMTrace
+        fields = "__all__"
+        read_only_fields = ["trace_id", "created_at"]
 
 class RequestCatalogSerializer(serializers.ModelSerializer):
     class Meta:
@@ -103,4 +110,3 @@ class ReportArchiveSerializer(serializers.ModelSerializer):
         model = ReportArchive
         fields = "__all__"
         read_only_fields = ["report_id", "created_at", "updated_at"]
-

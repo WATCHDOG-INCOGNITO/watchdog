@@ -7,7 +7,17 @@ import logging
 import re
 from django.utils import timezone
 
+from .error_utils import summarize_exception
+from .llm_trace_store import record_llm_trace
 from .models import ScanRun, RequestCatalog, Candidate
+from .scan_control import (
+    ScanStopped,
+    is_stop_requested,
+    mark_scan_stopped,
+    raise_if_stop_requested,
+    register_scan,
+    unregister_scan,
+)
 from .crawler import Crawler
 
 logger = logging.getLogger(__name__)
@@ -90,6 +100,7 @@ def calculate_priority(param_hits, path_hits):
 
 def run_crawl(scan_run: ScanRun):
     """크롤링 실행 → request_catalog에 저장 (SPA 자동 감지)"""
+    raise_if_stop_requested(scan_run)
     logger.info(f"[{scan_run.run_id}] 크롤링 시작: {scan_run.target_url}")
 
     # config에서 force_spa 옵션 확인
@@ -141,18 +152,22 @@ def run_crawl(scan_run: ScanRun):
         catalog_items.append(item)
 
     RequestCatalog.objects.bulk_create(catalog_items)
+    from .realtime import broadcast_scan_update
+    broadcast_scan_update(scan_run.run_id)
     logger.info(f"[{scan_run.run_id}] {len(catalog_items)}개 엔드포인트 저장 완료")
 
     return catalog_items
 
 def run_rule_filter(scan_run: ScanRun):
     """규칙 기반 필터링 → candidates에 저장"""
+    raise_if_stop_requested(scan_run)
     logger.info(f"[{scan_run.run_id}] 규칙 기반 필터링 시작")
 
     catalog_items = RequestCatalog.objects.filter(scan_run=scan_run)
     candidates = []
 
     for item in catalog_items:
+        raise_if_stop_requested(scan_run)
         param_hits = analyze_params(item.params)
         path_hits = analyze_path(item.endpoint)
 
@@ -190,41 +205,74 @@ def run_rule_filter(scan_run: ScanRun):
             candidates.append(cand)
 
     Candidate.objects.bulk_create(candidates)
+    from .realtime import broadcast_scan_update
+    broadcast_scan_update(scan_run.run_id)
     logger.info(f"[{scan_run.run_id}] {len(candidates)}개 candidate 생성 완료")
 
     return candidates
 
 def run_scan(scan_run: ScanRun):
     """전체 스캔 파이프라인 (크롤링 → 필터링 → LLM 분석)"""
+feat/design-func
+    # MCP 모드 분기
+    config = scan_run.config or {}
+    if config.get("mode") == "mcp":
+        from .mcp_agent import run_mcp_scan
+        return run_mcp_scan(scan_run)
+
+    register_scan(scan_run.run_id)
+dev
     try:
+        if is_stop_requested(scan_run.run_id):
+            mark_scan_stopped(scan_run)
+            return
+
         scan_run.status = "running"
-        scan_run.save(update_fields=["status"])
+        scan_run.finished_at = None
+        scan_run.error_log = None
+        scan_run.save(update_fields=["status", "finished_at", "error_log"])
 
         # 1. 크롤링
         run_crawl(scan_run)
+        raise_if_stop_requested(scan_run)
 
         # 2. 규칙 기반 필터링
         run_rule_filter(scan_run)
+        raise_if_stop_requested(scan_run)
 
         # 3. LLM 분석 (2단계: llm_screen)
         run_llm_screen(scan_run)
+        raise_if_stop_requested(scan_run)
 
         # 4. 검증 루프 (3단계: 실제 페이로드 전송)
         run_verify(scan_run)
+        raise_if_stop_requested(scan_run)
 
         # 5. 완료
-        scan_run.status = "finished"
-        scan_run.finished_at = timezone.now()
-        scan_run.save(update_fields=["status", "finished_at"])
+        if is_stop_requested(scan_run.run_id):
+            mark_scan_stopped(scan_run)
+            logger.info(f"[{scan_run.run_id}] 스캔 중지")
+        else:
+            scan_run.status = "finished"
+            scan_run.finished_at = timezone.now()
+            scan_run.save(update_fields=["status", "finished_at"])
+            logger.info(f"[{scan_run.run_id}] 스캔 완료")
 
-        logger.info(f"[{scan_run.run_id}] 스캔 완료")
-
+    except ScanStopped as e:
+        mark_scan_stopped(scan_run, str(e))
+        logger.info(f"[{scan_run.run_id}] 스캔 중지: {e}")
     except Exception as e:
-        scan_run.status = "failed"
-        scan_run.error_log = str(e)
-        scan_run.save(update_fields=["status", "error_log"])
-        logger.error(f"[{scan_run.run_id}] 스캔 실패: {e}")
-        raise
+        if is_stop_requested(scan_run.run_id):
+            mark_scan_stopped(scan_run)
+            logger.info(f"[{scan_run.run_id}] 스캔 중지 중 예외 발생: {e}")
+        else:
+            scan_run.status = "failed"
+            scan_run.error_log = summarize_exception(e)
+            scan_run.save(update_fields=["status", "error_log"])
+            logger.error(f"[{scan_run.run_id}] 스캔 실패: {e}")
+            raise
+    finally:
+        unregister_scan(scan_run.run_id)
 
 def run_llm_screen(scan_run: ScanRun, max_candidates=9999):
     """
@@ -239,6 +287,7 @@ def run_llm_screen(scan_run: ScanRun, max_candidates=9999):
     from .llm_router import batch_analyze_candidates
 
     logger.info(f"[{scan_run.run_id}] LLM 스크리닝 시작")
+    raise_if_stop_requested(scan_run)
 
     # priority 높은 순으로 candidate 가져오기
     candidates = Candidate.objects.filter(
@@ -266,11 +315,13 @@ def run_llm_screen(scan_run: ScanRun, max_candidates=9999):
         cand_objects.append(cand)
 
     # Claude 분석
+    call_base = scan_run.llm_calls_count
     results = batch_analyze_candidates(cand_data_list, max_count=max_candidates)
 
     # 결과 반영
     total_tokens = 0
-    for result, cand in zip(results, cand_objects):
+    for offset, (result, cand, cand_data) in enumerate(zip(results, cand_objects, cand_data_list), start=1):
+        raise_if_stop_requested(scan_run)
         risk = result.get("risk_level", "unknown")
         action = result.get("next_action", "escalate")
         llm_confidence = result.get("confidence", 0.0)
@@ -301,6 +352,27 @@ def run_llm_screen(scan_run: ScanRun, max_candidates=9999):
         usage = result.get("_usage", {})
         total_tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
 
+        record_llm_trace(
+            scan_run=scan_run,
+            call_index=call_base + offset,
+            stage="llm_screen",
+            model="claude-sonnet-4-20250514",
+            prompt_preview=result.get("_trace_prompt", ""),
+            response_preview=result.get("_trace_response_preview", ""),
+            stop_reason="end_turn",
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            metadata={
+                "endpoint": cand_data.get("endpoint"),
+                "method": cand_data.get("method"),
+                "vuln_type": cand_data.get("vuln_type"),
+                "candidate_id": str(cand.cand_id),
+                "candidate_action": action,
+                "candidate_risk": risk,
+            },
+            error="LLM analysis failed" if risk == "unknown" and result.get("analysis") == "LLM analysis failed" else "",
+        )
+
     # LLM 비용 기록
     from decimal import Decimal
     scan_run.llm_calls_count += len(results)
@@ -319,6 +391,7 @@ def run_verify(scan_run: ScanRun, max_candidates=9999):
     from .verifier import run_verification_for_scan
 
     logger.info(f"[{scan_run.run_id}] 검증 루프 시작")
+    raise_if_stop_requested(scan_run)
     results = run_verification_for_scan(
         scan_run=scan_run,
         max_candidates=max_candidates,
@@ -332,4 +405,3 @@ def run_verify(scan_run: ScanRun, max_candidates=9999):
     scan_run.save(update_fields=["request_budget_used"])
 
     return results
-
