@@ -213,7 +213,6 @@ def run_rule_filter(scan_run: ScanRun):
 
 def run_scan(scan_run: ScanRun):
     """전체 스캔 파이프라인 (크롤링 → 필터링 → LLM 분석)"""
-feat/design-func
     # MCP 모드 분기
     config = scan_run.config or {}
     if config.get("mode") == "mcp":
@@ -221,7 +220,6 @@ feat/design-func
         return run_mcp_scan(scan_run)
 
     register_scan(scan_run.run_id)
-dev
     try:
         if is_stop_requested(scan_run.run_id):
             mark_scan_stopped(scan_run)

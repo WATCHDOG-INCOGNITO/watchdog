@@ -1,0 +1,129 @@
+import json
+from asgiref.sync import sync_to_async
+from api.models import ScanRun, RequestCatalog, Candidate
+from api.services import analyze_params, analyze_path, calculate_priority
+
+def register(mcp):
+
+    @mcp.tool()
+    def analyze_endpoint(run_id: str, endpoint: str, method: str, params: str) -> str:
+        """엔드포인트를 규칙 기반으로 분석하여 의심 취약점 유형과 점수를 반환한다.
+        params는 JSON 문자열로 전달한다. 예: '{"id": "1", "name": "test"}'
+        """
+        try:
+            params_dict = json.loads(params) if isinstance(params, str) else params
+        except json.JSONDecodeError:
+            params_dict = {}
+
+        param_hits = analyze_params(params_dict)
+        path_hits = analyze_path(endpoint)
+        score = calculate_priority(param_hits, path_hits)
+
+        vuln_types = list(set(h["vuln_type"] for h in param_hits + path_hits))
+
+        return json.dumps({
+            "endpoint": endpoint,
+            "method": method,
+            "vuln_types": vuln_types,
+            "priority_score": round(score, 3),
+            "param_hits": param_hits,
+            "path_hits": path_hits,
+        })
+
+    @mcp.tool()
+    async def run_rule_filter(run_id: str) -> str:
+        """스캔의 모든 엔드포인트에 규칙 기반 필터링을 실행하고 candidate를 생성한다."""
+        from api.services import run_rule_filter as _run_rule_filter
+
+        scan_run = await sync_to_async(ScanRun.objects.get)(run_id=run_id)
+        candidates = await sync_to_async(_run_rule_filter)(scan_run)
+        return json.dumps({
+            "run_id": run_id,
+            "candidates_created": len(candidates),
+        })
+
+    @mcp.tool()
+    async def list_candidates(run_id: str, status: str = "", vuln_type: str = "") -> str:
+        """스캔의 후보(candidate) 목록을 조회한다.
+        status: open, verifying, confirmed, false_positive, dismissed
+        vuln_type: sqli, xss, idor, ssrf, upload
+        """
+        def _query():
+            qs = Candidate.objects.filter(scan_run_id=run_id).select_related("request")
+            if status:
+                qs = qs.filter(status=status)
+            if vuln_type:
+                qs = qs.filter(vuln_type=vuln_type)
+
+            results = []
+            for c in qs.order_by("-priority_score")[:30]:
+                results.append({
+                    "cand_id": str(c.cand_id),
+                    "vuln_type": c.vuln_type,
+                    "status": c.status,
+                    "priority_score": round(c.priority_score, 3),
+                    "detection_stage": c.detection_stage,
+                    "hypothesis": c.hypothesis,
+                    "endpoint": c.request.endpoint if c.request else None,
+                    "method": c.request.method if c.request else None,
+                    "params": c.request.params if c.request else {},
+                })
+            return results
+
+        results = await sync_to_async(_query)()
+        return json.dumps({"count": len(results), "candidates": results})
+
+    @mcp.tool()
+    async def reopen_candidate(cand_id: str) -> str:
+        """이전에 검증 실패했거나 dismiss된 candidate를 다시 open 상태로 되돌린다.
+        다른 도구/전략으로 재검증할 때 사용.
+        """
+        def _reopen():
+            try:
+                cand = Candidate.objects.get(cand_id=cand_id)
+            except Candidate.DoesNotExist:
+                return json.dumps({"error": "candidate not found"})
+
+            if cand.status == "confirmed":
+                return json.dumps({"error": "confirmed candidate cannot be reopened"})
+
+            old_status = cand.status
+            cand.status = "open"
+            cand.save(update_fields=["status"])
+            return json.dumps({"cand_id": str(cand.cand_id), "old_status": old_status, "new_status": "open"})
+
+        return await sync_to_async(_reopen)()
+
+    @mcp.tool()
+    async def create_candidate_manual(run_id: str, endpoint: str, method: str,
+                                 vuln_type: str, params: str = "{}",
+                                 hypothesis: str = "") -> str:
+        """수동으로 candidate를 생성한다.
+        LLM이 브라우저/도구로 발견한 의심 지점을 등록할 때 사용.
+        """
+        try:
+            params_dict = json.loads(params) if isinstance(params, str) else params
+        except json.JSONDecodeError:
+            params_dict = {}
+
+        def _create():
+            scan_run = ScanRun.objects.get(run_id=run_id)
+            cand = Candidate.objects.create(
+                scan_run=scan_run,
+                vuln_type=vuln_type,
+                hypothesis=hypothesis or f"LLM 수동 등록: {method} {endpoint} ({vuln_type})",
+                priority_score=0.8,
+                detection_stage="llm_screen",
+                status="open",
+                features={"source": "llm_manual", "params": params_dict},
+            )
+            return cand
+
+        cand = await sync_to_async(_create)()
+        return json.dumps({
+            "cand_id": str(cand.cand_id),
+            "vuln_type": vuln_type,
+            "endpoint": endpoint,
+            "status": "open",
+        })
+

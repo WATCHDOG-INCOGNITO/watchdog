@@ -63,5 +63,13 @@ services:
         condition: service_healthy
     command: "python -m watchdog_mcp.server --sse"
 
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
 volumes:
   pgdata:
