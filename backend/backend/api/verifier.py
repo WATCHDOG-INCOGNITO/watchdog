@@ -3,7 +3,7 @@ LLM 주도 검증 루프
 
 흐름:
 1. candidate를 받으면 LLM에게 공격 전략 + 페이로드 생성 요청
-2. 생성된 페이로드를 실제로 전송
+2. 생성된 페이로드를 실제로 전송 (+ 외부 도구 sqlmap/dalfox/nuclei 활용)
 3. 응답을 LLM에게 보내서 분석 + 다음 페이로드 결정
 4. LLM이 confirm/abort 판정할 때까지 반복 (최대 N회)
 5. 최종 판정 → confirmed면 finding 생성
@@ -28,12 +28,72 @@ from .llm_router import (
     mutate_payload_for_bypass,
     make_final_verdict,
 )
+from . import tool_bridge
 
 logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 8
 REQUEST_TIMEOUT = 10
 DELAY_BETWEEN = 0.5
+
+
+def _run_external_tools(base_url, endpoint, method, params, vuln_type):
+    """vuln_type에 따라 적절한 외부 도구를 실행하고 결과를 반환한다."""
+    base_url = base_url.rstrip("/")
+    target = f"{base_url}/{endpoint.lstrip('/')}"
+
+    if params:
+        first_param = list(params.keys())[0]
+        first_val = params[first_param] or "1"
+        if method.upper() == "GET":
+            target = f"{target}?{first_param}={first_val}"
+
+    result = {"confirmed_by_tool": False, "tool_name": "", "output": ""}
+
+    if vuln_type == "sqli":
+        logger.info(f"[tool] sqlmap 실행: {target}")
+        r = tool_bridge.sqlmap_scan(target_url=target, method=method, level=2, risk=2)
+        if r.get("error"):
+            logger.warning(f"[tool] sqlmap 실패: {r['error']}")
+        else:
+            output = r.get("output", "")
+            result["tool_name"] = "sqlmap"
+            result["output"] = output
+            if "is vulnerable" in output.lower() or "injection point" in output.lower():
+                result["confirmed_by_tool"] = True
+
+    elif vuln_type == "xss":
+        logger.info(f"[tool] dalfox 실행: {target}")
+        r = tool_bridge.dalfox_scan(target_url=target)
+        if r.get("error"):
+            logger.warning(f"[tool] dalfox 실패: {r['error']}")
+        else:
+            result["tool_name"] = "dalfox"
+            result["output"] = r.get("full_output", "")
+            if r.get("vulnerabilities"):
+                result["confirmed_by_tool"] = True
+
+    # nuclei는 모든 vuln_type에 대해 실행
+    logger.info(f"[tool] nuclei 실행: {base_url}")
+    nr = tool_bridge.nuclei_scan(target_url=base_url, severity="critical,high,medium")
+    if not nr.get("error") and nr.get("findings_count", 0) > 0:
+        relevant = [f for f in nr.get("findings", []) if endpoint in f or vuln_type in f.lower()]
+        if relevant:
+            result["tool_name"] = result.get("tool_name", "") + "+nuclei"
+            result["output"] += "\n--- nuclei ---\n" + "\n".join(relevant[:10])
+            if not result["confirmed_by_tool"]:
+                result["confirmed_by_tool"] = True
+
+    # WAF 감지
+    waf = tool_bridge.wafw00f_scan(base_url)
+    if not waf.get("error"):
+        waf_output = waf.get("output", "")
+        if "is behind" in waf_output.lower():
+            result["waf_detected"] = True
+            result["waf_info"] = waf_output[:500]
+            logger.info(f"[tool] WAF 감지됨: {waf_output[:200]}")
+
+    return result
 
 class AttackExecutor:
     def __init__(self, base_url, timeout=REQUEST_TIMEOUT):
@@ -120,6 +180,42 @@ def run_verification_loop(candidate, scan_run):
     candidate.save(update_fields=["status"])
 
     logger.info(f"[{candidate.cand_id}] LLM 주도 검증 시작: {method} {endpoint} ({vuln_type})")
+
+    # 0단계: 외부 보안 도구 선행 실행
+    tool_results = _run_external_tools(scan_run.target_url, endpoint, method, params, vuln_type)
+    if tool_results.get("confirmed_by_tool"):
+        logger.info(f"[{candidate.cand_id}] 외부 도구가 취약점 확정: {tool_results['tool_name']}")
+        evidence_list = [{
+            "kind": "request",
+            "content": json.dumps({
+                "tool": tool_results["tool_name"],
+                "output": tool_results["output"][:3000],
+                "confirmed_by": "external_tool",
+            }, ensure_ascii=False),
+            "role": "primary",
+        }]
+        try:
+            confirm_result = confirm_candidate(
+                cand_id=candidate.cand_id,
+                confidence=0.95,
+                summary=f"외부 도구({tool_results['tool_name']})가 {vuln_type} 취약점 확정",
+                evidence_list=evidence_list,
+            )
+            return {
+                "verified": True, "confidence": 0.95,
+                "detail": f"Confirmed by {tool_results['tool_name']}",
+                "attempts": 0, "finding_id": confirm_result["finding_id"],
+                "strategy": "external_tool", "total_llm_tokens": 0,
+            }
+        except Exception as e:
+            logger.error(f"[{candidate.cand_id}] tool confirm 실패: {e}")
+
+    # 외부 도구 결과를 context에 추가 (LLM한테 참고하라고)
+    if tool_results.get("output"):
+        context["tool_scan_result"] = {
+            "tool": tool_results.get("tool_name", ""),
+            "summary": tool_results.get("output", "")[:1000],
+        }
 
     # 1단계: LLM에게 초기 페이로드 생성 요청
     plan = generate_initial_payloads(vuln_type, endpoint, method, params, context)
