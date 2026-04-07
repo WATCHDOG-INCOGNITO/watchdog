@@ -26,7 +26,7 @@ services:
     environment:
       DJANGO_SECRET_KEY: "change-this-in-production"
       DJANGO_DEBUG: "1"
-      DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1,0.0.0.0"
+      DJANGO_ALLOWED_HOSTS: "*"
       DB_NAME: ${DB_NAME:-bugbounty_agent}
       DB_USER: ${DB_USER:-bugbounty}
       DB_PASSWORD: ${DB_PASSWORD:-bugbounty123}
