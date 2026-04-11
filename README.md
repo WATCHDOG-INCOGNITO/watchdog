@@ -66,3 +66,46 @@ docker compose -f docker/docker-compose.e2e.yml down -v
   - 배포 후 smoke(환경 변수 `BASE_URL`, `SMOKE_TARGET_URL` 설정 시)
 
 자세한 운영/설정은 `infra/readme.md` 참고.
+
+## 환경 설정
+
+현재 로컬/Docker 실행 시 backend에서 사용하는 주요 환경설정은 다음과 같다.
+
+### 1. 주요 환경변수
+
+- `DB_NAME`
+- `DB_USER`
+- `DB_PASSWORD`
+- `DB_HOST`
+- `DB_PORT`
+- `ANTHROPIC_API_KEY`
+- `GOOGLE_APPLICATION_CREDENTIALS`
+- `GCS_BUCKET_NAME`
+
+### 2. Docker Compose 기준 DB 설정
+
+현재 공용 `docker-compose.yml`에서는 backend DB 설정이 아래와 같이 환경변수 확장 문법으로 정의되어 있다.
+
+```yaml
+DB_NAME: ${DB_NAME:-bugbounty_agent}
+DB_USER: ${DB_USER:-bugbounty}
+DB_PASSWORD: ${DB_PASSWORD:-bugbounty123}
+DB_HOST: ${DB_HOST:-db}
+DB_PORT: ${DB_PORT:-5432}
+```
+
+### 3. GCS 사용 시 추가 설정
+Evidence 업로드 기능을 사용하려면 아래 설정이 필요하다.
+
+- GOOGLE_APPLICATION_CREDENTIALS
+- GCS_BUCKET_NAME
+
+```yaml
+GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-key1.json
+GCS_BUCKET_NAME: watchdog-evidence
+```
+
+### 4. 주의사항
+- 실제 API Key, 서비스 계정 키 파일, 운영용 비밀번호는 저장소에 직접 커밋하지 않는 것을 권장
+- .env를 사용할 경우 로컬 환경에 맞게 값을 주입하고, 없으면 docker-compose.yml의 기본값이 사용됨
+- GCS 기능을 사용하지 않는 경우에도 DB 관련 기본값만으로 backend 기동은 가능
