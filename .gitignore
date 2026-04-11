@@ -28,4 +28,6 @@ media/
 gcp-key1.json
 *.json.key
 
+# frontend/node_modules/파일 삭제
 frontend/node_modules/
+node_modules/

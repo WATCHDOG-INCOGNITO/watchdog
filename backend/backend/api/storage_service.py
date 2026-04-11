@@ -6,6 +6,7 @@ P4 Storage 서비스
 """
 
 import logging
+import json
 from django.db import transaction
 
 from .models import Candidate, Finding, EvidenceBlob, FindingEvidenceLink
@@ -14,6 +15,25 @@ logger = logging.getLogger(__name__)
 
 class StorageError(Exception):
     pass
+
+def _to_bytes_for_upload(ev: dict) -> bytes:
+    """
+    evidence dict를 GCS 업로드용 bytes로 변환한다.
+    content가 있으면 우선 사용하고,
+    없으면 evidence 전체 dict를 JSON으로 직렬화한다.
+    """
+    content = ev.get("content")
+
+    if isinstance(content, bytes):
+        return content
+
+    if isinstance(content, str):
+        return content.encode("utf-8")
+
+    if content is not None:
+        return json.dumps(content, ensure_ascii=False, default=str).encode("utf-8")
+
+    return json.dumps(ev, ensure_ascii=False, default=str).encode("utf-8")
 
 def confirm_candidate(cand_id, severity=None, title=None, summary=None,
                       reproduction_steps=None, confidence=None, evidence_list=None):
@@ -90,6 +110,10 @@ def confirm_candidate(cand_id, severity=None, title=None, summary=None,
                     byte_size=ev.get("byte_size"),
                     metadata=ev.get("metadata"),
                 )
+
+                content_bytes = _to_bytes_for_upload(ev)
+                upload_evidence_to_gcs(blob, content_bytes)
+
                 link = FindingEvidenceLink.objects.create(
                     finding=finding,
                     blob=blob,
@@ -169,6 +193,10 @@ def attach_evidence(finding_id, evidence_data):
                 byte_size=ev.get("byte_size"),
                 metadata=ev.get("metadata"),
             )
+
+            content_bytes = _to_bytes_for_upload(ev)
+            upload_evidence_to_gcs(blob, content_bytes)
+            
             link = FindingEvidenceLink.objects.create(
                 finding=finding,
                 blob=blob,
@@ -303,3 +331,4 @@ def upload_evidence_to_gcs(blob: "EvidenceBlob", content_bytes: bytes) -> str:
         import logging
         logging.getLogger(__name__).warning(f"GCS upload failed: {e}")
         return "local://auto"
+    
