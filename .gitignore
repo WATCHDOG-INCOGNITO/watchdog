@@ -29,3 +29,9 @@ gcp-key1.json
 *.json.key
 
 frontend/node_modules/
+
+# CTF 문제 디렉터리 (별도 repo로 clone, 크기 큼 + .git submodule)
+codegate2023-fin/
+codegate2024-final/
+codegate2025-final/
+codegate2026-pre/

@@ -24,7 +24,7 @@ def register(mcp):
             evidence = []
 
         try:
-            result = await sync_to_async(_confirm, thread_sensitive=False)(
+            result = await sync_to_async(_confirm, thread_sensitive=True)(
                 cand_id=cand_id,
                 severity=severity or None,
                 title=title or None,
@@ -41,7 +41,7 @@ def register(mcp):
         reason: false_positive 또는 dismissed
         """
         try:
-            result = await sync_to_async(_dismiss, thread_sensitive=False)(cand_id=cand_id, reason=reason)
+            result = await sync_to_async(_dismiss, thread_sensitive=True)(cand_id=cand_id, reason=reason)
             return json.dumps(result)
         except StorageError as e:
             return json.dumps({"error": str(e)})
@@ -53,7 +53,7 @@ def register(mcp):
         role: primary, supporting
         """
         try:
-            result = await sync_to_async(_attach, thread_sensitive=False)(finding_id=finding_id, evidence_data={
+            result = await sync_to_async(_attach, thread_sensitive=True)(finding_id=finding_id, evidence_data={
                 "kind": kind, "content": content, "role": role,
             })
             return json.dumps(result)
@@ -64,7 +64,7 @@ def register(mcp):
     async def get_finding(finding_id: str) -> str:
         """finding 상세 정보와 증거를 조회한다."""
         try:
-            result = await sync_to_async(_detail, thread_sensitive=False)(finding_id=finding_id)
+            result = await sync_to_async(_detail, thread_sensitive=True)(finding_id=finding_id)
             return json.dumps(result)
         except StorageError as e:
             return json.dumps({"error": str(e)})
@@ -72,7 +72,7 @@ def register(mcp):
     @mcp.tool()
     async def get_scan_summary(run_id: str) -> str:
         """스캔 결과 요약 (severity별, vuln_type별 카운트 + finding 목록)."""
-        result = await sync_to_async(_summary, thread_sensitive=False)(run_id=run_id)
+        result = await sync_to_async(_summary, thread_sensitive=True)(run_id=run_id)
         return json.dumps(result)
 
     @mcp.tool()
@@ -131,7 +131,7 @@ def register(mcp):
         saved = []
         for ev in evidence_items:
             try:
-                result = await sync_to_async(_attach, thread_sensitive=False)(finding_id=finding_id, evidence_data=ev)
+                result = await sync_to_async(_attach, thread_sensitive=True)(finding_id=finding_id, evidence_data=ev)
                 saved.append({"kind": ev["kind"], "role": ev["role"], "saved": True})
             except StorageError as e:
                 saved.append({"kind": ev["kind"], "error": str(e)})

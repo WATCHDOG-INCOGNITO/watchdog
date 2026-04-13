@@ -30,7 +30,66 @@ def _safe_get(url: str, *, headers: dict | None = None, timeout: int = DEFAULT_T
     return requests.get(url, headers=h, timeout=timeout, allow_redirects=False)
 
 
+def _response_diff_blocks(baseline: str, payload: str, control: str) -> dict:
+    """3개 응답을 라인 단위로 비교해 'payload에만 있는' 블록을 추출.
+    하드코딩 시그니처 없이 일반화된 oracle — Verifier가 결과 보고 의미 판정.
+    """
+    def _lines(s: str) -> list[str]:
+        return [ln.rstrip() for ln in (s or "").splitlines() if ln.strip()]
+
+    base = set(_lines(baseline))
+    ctrl = set(_lines(control)) if control else set()
+    pay = _lines(payload)
+
+    # payload에만 등장하는 라인 (baseline + control 양쪽에 모두 없음)
+    novel_lines = [ln for ln in pay if ln not in base and ln not in ctrl]
+    # 길이/엔트로피로 정렬해 의미 있는 줄 우선
+    novel_lines = sorted(novel_lines, key=lambda l: (-len(l), l))[:30]
+
+    return {
+        "novel_line_count": len(novel_lines),
+        "novel_lines": novel_lines,
+        "baseline_line_count": len(base),
+        "payload_line_count": len(pay),
+        "control_line_count": len(ctrl),
+    }
+
+
 def register(mcp):
+
+    @mcp.tool()
+    def oracle_response_diff(
+        baseline_url: str,
+        payload_url: str,
+        control_url: str = "",
+    ) -> str:
+        """일반화된 응답 diff oracle — 하드코딩 시그니처 없음.
+
+        baseline (벤치 정상 요청), payload (공격 요청), control (선택적, 다른 정상 요청)을
+        호출해 *payload 응답에만 등장한 라인들*을 반환. 어떤 vuln 클래스든 적용 가능.
+
+        Verifier는 반환된 novel_lines를 보고 의미 판정 (예: 비밀스러운 데이터 누출,
+        에러 메시지 노출, 새 HTML 요소 삽입 등). 시그니처 매칭 없이 LLM 판단으로 풀어냄.
+        """
+        try:
+            r_base = _safe_get(baseline_url)
+            r_pay = _safe_get(payload_url)
+            r_ctrl = _safe_get(control_url) if control_url else None
+        except requests.RequestException as e:
+            return json.dumps({"error": f"http error: {e}"})
+
+        diff = _response_diff_blocks(
+            r_base.text, r_pay.text, r_ctrl.text if r_ctrl else ""
+        )
+        return json.dumps({
+            "baseline_status": r_base.status_code,
+            "payload_status": r_pay.status_code,
+            "control_status": r_ctrl.status_code if r_ctrl else None,
+            "len_baseline": len(r_base.text),
+            "len_payload": len(r_pay.text),
+            **diff,
+        }, ensure_ascii=False)
+
 
     # ─────────────────────────────────────────────────────────────
     # XSS — Playwright headless에서 dialog/JS 실행 캡처
@@ -140,15 +199,25 @@ def register(mcp):
             return json.dumps({"error": f"http error: {e}"})
 
         len_true, len_false, len_base = len(r_true.text), len(r_false.text), len(r_base.text)
-        diff_ratio = abs(len_true - len_false) / max(len_true, len_false, 1)
-        same_status = r_true.status_code == r_false.status_code
-        # 양성 조건: 길이 차 5%+ 또는 status 다름, AND true가 baseline 과 길이 비슷 (10% 이내)
-        base_match = abs(len_true - len_base) / max(len_true, len_base, 1) < 0.10
-        confirmed = (diff_ratio > 0.05 or not same_status) and base_match
+        diff_tf = abs(len_true - len_false) / max(len_true, len_false, 1)
+        diff_tb = abs(len_true - len_base) / max(len_true, len_base, 1)
+        diff_fb = abs(len_false - len_base) / max(len_false, len_base, 1)
+        # 양성 조건 (여러 신호 중 하나):
+        #   (a) true vs false 길이 차 5%+ 또는 status 다름 (전형적 boolean diff)
+        #   (b) 어느 한쪽이 baseline과 의미 있게 다름 (10%+) — true=match면 baseline보다 행 추가,
+        #       false=miss면 baseline보다 행 적음
+        #   (c) status code 다름
+        confirmed = (
+            diff_tf > 0.05
+            or r_true.status_code != r_false.status_code
+            or max(diff_tb, diff_fb) > 0.10
+        )
 
         return json.dumps({
             "confirmed": confirmed,
-            "diff_ratio": round(diff_ratio, 4),
+            "diff_true_vs_false": round(diff_tf, 4),
+            "diff_true_vs_baseline": round(diff_tb, 4),
+            "diff_false_vs_baseline": round(diff_fb, 4),
             "len_true": len_true,
             "len_false": len_false,
             "len_baseline": len_base,
@@ -210,12 +279,14 @@ def register(mcp):
     # LFI — etc/passwd 등 시스템 파일 시그니처
     # ─────────────────────────────────────────────────────────────
 
+    # 응답이 HTML wrapper 안에 있는 경우(<pre>root:...) 도 매치되도록 anchor 완화.
     LFI_SIGNATURES = [
-        (re.compile(r"^root:[^:]*:0:0:", re.MULTILINE), "/etc/passwd (unix)"),
+        (re.compile(r"(?:^|>|\n)\s*root:[^:\n]*:\d+:\d+:"), "/etc/passwd (unix)"),
+        (re.compile(r"daemon:[^:]*:\d+:\d+:"), "/etc/passwd (daemon line)"),
         (re.compile(r"\[boot loader\]", re.IGNORECASE), "boot.ini (windows)"),
-        (re.compile(r"<\?php", re.IGNORECASE), "php source"),
+        (re.compile(r"<\?php\b"), "php source"),
         (re.compile(r"DocumentRoot|ServerName", re.IGNORECASE), "apache config"),
-        (re.compile(r"^[A-Za-z0-9+/=]{200,}\s*$"), "base64 (php filter)"),
+        (re.compile(r"^[A-Za-z0-9+/=]{200,}\s*$", re.MULTILINE), "base64 (php filter)"),
     ]
 
     @mcp.tool()
@@ -254,6 +325,10 @@ def register(mcp):
         (re.compile(r"metadata\.azure", re.IGNORECASE), "Azure metadata"),
         (re.compile(r"<title>.{0,200}localhost", re.IGNORECASE | re.DOTALL), "localhost banner"),
         (re.compile(r"127\.0\.0\.1[:\s]"), "loopback echo"),
+        # file:// 프로토콜 — wrapper가 file 읽기까지 허용하면 강한 신호
+        (re.compile(r"(?:^|>|\n)\s*root:[^:\n]*:\d+:\d+:"), "file:// /etc/passwd echoed"),
+        # gopher/dict/ldap 같은 비-HTTP 프로토콜 echo
+        (re.compile(r"^(gopher|dict|ldap|ftp)://", re.IGNORECASE | re.MULTILINE), "non-http scheme echoed"),
     ]
 
     @mcp.tool()

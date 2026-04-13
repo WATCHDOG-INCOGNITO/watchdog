@@ -32,6 +32,8 @@ from .tools_benchmark import register as register_benchmark
 from .tools_knowledge import register as register_knowledge
 from .tools_handoff import register as register_handoff
 from .tools_oracle import register as register_oracle
+from .tools_learn import register as register_learn
+from .tools_source import register as register_source
 
 register_security(mcp)
 register_browser(mcp)
@@ -42,6 +44,8 @@ register_benchmark(mcp)
 register_knowledge(mcp)
 register_handoff(mcp)
 register_oracle(mcp)
+register_learn(mcp)
+register_source(mcp)
 
 def main():
     import sys

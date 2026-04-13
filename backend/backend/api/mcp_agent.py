@@ -155,16 +155,29 @@ PLANNER_PROMPT = """\
 
 ## 권장 흐름 (강제 아님)
 
-1. browser_navigate + browser_extract_api_endpoints로 endpoint surface 빠르게 파악.
-2. analyze_endpoint로 의심 vuln_type을 추정 (필요 endpoint만, 전수 분석 의무 없음).
-3. search_knowledge / retrieve_similar_patterns / retrieve_cve_variants를 _필요한 만큼만_
-   호출. 같은 vuln_type을 두 번 이상 조회하지 않기. 추가 호출이 새 hypothesis를 만들지
-   못하면 즉시 그만.
-4. is_gold / success_rate 높은 패턴 우선, 그러나 zero-day 가능성을 위해 1~2개는
-   _exploration mode_ — KB에 없는 새로운 가설(retrieve_cve_variants 결과 또는 자체 추론)도
-   포함 권장.
-5. 충분한 hypotheses가 모이면 즉시 `emit_hypotheses` 호출 또는 JSON 코드블록 출력.
-   "충분"의 기준은 당신이 판단 — 일반적으로 endpoint surface 절반 이상에 대해 1~3개씩.
+0. **시작 즉시 `recall_target(target_host=...)` 호출.** 이 host에 대한 누적 지식
+   (이전 스캔에서 통한 페이로드, framework/server/WAF, 막힌 시도)을 받아온다.
+   "known": false면 처음 보는 host. "known": true면 learned_patterns / dead_ends를
+   힌트로 활용해 정찰을 압축. **이게 우리 시스템의 진짜 RAG 가치**.
+0a. **소스가 마운트된 white-box 환경이면** (CTF/내부 진단 등) `list_source_tree("/sources")`
+    로 트리 파악 후 핵심 파일을 `read_source` / `grep_source` 로 분석. black-box 추측보다
+    훨씬 정확. SOURCE_ROOTS 환경변수로 안전 root 제한됨 — 그 안만 접근 가능.
+1. browser_navigate + browser_extract_api_endpoints로 endpoint surface 파악.
+   **작은 타겟(endpoint < 15)이면 모든 endpoint를 분석하는 것 권장.**
+2. analyze_endpoint로 의심 vuln_type을 추정.
+3. 정찰 중 framework/server/WAF 식별되면 `update_target_profile`로 누적 저장
+   (다음 스캔에서 이 정보 즉시 활용 가능).
+4. search_knowledge / retrieve_similar_patterns / retrieve_cve_variants를 _필요한 만큼만_
+   호출. 같은 vuln_type을 두 번 이상 조회하지 않기. recall_target에 이미 learned 패턴이
+   있으면 commodity KB는 보조로만.
+5. **mode 분배 (zero-day 발견을 위해 중요)**:
+   - exploit mode: KB seed 또는 recall_target.learned_patterns 활용 — 빠른 baseline.
+   - **explore mode (최소 hypotheses 1/3)**: LLM 자체 추론으로 *commodity 도구가 못 잡을*
+     가설 만들기. framework-specific quirk(Flask array param, Django ORM, Spring SpEL),
+     logic flaw(IDOR persona, mass assignment, race), multi-endpoint composition,
+     특이 인코딩 chain 등. sqlmap/dalfox/nuclei가 어차피 commodity는 다 시도하니까,
+     **우리 시스템의 차별화는 explore mode에서 나온다**.
+6. 충분한 hypotheses가 모이면 즉시 `emit_hypotheses` 호출.
 
 ## 종료 출력 (emit_hypotheses 또는 JSON 코드블록)
 
@@ -207,12 +220,17 @@ EXECUTOR_PROMPT = """\
 
 핵심 원칙: **hypothesis당 1~2 도구 호출만**, 분석/판단 없음, 다음으로 즉시 이동.
 
+0. 한 번만 `recall_dead_ends(target_host=...)` 호출해 이 host에서 이전에 막힌
+   (endpoint, vuln_type, pattern) 조합을 한 방에 받아두고, 같은 시도는 skip.
 1. 각 hypothesis 마다:
    - mode=exploit: candidate_pattern_ids에서 1개 패턴만 골라 즉시 http_request 또는 전용 스캐너로 전송.
      매처 매치 여부는 응답 본문/헤더에서 *아주 짧게* 확인 (예: 상태코드, 길이, 시그니처 1-2개).
      "확실히 잡혔는지"는 Verifier 판단 — 의심스러우면 그냥 매치=true로 보내고 넘어가세요.
-   - mode=explore: KB 변종을 mutate_payload로 생성하거나 새 페이로드 직접 작성해 http_request.
-     zero-day 후보 — 단 1~2회만 시도, 길게 분석 금지.
+   - mode=explore: **commodity 도구(sqlmap/dalfox/nuclei)가 시도하지 않을 페이로드를 직접 작성**.
+     mutate_payload로 KB seed의 특이 변종을 만들거나, framework-specific quirk를 직접 작성:
+     예) Flask array `?id[1]=1' OR `, Django `__regex` field lookup, polyglot `{{7*7}}<svg/onload>`,
+     UTF-7 / null-byte / case-randomized chain 등. zero-day 가능성은 여기서 나온다.
+     단 1-2회만 시도, 길게 분석 금지 — Verifier가 oracle로 확증.
 2. 시도 직후 record_pattern_use 한 번. 매치되면 create_candidate_manual 한 번. **그 다음 즉시 다음 hypothesis.**
 3. evidence_summary는 짧게 (< 300자). Verifier가 깊이 본다.
 4. **모든 hypothesis 처리 후 즉시 `emit_attempts` 호출.** 추가 시도/확인 욕구가 들면 참으세요 —
@@ -263,6 +281,22 @@ get_finding, get_scan_summary, list_candidates.
 **판정 결과 등록**: confirm_finding, dismiss_candidate, save_evidence, auto_collect_evidence,
 record_pattern_use.
 
+**Living KB 학습 (시스템 자산화 — 적극 활용 권장)**:
+- `learn_from_finding(finding_id, target_host, payload_used, is_novel, novelty_reason, ...)`
+  — confirm_finding 직후 호출. **`is_novel` 판단이 핵심**:
+  - **is_novel=True (KB에 저장)**: LLM/sqlmap/dalfox/nuclei가 못 잡는 진짜 새 패턴.
+    예) explore mode에서 자체 생성한 페이로드, mutate_payload 변종 confirmed,
+    framework-specific quirk(Flask `?id[]=`, Django `__regex`), WAF 우회 chain,
+    logic flaw, multi-endpoint composition.
+  - **is_novel=False (저장 skip, 카운터만)**: sqlmap이 default로 시도하는 commodity.
+    예) `1' OR '1'='1`, `<script>alert(1)</script>`, `../../../etc/passwd`, `127.0.0.1` SSRF.
+    이런 건 표준 도구가 자동 시도하므로 KB에 저장해도 자산 가치 0.
+  - 애매하면 False로. 진짜 새로운 것만 KB 자산화.
+- `learn_dead_end(target_host, endpoint, vuln_type, pattern_id, payload_used, reason)`
+  — dismiss 또는 oracle 결과 음성일 때 호출. 다음 스캔의 무의미 반복 회피.
+- `update_target_profile(target_host, framework, server, waf, fingerprint_json, notes)`
+  — 검증 중 발견한 환경 정보 누적.
+
 ## 권장 사고 패턴 (Petri Judge with citation)
 
 판정 한 건마다 가능하면 다음 흐름을 따르세요:
@@ -273,8 +307,9 @@ record_pattern_use.
 3. **종합 판단** — citation들을 근거로 confirmed / false_positive / inconclusive 결정.
    oracle.confirmed=true 는 강한 증거이지만 _단독 결정 요인은 아님_. false_positive_hints에
    해당하는 패턴이 있으면 oracle 양성이어도 inconclusive로 강등 가능.
-4. **등록** — confirmed면 confirm_finding + auto_collect_evidence. false_positive면
-   dismiss_candidate + record_pattern_use(false_positive=True). 어느 쪽이든 통계 갱신.
+4. **등록** — confirmed면 confirm_finding + auto_collect_evidence + **learn_from_finding**.
+   false_positive면 dismiss_candidate + record_pattern_use(false_positive=True) +
+   **learn_dead_end**. 어느 쪽이든 통계와 Living KB 동시 갱신.
 
 ## 클래스별 휴리스틱 (강제 아님, 참고용)
 
@@ -315,6 +350,10 @@ PLANNER_TOOLS = {
     "browser_get_network_log", "browser_screenshot", "browser_get_console",
     "analyze_endpoint", "search_knowledge", "retrieve_similar_patterns",
     "retrieve_cve_variants", "list_candidates", "get_scan_summary",
+    # Living KB — host-specific 회상
+    "recall_target", "recall_dead_ends", "update_target_profile",
+    # Source code reading (white-box / glass-box CTF)
+    "list_source_tree", "read_source", "grep_source",
     "emit_hypotheses",
 }
 EXECUTOR_TOOLS = {
@@ -325,6 +364,10 @@ EXECUTOR_TOOLS = {
     "search_knowledge", "retrieve_similar_patterns", "record_pattern_use",
     "mutate_payload", "create_candidate_manual", "save_evidence",
     "auto_collect_evidence", "list_candidates",
+    # Living KB — dead end 사전 조회로 무의미한 시도 회피
+    "recall_dead_ends",
+    # Source reading — chain composition 시 코드 참고
+    "read_source", "grep_source", "list_source_tree",
     "emit_attempts",
 }
 VERIFIER_TOOLS = {
@@ -332,7 +375,11 @@ VERIFIER_TOOLS = {
     "search_knowledge", "confirm_finding", "dismiss_candidate", "reopen_candidate",
     "save_evidence", "auto_collect_evidence", "record_pattern_use",
     "oracle_xss", "oracle_sqli_boolean", "oracle_sqli_time",
-    "oracle_lfi", "oracle_ssrf",
+    "oracle_lfi", "oracle_ssrf", "oracle_response_diff",
+    # Living KB — confirm/dismiss 결과를 누적 자산으로 저장
+    "learn_from_finding", "learn_dead_end", "update_target_profile",
+    # Source reading — false positive 판정 시 코드 검증
+    "read_source", "grep_source", "list_source_tree",
     "emit_verdicts",
 }
 REPORTER_TOOLS = {"generate_report", "get_scan_summary"}

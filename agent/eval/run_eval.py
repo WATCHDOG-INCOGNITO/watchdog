@@ -368,7 +368,7 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="이번 실행을 baseline.json 으로 저장",
     )
-    p.add_argument("--total-timeout", type=int, default=1800)
+    p.add_argument("--total-timeout", type=int, default=3600)
     p.add_argument(
         "--target-url",
         default=None,

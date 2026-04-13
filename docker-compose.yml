@@ -36,8 +36,14 @@ services:
       VOYAGE_API_KEY: "${VOYAGE_API_KEY:-}"
       GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
       GCS_BUCKET_NAME: ${GCS_BUCKET_NAME:-}
+      # white-box CTF source 디렉터리. tools_source가 이 안만 안전 접근.
+      # 절대 for_organizer/exploit 디렉터리는 mount하지 말 것 (정답/flag 노출).
+      SOURCE_ROOTS: "/sources"
     volumes:
       - ./gcp-key1.json:/app/gcp-key1.json:ro
+      # CTF source mount (read-only) — 참가자가 받는 for_user 만 노출.
+      # 새 문제 추가 시 같은 패턴으로 한 줄씩 추가.
+      - ./codegate2023-fin/general/web-warmup/prob/for_user:/sources/codegate2023/web-warmup:ro
     depends_on:
       db:
         condition: service_healthy

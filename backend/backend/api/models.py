@@ -365,6 +365,12 @@ class PayloadPattern(models.Model):
     embedding = VectorField(dimensions=1024, null=True, blank=True)
     embedding_model = models.CharField(max_length=64, null=True, blank=True)
 
+    # Living KB — host-specific learned 패턴
+    # NULL이면 일반 patterns(seed 또는 generic mutation), 값이 있으면 그 host에서 통한 패턴
+    target_host = models.CharField(max_length=255, null=True, blank=True, db_index=True)
+    # 학습 메타: 사용된 endpoint, oracle 결과, 응답 fingerprint 등
+    attack_metadata = models.JSONField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -374,6 +380,52 @@ class PayloadPattern(models.Model):
     @property
     def success_rate(self):
         return self.times_succeeded / self.times_used if self.times_used else 0.0
+
+
+class TargetProfile(models.Model):
+    """Living KB — host별 누적 지식.
+    같은 host 재스캔 시 Planner가 즉시 활용. CWE/OWASP commodity가 아닌
+    이 host에 대한 사적 메모(framework, server, WAF, 통한 우회, 막힌 경로).
+    """
+    profile_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    host = models.CharField(max_length=255, unique=True, db_index=True)
+    framework = models.CharField(max_length=128, null=True, blank=True)
+    server = models.CharField(max_length=128, null=True, blank=True)
+    waf = models.CharField(max_length=128, null=True, blank=True)
+    fingerprint = models.JSONField(null=True, blank=True)  # response headers, tech detection 등
+    notes = models.TextField(null=True, blank=True)        # 자유 메모
+
+    # 통한 패턴/체인 카운트
+    confirmed_findings_count = models.IntegerField(default=0)
+    learned_patterns_count = models.IntegerField(default=0)
+    dead_ends_count = models.IntegerField(default=0)
+
+    last_scan_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "target_profiles"
+
+
+class DeadEnd(models.Model):
+    """Negative knowledge — 이 host/endpoint/vuln_type 조합에 시도했으나 실패한 패턴.
+    다음 스캔에서 같은 시도 회피해 cost/turn 절약.
+    """
+    dead_end_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    target_host = models.CharField(max_length=255, db_index=True)
+    endpoint = models.TextField()
+    vuln_type = models.CharField(max_length=64)
+    pattern_id = models.UUIDField(null=True, blank=True)  # PayloadPattern.pattern_id (옵션)
+    payload_used = models.TextField(null=True, blank=True)
+    reason = models.TextField(null=True, blank=True)  # "oracle returned false", "no diff" 등
+    times_seen = models.IntegerField(default=1)
+    last_seen_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "dead_ends"
+        unique_together = [("target_host", "endpoint", "vuln_type", "pattern_id")]
 
     @property
     def fp_rate(self):

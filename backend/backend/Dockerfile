@@ -27,6 +27,17 @@ RUN curl -sL https://github.com/ffuf/ffuf/releases/latest/download/ffuf_linux_am
 
 RUN pip install --no-cache-dir wafw00f
 
+# ── Public payload DB (commodity check용 ground truth) ──
+# 인터넷에 이미 공개된 payload 목록을 로컬에 두고, novel 판정 시 이것과 substring 매칭.
+# payloadbox 시리즈는 합쳐서 ~5MB 미만, 가장 자주 인용되는 SQLi/XSS/CMDi/LFI/SSRF 페이로드 모음.
+RUN mkdir -p /app/payloads_db && cd /app/payloads_db \
+  && curl -sSL -o sqli.txt    https://raw.githubusercontent.com/payloadbox/sql-injection-payload-list/master/Intruder/exploit/SQL_Injection.txt \
+  && curl -sSL -o xss.txt     https://raw.githubusercontent.com/payloadbox/xss-payload-list/master/Intruder/xss-payload-list.txt \
+  && curl -sSL -o cmdi.txt    https://raw.githubusercontent.com/payloadbox/command-injection-payload-list/master/command-injection-payload-list.txt \
+  && curl -sSL -o lfi.txt     https://raw.githubusercontent.com/payloadbox/rfi-lfi-payload-list/master/Intruder/lfi-Intruder.txt \
+  && curl -sSL -o ssrf.txt    https://raw.githubusercontent.com/payloadbox/ssrf-payload-list/master/ssrf-payloads.txt \
+  || echo "WARN: payload DB partial — commodity_check_local will still work with what got downloaded"
+
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
