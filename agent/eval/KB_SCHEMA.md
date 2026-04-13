@@ -162,17 +162,52 @@ update_target_profile(
 
 ---
 
-## 협업 — 같은 뇌 공유
+## 협업 — 같은 뇌 공유 (현재 활성: GCS)
 
-현재 Living KB는 local Postgres. 협업자가 같은 KB 가지려면:
+**현재 사용 중**: `gs://watchdog-evidence/kb/latest.json` (Asia-Northeast3, project=watchdog-db-490911).
+모든 협업자가 backend 컨테이너에서 같은 bucket에 read/write.
+
+### 새 technique 추가 후 GCS 업로드
+
+```bash
+docker compose exec backend python manage.py seed_techniques --reset
+docker compose exec backend python manage.py export_kb --gcs
+# → gs://watchdog-evidence/kb/kb_<ts>.json + gs://watchdog-evidence/kb/latest.json
+```
+
+### 협업자가 받은 KB 적용
+
+```bash
+# 1. GCS에서 fixture 다운로드
+gcloud storage cp gs://watchdog-evidence/kb/latest.json /tmp/kb_latest.json
+
+# 2. backend 컨테이너에 복사 + loaddata
+docker cp /tmp/kb_latest.json watchdog-backend-1:/tmp/
+docker compose exec backend python manage.py loaddata /tmp/kb_latest.json
+```
+
+또는 backend 안에서 직접:
+
+```bash
+docker compose exec backend python -c "
+from google.cloud import storage
+storage.Client().bucket('watchdog-evidence').blob('kb/latest.json').download_to_filename('/tmp/kb_latest.json')
+"
+docker compose exec backend python manage.py loaddata /tmp/kb_latest.json
+```
+
+### 충돌 (concurrent edit) 처리
+
+현재는 *last-write-wins*. 협업자 동시 작업이 잦으면:
+- 짧은 lifecycle: 작업 시작 시 `loaddata`, 끝에 `seed_techniques --reset && export_kb --gcs`
+- 권장: PR 단위로 KB 변경. 머지 후 한 명만 export.
+
+### 다른 옵션 (사용 안 함, 참고)
 
 | 옵션 | 방법 | 비용 |
 |---|---|---|
-| Cloud SQL / Supabase | `DATABASE_URL` 환경변수만 cloud Postgres로 변경 → 모든 협업자 같은 backend 접속 | $7-30/월 |
-| GCS dump 동기화 | `pg_dump > gs://watchdog-kb/dump-YYYY-MM-DD.sql` cron, 협업자 `pg_restore` | $0-1/월 |
-| Git에 fixture 동기화 | `python manage.py dumpdata api.PayloadPattern api.TargetProfile api.DeadEnd > fixtures/kb.json` 커밋 | $0 |
-
-(현재 권장 — git fixture 가장 단순. 큰 binary 없으면 충분.)
+| Cloud SQL / Supabase | `DATABASE_URL` 환경변수만 cloud Postgres로 변경 — 모든 협업자 같은 backend 접속 (real-time) | $7-30/월 |
+| Git fixture | `dumpdata > fixtures/kb.json` 커밋 (충돌 시 conflict) | $0 |
 
 ---
 

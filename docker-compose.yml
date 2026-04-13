@@ -34,8 +34,9 @@ services:
       DB_PORT: ${DB_PORT:-5432}
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
       VOYAGE_API_KEY: "${VOYAGE_API_KEY:-}"
-      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
-      GCS_BUCKET_NAME: ${GCS_BUCKET_NAME:-}
+      # GCS — KB sync + evidence upload. .env에서 override 가능.
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-/app/gcp-key1.json/gcp-key1.json}
+      GCS_BUCKET_NAME: ${GCS_BUCKET_NAME:-watchdog-evidence}
       # Multi-agent swarm 설정
       WATCHDOG_AGENT_MODE: "${WATCHDOG_AGENT_MODE:-swarm}"
       WATCHDOG_SWARM_EXECUTORS: "${WATCHDOG_SWARM_EXECUTORS:-3}"
