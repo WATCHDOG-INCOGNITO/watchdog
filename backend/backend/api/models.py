@@ -362,7 +362,7 @@ class PayloadPattern(models.Model):
     source = models.CharField(max_length=64, null=True, blank=True)
     tags = models.JSONField(null=True, blank=True)
 
-    embedding = VectorField(dimensions=1024, null=True, blank=True)
+    embedding = VectorField(dimensions=768, null=True, blank=True)
     embedding_model = models.CharField(max_length=64, null=True, blank=True)
 
     # Living KB — host-specific learned 패턴

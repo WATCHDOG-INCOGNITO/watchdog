@@ -107,10 +107,10 @@ def _retrieve_similar(query: str, k: int, vuln_type: str | None) -> dict:
     )
 
     if not is_available():
-        logger.warning("retrieve_similar_patterns: voyage embedding not available")
+        logger.warning("retrieve_similar_patterns: embedding model not available")
         return {
             "available": False,
-            "reason": "voyage embedding not configured (VOYAGE_API_KEY missing or voyageai not installed)",
+            "reason": "embedding model not available (sentence-transformers not installed or load failed)",
             "patterns": [],
         }
 
@@ -355,7 +355,7 @@ def register(mcp):
         """자연어 query 와 의미적으로 가까운 PayloadPattern 을 코사인 유사도로 검색한다.
 
         Knowledge DB의 RAG 단계. 엔드포인트 설명/파라미터/응답 발췌 등 자유 텍스트로 호출.
-        Voyage 임베딩이 비활성이면 `available: False` 와 reason을 반환한다.
+        임베딩이 비활성이면 `available: False` 와 reason을 반환한다.
 
         Args:
             query: 자연어 검색 쿼리. 예 "URL 파라미터로 외부 호스트 fetch하는 엔드포인트"

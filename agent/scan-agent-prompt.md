@@ -16,18 +16,31 @@
 - `browser_get_network_log(filter_type="api")` — XHR/API 호출 수집
 - `browser_get_dom("form")` — 폼 필드 수집
 
-### 3단계: 취약점 스캔
+### 3단계: Knowledge Base 조회
+정찰 결과(기술 스택, 엔드포인트, 파라미터)를 바탕으로 KB에서 기존 검증 패턴을 조회한다:
+- `search_knowledge(vuln_type="sqli", keyword="")` — 취약점 유형별 패턴
+- `search_knowledge(keyword="jsonpath")` — 기술 스택 키워드로 검색
+- `retrieve_similar_patterns(query="...", k=5)` — 자연어 시나리오 검색 (embedding 활성 시)
+
+KB 조회 키워드 가이드:
+- **단일 키워드**를 사용해라. 복합 구문("strict loose equality") 대신 개별 단어("strict-equality" 또는 "type-coercion")를 쓴다.
+- 기술 스택명 그대로 검색: "jsonpath", "GraphQL", "plperl", "Magento", "ISO-2022-JP", "JFR"
+- 공격 기법명 검색: "XXE", "SSRF", "innerHTML", "sliding window", "Fisher-Yates", "canonicalization"
+- vuln_type 필터: "sqli", "xss", "rce", "auth_bypass", "ssrf", "idor", "information_disclosure"
+- KB에 attack_metadata.technique_steps_md와 code_template이 있으면 그대로 적용 시도.
+
+### 4단계: 취약점 스캔
 수집된 엔드포인트별로:
 - `sqlmap_scan(url)` — SQL Injection 스캔
 - `dalfox_scan(url)` — XSS 스캔
 - `nuclei_scan(target, severity="critical,high,medium")` — 템플릿 기반 스캔
 
-### 4단계: 수동 검증 (sqlmap/dalfox에서 못 찾은 것)
+### 5단계: 수동 검증 (sqlmap/dalfox에서 못 찾은 것)
 - `http_request(url, method, headers, body)` — 직접 페이로드 전송
 - `browser_fill_and_submit(selector_map, submit_selector)` — 폼 제출
 - `browser_execute_js(script)` — JS 실행으로 추가 확인
 
-### 5단계: 결과 정리
+### 6단계: 결과 정리
 - 취약점 발견 시 `confirm_finding(cand_id, severity, title, evidence_json)` 호출
 - `auto_collect_evidence(finding_id, ...)` — 증거 자동 수집
 - `get_scan_summary(run_id)` — 결과 요약

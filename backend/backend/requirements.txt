@@ -13,4 +13,4 @@ sqlparse==0.5.5
 tzdata==2025.3
 google-cloud-storage>=2.14.0
 pgvector>=0.3.0
-voyageai>=0.3.0
+sentence-transformers>=3.0.0
