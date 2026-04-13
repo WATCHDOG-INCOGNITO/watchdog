@@ -37,15 +37,20 @@ if [[ ! -f "$ABS_DIR/docker-compose.yml" ]]; then
 fi
 
 echo "[+] CTF setup: $FOR_USER → alias=$ALIAS"
-echo "[+] docker compose up ..."
-( cd "$ABS_DIR" && docker compose up -d --build ) 1>/dev/null
+echo "[+] docker compose up (project=$ALIAS) ..."
+# -p ALIAS — compose project name 강제. container 이름 prefix가 ${ALIAS}-* 가 됨.
+# 단 docker-compose.yml 안의 container_name 필드 고정인 경우 -p 영향 없음 (그대로 사용).
+( cd "$ABS_DIR" && docker compose -p "$ALIAS" up -d --build ) 1>/dev/null
 
-# compose project 이름(기본: dir 이름 소문자)
-PROJECT="$(basename "$ABS_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')"
-# 실제 containers
-CONTAINERS=$(docker ps --format "{{.Names}}" | grep -E "^${PROJECT}-" || true)
+# 1차: ${ALIAS}-* prefix (compose project default)
+CONTAINERS=$(docker ps --format "{{.Names}}" | grep -E "^${ALIAS}-" || true)
+# 2차: docker compose ps 로 직접 (container_name 고정 케이스 대응)
 if [[ -z "$CONTAINERS" ]]; then
-  echo "[!] no containers matched prefix ${PROJECT}-" >&2
+  CONTAINERS=$(cd "$ABS_DIR" && docker compose -p "$ALIAS" ps --format '{{.Name}}' 2>/dev/null || true)
+fi
+if [[ -z "$CONTAINERS" ]]; then
+  echo "[!] no containers found for project=$ALIAS" >&2
+  echo "    docker ps:" && docker ps --format "    {{.Names}} ({{.Image}})"
   exit 1
 fi
 
@@ -54,8 +59,10 @@ echo "[+] containers:" && echo "$CONTAINERS" | sed 's/^/    /'
 detect_service() {
   local patterns="$1"
   for p in $patterns; do
+    # compose-default 패턴 ${ALIAS}-${p}-N
     local hit
-    hit=$(echo "$CONTAINERS" | grep -E "^${PROJECT}-${p}-[0-9]+$" || true)
+    hit=$(echo "$CONTAINERS" | grep -E "^${ALIAS}-${p}-[0-9]+$" || true)
+    [[ -z "$hit" ]] && hit=$(echo "$CONTAINERS" | grep -E "^${p}$" || true)  # container_name 고정
     if [[ -n "$hit" ]]; then
       echo "$hit" | head -1
       return 0
@@ -64,8 +71,8 @@ detect_service() {
   return 1
 }
 
-WEB_CONT="${WEB_SERVICE:-$(detect_service "webserver web app api api-server nginx api_server")}"
-BOT_CONT="${BOT_SERVICE:-$(detect_service "bot adminbot admin-bot admin_bot")}"
+WEB_CONT="${WEB_SERVICE:-$(detect_service "webserver web app api api-server nginx api_server flask" || true)}"
+BOT_CONT="${BOT_SERVICE:-$(detect_service "bot adminbot admin-bot admin_bot" || true)}"
 if [[ -z "$WEB_CONT" ]]; then
   echo "[!] web container not detected. Set WEB_SERVICE=<name> and rerun." >&2
   echo "    candidates:" && echo "$CONTAINERS" | sed 's/^/      /'

@@ -36,6 +36,12 @@ services:
       VOYAGE_API_KEY: "${VOYAGE_API_KEY:-}"
       GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
       GCS_BUCKET_NAME: ${GCS_BUCKET_NAME:-}
+      # Multi-agent swarm 설정
+      WATCHDOG_AGENT_MODE: "${WATCHDOG_AGENT_MODE:-swarm}"
+      WATCHDOG_SWARM_EXECUTORS: "${WATCHDOG_SWARM_EXECUTORS:-3}"
+      WATCHDOG_SWARM_VERIFIERS: "${WATCHDOG_SWARM_VERIFIERS:-2}"
+      WATCHDOG_SWARM_QUIESCENCE_S: "${WATCHDOG_SWARM_QUIESCENCE_S:-30}"
+      WATCHDOG_SWARM_MAX_HYPOTHESES: "${WATCHDOG_SWARM_MAX_HYPOTHESES:-20}"
       # white-box CTF source 디렉터리. tools_source가 이 안만 안전 접근.
       # 전체 대회 mount + tools_source의 for_user 경로 필수 검사 + 차단 토큰으로 정답 노출 차단.
       SOURCE_ROOTS: "/sources"

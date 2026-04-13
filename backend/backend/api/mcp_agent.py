@@ -66,6 +66,17 @@ ROLE_TURN_BUDGET = {
     "verifier": 18,   # oracle 호출 + 판정.
     "reporter": 4,    # 단순 generate_report.
 }
+# swarm 모드 — worker가 hypothesis/attempt 단 하나만 처리하므로 turn 짧음.
+SWARM_BUDGET = {
+    "planner": 14,
+    "executor_worker": 8,    # 1 hypothesis만. 시도 1-2회 + emit_attempts 1.
+    "verifier_worker": 10,   # 1 attempt만. oracle 1-3회 + confirm/dismiss + learn + emit.
+    "reporter": 4,
+}
+SWARM_EXECUTOR_COUNT = int(os.environ.get("WATCHDOG_SWARM_EXECUTORS", "3"))
+SWARM_VERIFIER_COUNT = int(os.environ.get("WATCHDOG_SWARM_VERIFIERS", "2"))
+SWARM_QUIESCENCE_S = int(os.environ.get("WATCHDOG_SWARM_QUIESCENCE_S", "30"))
+SWARM_MAX_HYPOTHESES = int(os.environ.get("WATCHDOG_SWARM_MAX_HYPOTHESES", "20"))
 MAX_PLAN_ITERATIONS = 2  # planner→executor→verifier 사이클 반복 횟수 (replan 포함)
 MODEL = "claude-sonnet-4-20250514"
 AGENT_MODE_DEFAULT = os.environ.get("WATCHDOG_AGENT_MODE", "multi").lower()
@@ -791,8 +802,302 @@ async def _run_multi_agent_loop(
     )
 
 
+# ─────────────────────────────────────────────────────────────
+# Swarm — N executor + M verifier 동시 worker + asyncio.Queue 비동기 dispatch
+# Living KB(Postgres+pgvector)가 진짜 shared memory. 한 verifier가 confirm하면
+# 다음 executor가 recall_target/recall_dead_ends로 즉시 활용 (continuous learning).
+# ─────────────────────────────────────────────────────────────
+
+EXECUTOR_WORKER_PROMPT = """\
+You are an Executor Worker. Single hypothesis only — fire payload, record, emit.
+**Don't judge** (Verifier handles). 1-2 tool calls max, then emit_attempts.
+
+## Tools
+- Stateful HTTP: http_session_request(session_id, ...) (multipart/cookie chain)
+- Stateless: http_request, sqlmap_scan, dalfox_scan, nuclei_scan, ffuf_scan,
+  curl_request, wafw00f_scan, whatweb_scan
+- OOB: oob_register_token / oob_wait_for_hit / oob_get_hits
+- KB recall (Living KB — 다른 worker가 방금 push한 정보 즉시 활용):
+  recall_target, recall_dead_ends, search_knowledge, retrieve_similar_patterns,
+  read_source, grep_source, list_source_tree
+- Mutate: mutate_payload (KB seed 변종)
+- Candidate: create_candidate_manual
+- Exit: emit_attempts(attempts_json='{"attempts":[{...}]}')
+
+## Flow (very tight)
+
+1. Optional: recall_dead_ends(target_host) once (skip already-failed).
+2. Send payload (1-2 calls). For explore mode: write LLM-novel payload commodity tools won't try.
+3. record_pattern_use; if matched, create_candidate_manual.
+4. emit_attempts immediately.
+"""
+
+VERIFIER_WORKER_PROMPT = """\
+You are a Verifier Worker. Single attempt only — call oracle_*, judge, register, learn, emit.
+
+## Tools
+- Oracles: oracle_xss / oracle_sqli_boolean / oracle_sqli_time / oracle_lfi /
+  oracle_ssrf / oracle_response_diff
+- OOB: oob_get_hits / oob_wait_for_hit
+- HTTP: http_request, http_session_request (control vs payload diff)
+- Source: read_source, grep_source (sink confirm)
+- Register: confirm_finding / dismiss_candidate / save_evidence /
+  auto_collect_evidence / record_pattern_use
+- **Living KB write (shared with all executor workers)**:
+  learn_from_finding(finding_id, target_host, payload_used, is_novel, novelty_reason, ...)
+    is_novel=True 만 KB에 저장 (commodity sqlmap/dalfox/nuclei 페이로드는 False).
+  learn_dead_end(target_host, endpoint, vuln_type, ...) — 다른 executor가 이걸 recall.
+  update_target_profile (framework/server/WAF detected).
+- Exit: emit_verdicts(verdicts_json='{"verdicts":[{...}]}')
+
+## Flow
+
+1. Decide which oracle(s) fit the vuln_type.
+2. Run oracle, gather citations from response/oracle output.
+3. confirmed → confirm_finding + auto_collect_evidence + learn_from_finding.
+   false_positive → dismiss_candidate + record_pattern_use(false_positive=True) + learn_dead_end.
+4. emit_verdicts.
+"""
+
+EXECUTOR_WORKER_TOOLS = EXECUTOR_TOOLS  # 같은 도구 — worker는 단지 더 짧은 input만 받음
+VERIFIER_WORKER_TOOLS = VERIFIER_TOOLS
+
+
+async def _executor_worker(
+    name: str,
+    scan_run: ScanRun,
+    anthropic,
+    tools: list,
+    tool_router: dict,
+    hypothesis_q: "asyncio.Queue[dict | None]",
+    attempt_q: "asyncio.Queue[dict | None]",
+    acc: _Accumulator,
+    last_activity_ref: list,
+):
+    """hypothesis_q에서 한 가설 받아 처리, attempts를 attempt_q에 push.
+    last_activity_ref[0]는 quiescence 감지용 (마지막 활동 timestamp).
+    """
+    import time as _t
+    while True:
+        try:
+            hyp = await hypothesis_q.get()
+        except asyncio.CancelledError:
+            return
+        if hyp is None:  # 종료 신호
+            hypothesis_q.task_done()
+            return
+        last_activity_ref[0] = _t.time()
+        logger.info(f"[{scan_run.run_id}] executor[{name}] picked: {hyp.get('endpoint')} {hyp.get('vuln_type')}")
+        user_msg = (
+            f"target_url: {scan_run.target_url}\n"
+            f"scan_id: {scan_run.run_id}\n\n"
+            f"한 hypothesis 만 처리하세요:\n```json\n"
+            f"{json.dumps(hyp, ensure_ascii=False)}\n```\n"
+            f"빠르게 시도 후 emit_attempts."
+        )
+        try:
+            text, _ = await _run_role_phase(
+                scan_run, anthropic, f"executor:{name}", EXECUTOR_WORKER_PROMPT,
+                tools, tool_router, user_msg, acc,
+                max_turns=SWARM_BUDGET["executor_worker"],
+            )
+            data = _extract_json_block(text) or {}
+            for att in data.get("attempts", []):
+                await attempt_q.put(att)
+        except Exception as e:
+            logger.error(f"[{scan_run.run_id}] executor[{name}] error: {e}", exc_info=True)
+        finally:
+            last_activity_ref[0] = _t.time()
+            hypothesis_q.task_done()
+
+
+async def _verifier_worker(
+    name: str,
+    scan_run: ScanRun,
+    anthropic,
+    tools: list,
+    tool_router: dict,
+    attempt_q: "asyncio.Queue[dict | None]",
+    verdicts_collector: list,
+    acc: _Accumulator,
+    last_activity_ref: list,
+):
+    """attempt_q에서 한 attempt 받아 oracle 검증, verdicts_collector에 append + Living KB write."""
+    import time as _t
+    while True:
+        try:
+            att = await attempt_q.get()
+        except asyncio.CancelledError:
+            return
+        if att is None:
+            attempt_q.task_done()
+            return
+        last_activity_ref[0] = _t.time()
+        logger.info(f"[{scan_run.run_id}] verifier[{name}] picked: {att.get('endpoint')} {att.get('vuln_type')}")
+        user_msg = (
+            f"target_url: {scan_run.target_url}\n"
+            f"scan_id: {scan_run.run_id}\n\n"
+            f"한 attempt 만 검증:\n```json\n"
+            f"{json.dumps(att, ensure_ascii=False)}\n```\n"
+            f"oracle 호출 → confirm/dismiss + learn_from_finding/learn_dead_end → emit_verdicts."
+        )
+        try:
+            text, _ = await _run_role_phase(
+                scan_run, anthropic, f"verifier:{name}", VERIFIER_WORKER_PROMPT,
+                tools, tool_router, user_msg, acc,
+                max_turns=SWARM_BUDGET["verifier_worker"],
+            )
+            data = _extract_json_block(text) or {}
+            for v in data.get("verdicts", []):
+                verdicts_collector.append(v)
+        except Exception as e:
+            logger.error(f"[{scan_run.run_id}] verifier[{name}] error: {e}", exc_info=True)
+        finally:
+            last_activity_ref[0] = _t.time()
+            attempt_q.task_done()
+
+
+async def _run_swarm(
+    scan_run: ScanRun,
+    anthropic,
+    anthropic_tools: list,
+    tool_router: dict,
+):
+    """Continuous swarm — Planner 1회 → N Executor + M Verifier 동시 → quiescence → Reporter.
+    Living KB가 shared memory: Verifier가 confirm 시 즉시 KB write,
+    그 다음 Executor가 recall_target/recall_dead_ends로 활용.
+    """
+    import time as _t
+    acc = _Accumulator()
+
+    planner_tools = _filter_tools(anthropic_tools, PLANNER_TOOLS)
+    executor_tools = _filter_tools(anthropic_tools, EXECUTOR_WORKER_TOOLS)
+    verifier_tools = _filter_tools(anthropic_tools, VERIFIER_WORKER_TOOLS)
+    reporter_tools = _filter_tools(anthropic_tools, REPORTER_TOOLS)
+
+    logger.info(
+        f"[{scan_run.run_id}] swarm: planner=1, executors={SWARM_EXECUTOR_COUNT}, "
+        f"verifiers={SWARM_VERIFIER_COUNT}, quiescence={SWARM_QUIESCENCE_S}s, "
+        f"max_hypotheses={SWARM_MAX_HYPOTHESES}"
+    )
+
+    # ── 1. Planner — 초기 hypotheses 생성 ──
+    src_roots = os.environ.get("SOURCE_ROOTS", "").strip()
+    source_hint = ""
+    if src_roots:
+        try:
+            existing = []
+            for root in src_roots.split(":"):
+                root = root.strip()
+                if root and os.path.isdir(root):
+                    sub = [d for d in os.listdir(root) if not d.startswith(".")]
+                    if sub:
+                        existing.append((root, sub[:10]))
+            if existing:
+                lines = ["", "[WHITE-BOX] SOURCE_ROOTS:"]
+                for root, subs in existing:
+                    lines.append(f"  - {root}: {', '.join(subs)}")
+                source_hint = "\n".join(lines)
+        except Exception:
+            pass
+
+    plan_brief = (
+        f"target_url: {scan_run.target_url}\n"
+        f"scan_id: {scan_run.run_id}\n"
+        f"{source_hint}\n"
+        f"swarm 모드 — 가설을 emit_hypotheses로 풍부하게(권장 6-12개) 출력. "
+        f"각 hypothesis는 독립 worker에 분배되어 동시 처리됨."
+    )
+    planner_text, _ = await _run_role_phase(
+        scan_run, anthropic, "planner", PLANNER_PROMPT,
+        planner_tools, tool_router, plan_brief, acc,
+        max_turns=SWARM_BUDGET["planner"],
+    )
+    plan_json = _extract_json_block(planner_text) or {"hypotheses": []}
+    initial_hyps = plan_json.get("hypotheses", [])[:SWARM_MAX_HYPOTHESES]
+    logger.info(f"[{scan_run.run_id}] planner produced {len(initial_hyps)} hypotheses")
+
+    if not initial_hyps:
+        logger.warning(f"[{scan_run.run_id}] no hypotheses, fallback to reporter")
+    else:
+        # ── 2. Queues + worker pool ──
+        hypothesis_q: "asyncio.Queue[dict | None]" = asyncio.Queue()
+        attempt_q: "asyncio.Queue[dict | None]" = asyncio.Queue()
+        verdicts_collector: list = []
+        last_activity = [_t.time()]  # mutable ref
+
+        for h in initial_hyps:
+            await hypothesis_q.put(h)
+
+        executors = [
+            asyncio.create_task(
+                _executor_worker(
+                    f"E{i+1}", scan_run, anthropic, executor_tools, tool_router,
+                    hypothesis_q, attempt_q, acc, last_activity,
+                ),
+                name=f"exec-{i+1}",
+            )
+            for i in range(SWARM_EXECUTOR_COUNT)
+        ]
+        verifiers = [
+            asyncio.create_task(
+                _verifier_worker(
+                    f"V{i+1}", scan_run, anthropic, verifier_tools, tool_router,
+                    attempt_q, verdicts_collector, acc, last_activity,
+                ),
+                name=f"verify-{i+1}",
+            )
+            for i in range(SWARM_VERIFIER_COUNT)
+        ]
+
+        # ── 3. Quiescence loop ──
+        # 두 큐 모두 비고 + 마지막 활동 후 SWARM_QUIESCENCE_S 경과 → 종료
+        while True:
+            await asyncio.sleep(2)
+            queues_empty = hypothesis_q.empty() and attempt_q.empty()
+            idle_for = _t.time() - last_activity[0]
+            if queues_empty and idle_for > SWARM_QUIESCENCE_S:
+                logger.info(
+                    f"[{scan_run.run_id}] quiescence reached "
+                    f"(queues empty, idle for {idle_for:.0f}s)"
+                )
+                break
+            try:
+                raise_if_stop_requested(scan_run)
+            except Exception:
+                logger.info(f"[{scan_run.run_id}] swarm stop requested")
+                break
+
+        # ── 4. workers에게 종료 신호 (None) — 각 worker가 받으면 return ──
+        for _ in executors:
+            await hypothesis_q.put(None)
+        for _ in verifiers:
+            await attempt_q.put(None)
+        await asyncio.gather(*executors, *verifiers, return_exceptions=True)
+
+        logger.info(
+            f"[{scan_run.run_id}] swarm done: verdicts={len(verdicts_collector)}, "
+            f"executors+verifiers complete"
+        )
+
+    # ── 5. Reporter ──
+    reporter_msg = (
+        f"generate_report(run_id=\"{scan_run.run_id}\", format=\"json\") 만 호출."
+    )
+    await _run_role_phase(
+        scan_run, anthropic, "reporter", REPORTER_PROMPT,
+        reporter_tools, tool_router, reporter_msg, acc,
+        max_turns=SWARM_BUDGET["reporter"],
+    )
+
+    logger.info(
+        f"[{scan_run.run_id}] swarm complete: {acc.calls} LLM calls, "
+        f"{acc.input_tokens + acc.output_tokens} tokens, ${scan_run.llm_cost_usd}"
+    )
+
+
 async def _connect_mcp_and_run(scan_run: ScanRun, mode: str):
-    """MCP 서버 연결 후 mode에 따라 single/multi loop를 실행."""
+    """MCP 서버 연결 후 mode에 따라 single/multi/swarm loop를 실행."""
     anthropic = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
     # `-m watchdog_mcp.server` 로 띄워야 server.py 의 relative import (`from .tools_*`)
@@ -856,7 +1161,9 @@ async def _connect_mcp_and_run(scan_run: ScanRun, mode: str):
             f"[{scan_run.run_id}] total tools={len(anthropic_tools)} mode={mode}"
         )
 
-        if mode == "multi":
+        if mode == "swarm":
+            await _run_swarm(scan_run, anthropic, anthropic_tools, tool_router)
+        elif mode == "multi":
             await _run_multi_agent_loop(scan_run, anthropic, anthropic_tools, tool_router)
         else:
             await _run_single_agent_loop(
@@ -927,7 +1234,7 @@ def run_mcp_scan(scan_run: ScanRun):
         scan_run.error_log = None
         scan_run.save(update_fields=["status", "finished_at", "error_log"])
 
-        mode = AGENT_MODE_DEFAULT if AGENT_MODE_DEFAULT in ("multi", "single") else "multi"
+        mode = AGENT_MODE_DEFAULT if AGENT_MODE_DEFAULT in ("swarm", "multi", "single") else "multi"
         logger.info(f"[{scan_run.run_id}] starting MCP scan (mode={mode})")
         asyncio.run(_connect_mcp_and_run(scan_run, mode=mode))
 

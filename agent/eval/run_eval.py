@@ -465,7 +465,9 @@ def main(argv: list[str]) -> int:
         finally:
             if args.teardown and t.get("ctf_for_user"):
                 print(f"      [teardown] {t['ctf_for_user']}")
-                subprocess.call(["bash", teardown_script, t["ctf_for_user"]])
+                subprocess.call([
+                    "bash", teardown_script, t["ctf_for_user"], t.get("ctf_alias", ""),
+                ])
 
     # ── baseline 비교 ──
     baseline = load_baseline()

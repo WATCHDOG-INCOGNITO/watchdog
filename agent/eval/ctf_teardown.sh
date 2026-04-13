@@ -14,18 +14,24 @@ if [[ -z "$FOR_USER" ]]; then
   exit 1
 fi
 
+ALIAS="${2:-}"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ABS_DIR="$REPO_ROOT/$FOR_USER"
 
-PROJECT="$(basename "$ABS_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')"
-# watchdog_default 네트워크에서 disconnect
-for c in $(docker ps --format "{{.Names}}" | grep -E "^${PROJECT}-" || true); do
-  docker network disconnect watchdog_default "$c" 2>/dev/null || true
-done
+# 모든 ALIAS-* container + container_name 고정 케이스 둘 다 disconnect
+if [[ -n "$ALIAS" ]]; then
+  CONTAINERS=$(docker ps --format "{{.Names}}" | grep -E "^${ALIAS}-" || true)
+  if [[ -z "$CONTAINERS" ]]; then
+    CONTAINERS=$(cd "$ABS_DIR" 2>/dev/null && docker compose -p "$ALIAS" ps --format '{{.Name}}' 2>/dev/null || true)
+  fi
+  for c in $CONTAINERS; do
+    docker network disconnect watchdog_default "$c" 2>/dev/null || true
+  done
+fi
 
 if [[ -f "$ABS_DIR/docker-compose.yml" ]]; then
-  ( cd "$ABS_DIR" && docker compose down -v ) 1>/dev/null 2>&1 || true
-  echo "[+] torn down $FOR_USER"
+  ( cd "$ABS_DIR" && docker compose -p "${ALIAS:-default}" down -v ) 1>/dev/null 2>&1 || true
+  echo "[+] torn down $FOR_USER (project=${ALIAS:-default})"
 else
   echo "[!] $ABS_DIR/docker-compose.yml not found (skip)"
 fi
