@@ -143,6 +143,8 @@ class TargetResult:
     recall: float = 0.0
     f1: float = 0.0
     score: float = 0.0
+    flag_found: bool = False
+    flag_value: str = ""
     expected: list[dict] = field(default_factory=list)
     extra_findings: list[dict] = field(default_factory=list)
 
@@ -296,6 +298,31 @@ def run_target(base: str, target: dict, use_mcp: bool, deadline: float) -> Targe
     res.expected = [asdict(e) for e in expected]
     res.extra_findings = extra
 
+    # ── CTF flag detector — 모든 trace/candidate/finding 텍스트에서 flag_pattern 매칭 ──
+    flag_pat = target.get("flag_pattern", "")
+    if flag_pat:
+        import re as _re
+        try:
+            rx = _re.compile(flag_pat)
+        except _re.error:
+            rx = None
+        if rx is not None:
+            haystack_parts: list[str] = []
+            for t in traces:
+                md = t.get("metadata") or {}
+                haystack_parts.append(json.dumps(md, ensure_ascii=False, default=str))
+                haystack_parts.append(json.dumps(t.get("response_preview"), ensure_ascii=False, default=str))
+                haystack_parts.append(json.dumps(t.get("tool_calls"), ensure_ascii=False, default=str))
+            for c in candidates:
+                haystack_parts.append(json.dumps(c, ensure_ascii=False, default=str))
+            for f in findings:
+                haystack_parts.append(json.dumps(f, ensure_ascii=False, default=str))
+            haystack = "\n".join(haystack_parts)
+            m = rx.search(haystack)
+            if m:
+                res.flag_found = True
+                res.flag_value = m.group(0)
+
     return res
 
 
@@ -305,6 +332,9 @@ def composite_score(res: TargetResult, metrics_cfg: dict) -> float:
     score -= float(metrics_cfg.get("turn_penalty_per_turn", 0.0)) * res.turns
     if res.status == "timeout":
         score -= float(metrics_cfg.get("timeout_penalty", 0.0))
+    # CTF flag 획득 시 큰 보너스 (default 1.0 점) — finding 매칭보다 본질적 성공
+    if res.flag_found:
+        score += float(metrics_cfg.get("flag_bonus", 1.0))
     return round(score, 4)
 
 
@@ -410,21 +440,23 @@ def main(argv: list[str]) -> int:
 
     # ── 요약 출력 ──
     print("\n" + "=" * 70)
-    print(f"{'target':14s} {'status':10s} {'P':>5s} {'R':>5s} {'F1':>5s} "
+    print(f"{'target':22s} {'status':10s} {'flag':>4s} {'P':>5s} {'R':>5s} {'F1':>5s} "
           f"{'score':>7s} {'turns':>5s} {'$':>6s}")
-    print("-" * 70)
+    print("-" * 80)
     overall_f1_sum = 0.0
     overall_score_sum = 0.0
     for r in results:
         b = baseline_by_id.get(r.target_id)
         bf1 = b["f1"] if b else None
-        bsc = b["score"] if b else None
+        flag_str = "FLAG" if r.flag_found else "  - "
         print(
-            f"{r.target_id:14s} {r.status:10s} "
+            f"{r.target_id:22s} {r.status:10s} {flag_str:>4s} "
             f"{r.precision:>5.2f} {r.recall:>5.2f} {r.f1:>5.2f} "
             f"{r.score:>7.3f} {r.turns:>5d} ${r.llm_cost_usd:>5.3f}"
             + (fmt_delta(r.f1, bf1, 2) if b else "")
         )
+        if r.flag_found:
+            print(f"        🏁 flag: {r.flag_value}")
         overall_f1_sum += r.f1
         overall_score_sum += r.score
 

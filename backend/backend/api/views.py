@@ -12,6 +12,7 @@ from .models import (
     FindingEvidenceLink, AgentTask, VerificationLoop, Hypothesis,
     VisualAnalysis, IDORTestSession, WAFBypassAttempt,
     VulnerabilityEntry, PayloadPattern, ReportArchive, RunReport,
+    OOBHit,
 )
 from .serializers import (
     ScanRunSerializer, LLMTraceSerializer, RequestCatalogSerializer, CandidateSerializer,
@@ -45,6 +46,31 @@ def health(request):
     except Exception:
         pass
     return Response({"ok": True, "db_alive": db_alive})
+
+
+# ── OOB callback receiver ────────────────────────────────────
+# 공격 페이로드(XSS bot, SSRF, RCE 등)가 외부로 cookie/data를 보낼 때 사용할 endpoint.
+# admin bot이 우리 backend를 hit하면 method/headers/query/body 전부 OOBHit으로 저장.
+# tools_oob.oob_get_hits 가 token으로 폴링.
+
+@api_view(["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+def oob_receiver(request, token):
+    body = ""
+    try:
+        body = request.body.decode("utf-8", errors="replace")[:8000]
+    except Exception:
+        pass
+    OOBHit.objects.create(
+        token=token,
+        method=request.method,
+        path=request.path,
+        query_string=request.META.get("QUERY_STRING", "")[:4000],
+        headers={k: v for k, v in request.META.items()
+                 if k.startswith("HTTP_") or k in ("CONTENT_TYPE", "CONTENT_LENGTH")},
+        body=body,
+        remote_addr=request.META.get("REMOTE_ADDR", ""),
+    )
+    return Response({"received": True, "token": token})
 
 @api_view(["GET", "POST"])
 def scan_runs(request):

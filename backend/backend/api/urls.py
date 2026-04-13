@@ -13,6 +13,10 @@ router.register(r"report-archives", views.ReportArchiveViewSet, basename="report
 urlpatterns = [
     path("health/", views.health),
 
+    # OOB callback — token만 일치하면 무엇이든 받음. 페이로드가 admin bot 등을 통해 hit.
+    path("oob/<str:token>/", views.oob_receiver),
+    path("oob/<str:token>", views.oob_receiver),
+
     path("api/scan-runs/", views.scan_runs),
     path("api/scan-runs/<str:run_id>/", views.get_scan_run),
     path("api/scan-runs/<str:run_id>/llm-traces/", views.scan_run_llm_traces),

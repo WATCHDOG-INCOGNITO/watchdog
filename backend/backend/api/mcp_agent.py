@@ -203,12 +203,21 @@ EXECUTOR_PROMPT = """\
 도구 선택과 호출 횟수는 자율.
 
 ## 무기고 (필요한 것만)
-- 공격/요청: http_request, curl_request, sqlmap_scan, dalfox_scan, nuclei_scan,
+- 공격/요청: http_request (stateless), curl_request, sqlmap_scan, dalfox_scan, nuclei_scan,
   ffuf_scan, nikto_scan, wafw00f_scan, whatweb_scan
+- **Stateful HTTP (multi-step web flow 필수)**:
+  - `http_session_request(session_id, method, url, headers_json, body, form_json, files_json)`
+    — session_id가 같으면 cookie/session 보존. 회원가입 → 로그인 → 보호된 endpoint chain.
+    files_json으로 multipart 파일 업로드.
+  - `http_session_cookies(session_id)` / `http_session_close(session_id)`
+- **OOB callback (XSS bot / SSRF / RCE 비동기 결과)**:
+  - `oob_register_token(scan_run_id)` → callback_url 발급. 페이로드의 webhook 대상으로 사용.
+  - `oob_wait_for_hit(token, timeout_s)` → 페이로드 발사 후 hit 동기 대기.
+  - `oob_get_hits(token)` → 폴링.
 - 정찰 보조: browser_navigate, browser_get_dom, browser_get_network_log,
   browser_screenshot, browser_extract_api_endpoints
-- Knowledge: search_knowledge, retrieve_similar_patterns, record_pattern_use,
-  mutate_payload(seed_pattern_id, mutation_type)  ← KB 패턴의 변종 생성 (exploration용)
+- Source reading (white-box): list_source_tree, read_source, grep_source
+- Knowledge: search_knowledge, retrieve_similar_patterns, record_pattern_use, mutate_payload
 - 후보 생성: create_candidate_manual
 - 증거 보조: save_evidence, auto_collect_evidence
 - 종료: emit_attempts(attempts_json="...")
@@ -368,6 +377,10 @@ EXECUTOR_TOOLS = {
     "recall_dead_ends",
     # Source reading — chain composition 시 코드 참고
     "read_source", "grep_source", "list_source_tree",
+    # Stateful HTTP — multi-step web flow (login → write → report 등)
+    "http_session_request", "http_session_cookies", "http_session_close",
+    # OOB callback — XSS bot / SSRF / RCE 비동기 결과 수신
+    "oob_register_token", "oob_get_hits", "oob_wait_for_hit", "oob_clear_hits",
     "emit_attempts",
 }
 VERIFIER_TOOLS = {
@@ -380,6 +393,10 @@ VERIFIER_TOOLS = {
     "learn_from_finding", "learn_dead_end", "update_target_profile",
     # Source reading — false positive 판정 시 코드 검증
     "read_source", "grep_source", "list_source_tree",
+    # OOB — XSS bot 등 비동기 결과 확증 (oracle 보다 강한 증거)
+    "oob_get_hits", "oob_wait_for_hit",
+    # Verifier도 stateful HTTP 가능 (control vs payload 비교 chain)
+    "http_session_request",
     "emit_verdicts",
 }
 REPORTER_TOOLS = {"generate_report", "get_scan_summary"}
@@ -678,9 +695,31 @@ async def _run_multi_agent_loop(
         f"verifier={len(verifier_tools)} reporter={len(reporter_tools)}"
     )
 
+    # white-box 환경 자동 감지 — SOURCE_ROOTS 환경변수가 있고 디렉터리에 파일이 있으면
+    # Planner에게 명시. 자율성 원칙 — 강제 X, 정보만 알려주고 사용 결정은 에이전트.
+    source_hint = ""
+    src_roots = os.environ.get("SOURCE_ROOTS", "").strip()
+    if src_roots:
+        try:
+            existing = []
+            for root in src_roots.split(":"):
+                root = root.strip()
+                if root and os.path.isdir(root):
+                    sub = [d for d in os.listdir(root) if not d.startswith(".")]
+                    if sub:
+                        existing.append((root, sub[:10]))
+            if existing:
+                lines = ["", "[WHITE-BOX] SOURCE_ROOTS 디렉터리에 코드가 있습니다 — `list_source_tree`/`read_source`/`grep_source` 활용 권장:"]
+                for root, subs in existing:
+                    lines.append(f"  - {root}: {', '.join(subs)}")
+                source_hint = "\n".join(lines)
+        except Exception:
+            pass
+
     plan_brief = (
         f"타겟 URL: {scan_run.target_url}\n"
-        f"스캔 ID: {scan_run.run_id}\n\n"
+        f"스캔 ID: {scan_run.run_id}\n"
+        f"{source_hint}\n"
         f"위 타겟을 정찰하고 hypotheses(JSON)를 출력하세요."
     )
     last_replan_hint = ""

@@ -34,6 +34,8 @@ from .tools_handoff import register as register_handoff
 from .tools_oracle import register as register_oracle
 from .tools_learn import register as register_learn
 from .tools_source import register as register_source
+from .tools_session import register as register_session
+from .tools_oob import register as register_oob
 
 register_security(mcp)
 register_browser(mcp)
@@ -46,6 +48,8 @@ register_handoff(mcp)
 register_oracle(mcp)
 register_learn(mcp)
 register_source(mcp)
+register_session(mcp)
+register_oob(mcp)
 
 def main():
     import sys

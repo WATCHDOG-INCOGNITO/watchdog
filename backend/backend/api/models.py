@@ -408,6 +408,28 @@ class TargetProfile(models.Model):
         db_table = "target_profiles"
 
 
+class OOBHit(models.Model):
+    """Out-of-band callback 수신 기록 — XSS bot, SSRF, RCE 등이 우리 서버를 hit 하면 저장.
+
+    공격 페이로드가 외부 callback URL로 사용할 수 있게 backend에 `/oob/<token>/...` view 노출.
+    공격이 admin bot 등을 통해 우리 endpoint를 hit하면 method/headers/query/body 전부 저장.
+    Verifier 등이 oob_get_hits(token) 으로 폴링.
+    """
+    hit_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    token = models.CharField(max_length=128, db_index=True)
+    method = models.CharField(max_length=16)
+    path = models.TextField()
+    query_string = models.TextField(null=True, blank=True)
+    headers = models.JSONField(null=True, blank=True)
+    body = models.TextField(null=True, blank=True)
+    remote_addr = models.CharField(max_length=64, null=True, blank=True)
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "oob_hits"
+        ordering = ["-received_at"]
+
+
 class DeadEnd(models.Model):
     """Negative knowledge — 이 host/endpoint/vuln_type 조합에 시도했으나 실패한 패턴.
     다음 스캔에서 같은 시도 회피해 cost/turn 절약.
