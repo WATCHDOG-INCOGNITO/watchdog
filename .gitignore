@@ -25,8 +25,14 @@ media/
 
 # 민감 파일
 .env
-gcp-key1.json
 *.json.key
+# 모든 secret 한 폴더에 모음 — 디렉터리 자체만 유지
+secrets/*
+!secrets/.gitkeep
+!secrets/README.md
+# (legacy) 이전 위치 — 이미 secrets/ 로 이동
+gcp-key1.json
+voyage_api.key
 
 frontend/node_modules/
 

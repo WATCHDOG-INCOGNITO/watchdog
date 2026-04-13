@@ -18,6 +18,15 @@ _client = None
 _unavailable_reason: str | None = None
 
 
+def _read_secret_file(path: str) -> str:
+    """secrets/voyage.key 같은 한 줄 파일 read (entrypoint env 못 받는 child process용)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except (FileNotFoundError, PermissionError, OSError):
+        return ""
+
+
 def _get_client():
     global _client, _unavailable_reason
     if _client is not None:
@@ -25,9 +34,15 @@ def _get_client():
     if _unavailable_reason is not None:
         return None
 
-    api_key = os.environ.get("VOYAGE_API_KEY", "").strip()
+    # 1) 환경변수 우선 (.env 또는 docker compose environment)
+    # 2) /run/secrets/voyage.key file fallback (docker exec child process가 entrypoint
+    #    env를 못 받을 때 자동 read)
+    api_key = (
+        os.environ.get("VOYAGE_API_KEY", "").strip()
+        or _read_secret_file("/run/secrets/voyage.key")
+    )
     if not api_key:
-        _unavailable_reason = "VOYAGE_API_KEY not set"
+        _unavailable_reason = "VOYAGE_API_KEY not set (env + /run/secrets/voyage.key 둘 다 없음)"
         logger.warning("Voyage embedding disabled: %s", _unavailable_reason)
         return None
     try:
