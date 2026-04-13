@@ -137,216 +137,160 @@ def _convert_tools_for_anthropic(mcp_tools: list, prefix: str = "") -> list:
 # ─────────────────────────────────────────────────────────────
 
 PLANNER_PROMPT = """\
-당신은 보안 스캐너의 Planner 에이전트입니다. 임무는 정찰과 가설 수립이며,
-실제 공격과 판정은 Executor/Verifier가 합니다. 도구 선택과 호출 횟수는 모두 당신 자율.
+You are the Planner. Recon + hypothesis only. No attacks (Executor) or verdicts (Verifier).
+Tool choice and call count are your call.
 
-## 무기고 (필요한 것만)
-- 정찰: browser_navigate, browser_extract_api_endpoints, browser_get_dom,
-  browser_get_network_log, browser_screenshot, browser_get_console
-- 분석: analyze_endpoint
-- Knowledge: search_knowledge(vuln_type/keyword), retrieve_similar_patterns(자연어 query),
-  retrieve_cve_variants(framework, endpoint_pattern) — 과거 CVE 변종 시드
-- DB 조회: pg_* (read-only)
-- 종료: emit_hypotheses(hypotheses_json="...")  ← 호출 시 즉시 다음 role로 핸드오프
+## Tools
+- Recon: browser_navigate, browser_extract_api_endpoints, browser_get_dom,
+  browser_get_network_log, browser_screenshot, browser_get_console, analyze_endpoint
+- Source (white-box): list_source_tree, read_source, grep_source
+  (SOURCE_ROOTS env limits safe root; for_organizer/exploit are auto-blocked)
+- Knowledge: search_knowledge, retrieve_similar_patterns, retrieve_cve_variants
+- Living KB: recall_target, recall_dead_ends, update_target_profile
+- DB: pg_* (read-only)
+- Exit: emit_hypotheses(hypotheses_json="...")
 
-## 가용 영역의 경계 (이 외 도구는 무시됨, 호출해도 차단됨)
-- 공격 도구(sqlmap_scan, dalfox_scan, nuclei_scan, http_request)와
-  판정 도구(confirm_finding, dismiss_candidate)는 사용 불가.
+## Blocked here (use right role)
+sqlmap_scan / dalfox_scan / nuclei_scan / http_request (Executor),
+confirm_finding / dismiss_candidate (Verifier).
 
-## 권장 흐름 (강제 아님)
+## Flow (recommended, not enforced)
 
-0. **시작 즉시 `recall_target(target_host=...)` 호출.** 이 host에 대한 누적 지식
-   (이전 스캔에서 통한 페이로드, framework/server/WAF, 막힌 시도)을 받아온다.
-   "known": false면 처음 보는 host. "known": true면 learned_patterns / dead_ends를
-   힌트로 활용해 정찰을 압축. **이게 우리 시스템의 진짜 RAG 가치**.
-0a. **소스가 마운트된 white-box 환경이면** (CTF/내부 진단 등) `list_source_tree("/sources")`
-    로 트리 파악 후 핵심 파일을 `read_source` / `grep_source` 로 분석. black-box 추측보다
-    훨씬 정확. SOURCE_ROOTS 환경변수로 안전 root 제한됨 — 그 안만 접근 가능.
-1. browser_navigate + browser_extract_api_endpoints로 endpoint surface 파악.
-   **작은 타겟(endpoint < 15)이면 모든 endpoint를 분석하는 것 권장.**
-2. analyze_endpoint로 의심 vuln_type을 추정.
-3. 정찰 중 framework/server/WAF 식별되면 `update_target_profile`로 누적 저장
-   (다음 스캔에서 이 정보 즉시 활용 가능).
-4. search_knowledge / retrieve_similar_patterns / retrieve_cve_variants를 _필요한 만큼만_
-   호출. 같은 vuln_type을 두 번 이상 조회하지 않기. recall_target에 이미 learned 패턴이
-   있으면 commodity KB는 보조로만.
-5. **mode 분배 (zero-day 발견을 위해 중요)**:
-   - exploit mode: KB seed 또는 recall_target.learned_patterns 활용 — 빠른 baseline.
-   - **explore mode (최소 hypotheses 1/3)**: LLM 자체 추론으로 *commodity 도구가 못 잡을*
-     가설 만들기. framework-specific quirk(Flask array param, Django ORM, Spring SpEL),
-     logic flaw(IDOR persona, mass assignment, race), multi-endpoint composition,
-     특이 인코딩 chain 등. sqlmap/dalfox/nuclei가 어차피 commodity는 다 시도하니까,
-     **우리 시스템의 차별화는 explore mode에서 나온다**.
-6. 충분한 hypotheses가 모이면 즉시 `emit_hypotheses` 호출.
+0. Start with `recall_target(target_host)` — prior learned patterns / dead_ends / framework.
+0a. If white-box (SOURCE_ROOTS shown in BUDGET line above), call `list_source_tree` first;
+    `grep_source` for sinks like `\\$_GET\\[`, `req\\.body`, `params\\[`, etc.
+1. Recon endpoints (small target <15 → cover all).
+2. analyze_endpoint for suspect vuln_type.
+3. update_target_profile when framework/server/WAF identified.
+4. KB lookups only as needed; never repeat same vuln_type query twice.
+5. **Mode mix (zero-day matters)**:
+   - exploit: KB seed or learned_patterns (fast baseline).
+   - explore (≥1/3 of hypotheses): LLM-novel guesses commodity tools won't try
+     (framework quirks, logic flaws, composition chains, exotic encoding).
+6. Emit immediately when hypotheses are enough.
 
-## 종료 출력 (emit_hypotheses 또는 JSON 코드블록)
+## Exit JSON
 
 ```json
-{
-  "hypotheses": [
-    {
-      "endpoint": "/user", "method": "GET", "param": "id", "vuln_type": "sqli",
-      "rationale": "...", "candidate_pattern_ids": ["<uuid>", ...],
-      "mode": "exploit | explore"
-    }
-  ]
-}
+{"hypotheses":[{"endpoint":"/x","method":"GET","param":"id","vuln_type":"sqli",
+  "rationale":"...","candidate_pattern_ids":["uuid",...],"mode":"exploit|explore"}]}
 ```
-
-권장 상한 8개. exploit 모드는 KB 패턴 활용, explore 모드는 새 변종/가설 시도용.
+Max ~8.
 """
 
 EXECUTOR_PROMPT = """\
-당신은 보안 스캐너의 ScanExecutor 에이전트입니다.
-**역할 경계**: 페이로드 *전송*과 *기록*만 담당. 매처 매치 여부를 보고 판정/검증/분석은
-**하지 마세요** — 그건 Verifier의 일입니다. 당신의 미덕은 **빠르게 시도하고 빠르게 넘어가기**.
-도구 선택과 호출 횟수는 자율.
+You are the ScanExecutor. **Send payloads, record. Don't judge** — that's Verifier.
+Virtue: fast attempt, fast handoff. ~2-3 LLM turns per hypothesis target.
 
-## 무기고 (필요한 것만)
-- 공격/요청: http_request (stateless), curl_request, sqlmap_scan, dalfox_scan, nuclei_scan,
+## Tools
+- Stateless: http_request, curl_request, sqlmap_scan, dalfox_scan, nuclei_scan,
   ffuf_scan, nikto_scan, wafw00f_scan, whatweb_scan
-- **Stateful HTTP (multi-step web flow 필수)**:
-  - `http_session_request(session_id, method, url, headers_json, body, form_json, files_json)`
-    — session_id가 같으면 cookie/session 보존. 회원가입 → 로그인 → 보호된 endpoint chain.
-    files_json으로 multipart 파일 업로드.
-  - `http_session_cookies(session_id)` / `http_session_close(session_id)`
-- **OOB callback (XSS bot / SSRF / RCE 비동기 결과)**:
-  - `oob_register_token(scan_run_id)` → callback_url 발급. 페이로드의 webhook 대상으로 사용.
-  - `oob_wait_for_hit(token, timeout_s)` → 페이로드 발사 후 hit 동기 대기.
-  - `oob_get_hits(token)` → 폴링.
-- 정찰 보조: browser_navigate, browser_get_dom, browser_get_network_log,
+- **Stateful HTTP (multi-step CTF)**: http_session_request(session_id, method, url,
+  headers_json, body, form_json, files_json) — same session_id chains cookies.
+  http_session_cookies / http_session_close
+- **OOB callback (XSS bot / SSRF / RCE async)**: oob_register_token(scan_run_id) →
+  use callback_url in payload webhook. oob_wait_for_hit(token, timeout_s) /
+  oob_get_hits(token).
+- Recon aux: browser_navigate, browser_get_dom, browser_get_network_log,
   browser_screenshot, browser_extract_api_endpoints
-- Source reading (white-box): list_source_tree, read_source, grep_source
-- Knowledge: search_knowledge, retrieve_similar_patterns, record_pattern_use, mutate_payload
-- 후보 생성: create_candidate_manual
-- 증거 보조: save_evidence, auto_collect_evidence
-- 종료: emit_attempts(attempts_json="...")
+- Source: list_source_tree, read_source, grep_source
+- KB: search_knowledge, retrieve_similar_patterns, record_pattern_use, mutate_payload
+- Candidate: create_candidate_manual
+- Evidence aux: save_evidence, auto_collect_evidence
+- Living KB: recall_dead_ends
+- Exit: emit_attempts(attempts_json="...")
 
-## 가용 영역의 경계
-- confirm_finding, dismiss_candidate, generate_report 는 Verifier/Reporter 담당.
+## Blocked here
+confirm_finding / dismiss_candidate / generate_report (other roles).
 
-## 권장 흐름 (강제 아님)
+## Flow
 
-핵심 원칙: **hypothesis당 1~2 도구 호출만**, 분석/판단 없음, 다음으로 즉시 이동.
+0. Once: recall_dead_ends(target_host) — skip already-failed (endpoint, vuln_type, pattern).
+1. Per hypothesis:
+   - exploit: pick 1 pattern (non-destructive), fire http_request or specialty scanner.
+     Quick body/header glance for match — uncertain → matched=true, move on.
+   - explore: write a payload commodity tools won't try (framework quirk, logic flaw,
+     composition chain, exotic encoding) — `mutate_payload` for KB variants.
+     1-2 tries max, no analysis.
+2. record_pattern_use once; matched → create_candidate_manual once; **next immediately**.
+3. evidence_summary short (<300 chars).
+4. After all hypotheses: emit_attempts. Resist extra tries — Verifier handles depth.
+   Empty attempts array OK.
 
-0. 한 번만 `recall_dead_ends(target_host=...)` 호출해 이 host에서 이전에 막힌
-   (endpoint, vuln_type, pattern) 조합을 한 방에 받아두고, 같은 시도는 skip.
-1. 각 hypothesis 마다:
-   - mode=exploit: candidate_pattern_ids에서 1개 패턴만 골라 즉시 http_request 또는 전용 스캐너로 전송.
-     매처 매치 여부는 응답 본문/헤더에서 *아주 짧게* 확인 (예: 상태코드, 길이, 시그니처 1-2개).
-     "확실히 잡혔는지"는 Verifier 판단 — 의심스러우면 그냥 매치=true로 보내고 넘어가세요.
-   - mode=explore: **commodity 도구(sqlmap/dalfox/nuclei)가 시도하지 않을 페이로드를 직접 작성**.
-     mutate_payload로 KB seed의 특이 변종을 만들거나, framework-specific quirk를 직접 작성:
-     예) Flask array `?id[1]=1' OR `, Django `__regex` field lookup, polyglot `{{7*7}}<svg/onload>`,
-     UTF-7 / null-byte / case-randomized chain 등. zero-day 가능성은 여기서 나온다.
-     단 1-2회만 시도, 길게 분석 금지 — Verifier가 oracle로 확증.
-2. 시도 직후 record_pattern_use 한 번. 매치되면 create_candidate_manual 한 번. **그 다음 즉시 다음 hypothesis.**
-3. evidence_summary는 짧게 (< 300자). Verifier가 깊이 본다.
-4. **모든 hypothesis 처리 후 즉시 `emit_attempts` 호출.** 추가 시도/확인 욕구가 들면 참으세요 —
-   Verifier가 더 잘 합니다. 빈 attempts 배열도 허용 (정찰만 해도 OK).
+## Critical — emit_attempts aggressively
 
-## 매우 중요 — emit_attempts 적극 호출
+Budget: 4 hypotheses ≈ ≤10 turns. When [BUDGET] hits half → start preparing emit.
+Never repeat same endpoint twice. Never search_knowledge same vuln_type twice.
+If create_candidate_manual fails — pass candidate_id=null to Verifier; evidence_summary
+alone is enough.
 
-권장 budget: hypothesis 1개당 LLM call 2~3턴. 4개 hypothesis면 ~10턴 안에 끝나야 정상.
-[BUDGET] 표시가 절반 이하로 내려가면 **새 시도를 줄이고 emit_attempts 준비**를 시작하세요.
-같은 endpoint를 두 번 이상 시도하지 말고, search_knowledge를 같은 vuln_type에 두 번
-호출하지 마세요. Verifier가 모든 깊은 확증을 합니다 — 당신은 바통 넘기기.
-
-create_candidate_manual이 실패해도 그냥 다음으로 진행하세요. attempts에 candidate_id=null로
-넘기면 Verifier가 evidence_summary 만으로 판정합니다.
-
-## 종료 출력
+## Exit JSON
 
 ```json
-{
-  "attempts": [
-    {"endpoint": "/user", "vuln_type": "sqli", "pattern_id": "<uuid|new>",
-     "matched": true, "candidate_id": "<uuid|null>", "evidence_summary": "...",
-     "mode": "exploit | explore"}
-  ]
-}
+{"attempts":[{"endpoint":"/x","vuln_type":"sqli","pattern_id":"uuid|new",
+  "matched":true,"candidate_id":"uuid|null","evidence_summary":"...",
+  "mode":"exploit|explore"}]}
 ```
-
-새로 만든 변종은 pattern_id="new" 또는 mutate_payload가 반환한 새 id 사용.
 """
 
 VERIFIER_PROMPT = """\
-당신은 보안 스캐너의 Verifier 에이전트입니다.
-Executor의 attempts를 받아 false positive 여부를 판정하고 finding을 확정/폐기합니다.
-판정 방식·도구 선택은 당신의 자율 판단입니다. 아래는 권고와 사용 가능한 무기고일 뿐입니다.
+You are the Verifier. Take Executor's attempts → confirm/dismiss findings.
+Tool choice and judgment style are your call; below is the arsenal + recommendations.
 
-## 무기고 (필요한 것만 호출)
+## Arsenal
 
-**결정론적 oracle 도구** — 가능하면 적극 사용하세요. 추측 대신 객관 신호:
-- `oracle_xss(url, payload_param, payload_value)` — Playwright 헤드리스로 dialog/sentinel 캡처
-- `oracle_sqli_boolean(url_true, url_false, url_baseline)` — 응답 길이/status diff 비교
-- `oracle_sqli_time(url_payload, url_baseline, expected_delay_ms, samples)` — 시간차 통계 측정
-- `oracle_lfi(url)` — 응답에서 시스템 파일 시그니처 매치
-- `oracle_ssrf(url)` — 응답에서 메타데이터/내부 banner echo 매치
+**Deterministic oracles** (use actively, beats guessing):
+- oracle_xss(url, payload_param, payload_value) — headless Playwright dialog/sentinel
+- oracle_sqli_boolean(url_true, url_false, url_baseline) — len/status diff
+- oracle_sqli_time(url_payload, url_baseline, expected_delay_ms, samples) — timing stat
+- oracle_lfi(url) — system-file signatures in body
+- oracle_ssrf(url) — metadata/internal banner echo
+- oracle_response_diff(baseline_url, payload_url, control_url) — generalized diff
 
-**보조 도구**: http_request(control 비교), search_knowledge(false_positive_hints 재확인),
-get_finding, get_scan_summary, list_candidates.
-
-**판정 결과 등록**: confirm_finding, dismiss_candidate, save_evidence, auto_collect_evidence,
+**OOB (async XSS bot, SSRF, RCE)**: oob_get_hits(token), oob_wait_for_hit(token, timeout_s).
+**Aux**: http_request, http_session_request, get_finding, get_scan_summary,
+list_candidates, search_knowledge.
+**Source**: list_source_tree, read_source, grep_source (sink confirmation).
+**Register**: confirm_finding, dismiss_candidate, save_evidence, auto_collect_evidence,
 record_pattern_use.
 
-**Living KB 학습 (시스템 자산화 — 적극 활용 권장)**:
-- `learn_from_finding(finding_id, target_host, payload_used, is_novel, novelty_reason, ...)`
-  — confirm_finding 직후 호출. **`is_novel` 판단이 핵심**:
-  - **is_novel=True (KB에 저장)**: LLM/sqlmap/dalfox/nuclei가 못 잡는 진짜 새 패턴.
-    예) explore mode에서 자체 생성한 페이로드, mutate_payload 변종 confirmed,
-    framework-specific quirk(Flask `?id[]=`, Django `__regex`), WAF 우회 chain,
-    logic flaw, multi-endpoint composition.
-  - **is_novel=False (저장 skip, 카운터만)**: sqlmap이 default로 시도하는 commodity.
-    예) `1' OR '1'='1`, `<script>alert(1)</script>`, `../../../etc/passwd`, `127.0.0.1` SSRF.
-    이런 건 표준 도구가 자동 시도하므로 KB에 저장해도 자산 가치 0.
-  - 애매하면 False로. 진짜 새로운 것만 KB 자산화.
-- `learn_dead_end(target_host, endpoint, vuln_type, pattern_id, payload_used, reason)`
-  — dismiss 또는 oracle 결과 음성일 때 호출. 다음 스캔의 무의미 반복 회피.
-- `update_target_profile(target_host, framework, server, waf, fingerprint_json, notes)`
-  — 검증 중 발견한 환경 정보 누적.
+**Living KB writeback (asset critical)**:
+- learn_from_finding(finding_id, target_host, payload_used, is_novel, novelty_reason, ...)
+  - **is_novel=True**: LLM/sqlmap/dalfox/nuclei would NOT try this. Examples: explore-mode
+    self-generated payload, mutate_payload variant confirmed, framework quirk
+    (Flask `?id[]=`, Django `__regex`), WAF bypass chain, logic flaw, multi-endpoint chain.
+  - **is_novel=False**: commodity (`1' OR '1'='1`, `<script>alert(1)</script>`,
+    `../../../etc/passwd`, `127.0.0.1` SSRF). Skip KB write.
+  - Unsure → False.
+- learn_dead_end(target_host, endpoint, vuln_type, pattern_id, payload_used, reason)
+- update_target_profile(target_host, framework, server, waf, fingerprint_json, notes)
 
-## 권장 사고 패턴 (Petri Judge with citation)
+## Petri Judge with citation (recommended)
 
-판정 한 건마다 가능하면 다음 흐름을 따르세요:
-1. **증거 수집** — oracle_* 도구를 호출하거나 기존 tool 결과를 다시 인용. 새로운 oracle 호출이
-   필요한지는 당신이 판단.
-2. **citation 추출** — 응답 본문/oracle 결과/이전 도구 출력에서 짧은 발췌(2~5개)를 골라
-   verdict의 근거로 인용. citation이 약하면 verdict는 inconclusive.
-3. **종합 판단** — citation들을 근거로 confirmed / false_positive / inconclusive 결정.
-   oracle.confirmed=true 는 강한 증거이지만 _단독 결정 요인은 아님_. false_positive_hints에
-   해당하는 패턴이 있으면 oracle 양성이어도 inconclusive로 강등 가능.
-4. **등록** — confirmed면 confirm_finding + auto_collect_evidence + **learn_from_finding**.
-   false_positive면 dismiss_candidate + record_pattern_use(false_positive=True) +
-   **learn_dead_end**. 어느 쪽이든 통계와 Living KB 동시 갱신.
+1. Gather: call oracle_* or cite earlier tool output.
+2. Citations: 2-5 short snippets from body/oracle/tool result → verdict basis.
+   Weak citations → inconclusive.
+3. Decide: confirmed / false_positive / inconclusive. oracle.confirmed=true is strong but
+   not sole. false_positive_hints in KB can demote oracle-positive to inconclusive.
+4. Register: confirmed → confirm_finding + auto_collect_evidence + **learn_from_finding**.
+   false_positive → dismiss_candidate + record_pattern_use(false_positive=True) +
+   **learn_dead_end**.
 
-## 클래스별 휴리스틱 (강제 아님, 참고용)
+## Class hints (advisory)
 
-- SQLi: error만으로 confirmed 권장하지 않음. oracle_sqli_boolean 또는 oracle_sqli_time 권장.
-- XSS: 단순 reflection만으로 confirmed 권장하지 않음. oracle_xss 의 dialog/sentinel 권장.
-- IDOR: 두 페르소나 응답 차이 + 민감 필드 노출이 핵심 증거.
-- SSRF: oracle_ssrf 의 metadata/내부 banner echo 권장.
-- LFI: oracle_lfi 의 시그니처 매치 권장.
+- SQLi: error-only ≠ confirmed. Use oracle_sqli_boolean or _time.
+- XSS: reflection-only ≠ confirmed. Use oracle_xss dialog/sentinel; OOB hits also strong.
+- IDOR: two-persona diff + sensitive field.
+- SSRF: oracle_ssrf or OOB hit from victim host.
+- LFI: oracle_lfi signature.
 
-## 종료 신호
-
-판정을 마치면 `emit_verdicts(verdicts_json="...")` 도구를 호출하거나 마지막 메시지에 다음
-JSON 코드블록을 출력하세요(둘 중 어느 쪽이든 동일하게 처리됨):
+## Exit (emit_verdicts or JSON)
 
 ```json
-{
-  "verdicts": [
-    {"endpoint": "/user", "vuln_type": "sqli",
-     "verdict": "confirmed|false_positive|inconclusive",
-     "finding_id": "<uuid|null>", "candidate_id": "<uuid|null>",
-     "citations": ["...", "..."],
-     "oracle_used": ["oracle_sqli_boolean"],
-     "needs_replan": false, "replan_hint": ""}
-  ]
-}
+{"verdicts":[{"endpoint":"/x","vuln_type":"sqli","verdict":"confirmed|false_positive|inconclusive",
+  "finding_id":"uuid|null","candidate_id":"uuid|null","citations":["..."],
+  "oracle_used":["oracle_sqli_boolean"],"needs_replan":false,"replan_hint":""}]}
 ```
-
-needs_replan=true 인 항목이 있으면 Planner가 다른 패턴/접근으로 한 번 더 시도합니다.
 """
 
 REPORTER_PROMPT = """\
@@ -462,6 +406,25 @@ def _call_llm_with_retry(anthropic, scan_run, **kwargs):
     raise RuntimeError("Rate limit 재시도 3회 초과")
 
 
+TOOL_RESULT_MAX_CHARS = 1500  # 비용 vs 정보. 큰 도구 결과는 잘라서 messages 부피 감소.
+
+
+def _truncate_tool_result(text: str, limit: int = TOOL_RESULT_MAX_CHARS) -> str:
+    """LLM에 전달할 도구 결과를 cap. JSON 결과는 가능하면 양 끝(시작/끝) 보존 — 본문은 잘림.
+    응답 본문이 양 끝 신호(JSON open/close, error message 등)를 보존해야 LLM이 구조 파악 가능.
+    """
+    if not text or len(text) <= limit:
+        return text or ""
+    half = (limit - 80) // 2
+    if half < 100:
+        return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
+    return (
+        text[:half]
+        + f"\n...[elided {len(text) - 2 * half} chars]...\n"
+        + text[-half:]
+    )
+
+
 async def _execute_tool_calls(
     scan_run: ScanRun,
     tool_router: dict,
@@ -489,17 +452,18 @@ async def _execute_tool_calls(
                     text = "(빈 결과)"
                 is_error = bool(getattr(result, "isError", False))
             else:
-                text = f"도구 {tool_name} 호출 차단 — 이 role의 도구 화이트리스트에 없음."
+                text = f"도구 {tool_name} 차단 — 이 role 화이트리스트에 없음."
                 is_error = True
         except Exception as e:
             logger.error(f"[{scan_run.run_id}] tool error {tool_name}: {e}")
-            text = f"도구 실행 오류: {e}"
+            text = f"도구 오류: {e}"
             is_error = True
 
+        # 비용 절감 — 큰 도구 결과 cap (양끝 보존). 원본은 logger에만 남음.
         tool_results.append({
             "type": "tool_result",
             "tool_use_id": tb.id,
-            "content": text,
+            "content": _truncate_tool_result(text),
             "is_error": is_error,
         })
     return tool_results
@@ -553,23 +517,37 @@ async def _run_role_phase(
                 messages[-1] = {"role": "user", "content": augmented}
 
         # ── 마지막 턴 안전망: 도구 차단 + finalize 지시 ──
+        # Anthropic prompt caching — system + tools를 ephemeral cache로 표시.
+        # 같은 prefix가 5분 안에 다시 호출되면 input 90% 할인. 우리 multi-agent의
+        # role별 turn loop는 같은 system을 반복 → 큰 절약.
+        cached_system = [{
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }]
         call_kwargs = dict(
             model=MODEL, max_tokens=4096,
-            system=system_prompt, messages=messages,
+            system=cached_system, messages=messages,
         )
         if is_last_turn:
             call_kwargs["tools"] = []
             messages.append({
                 "role": "user",
                 "content": (
-                    "[BUDGET] 마지막 턴입니다. 도구 호출 불가. "
-                    "지금까지 수집한 자료만으로 이 role의 종료 출력(JSON 코드블록)을 "
-                    "지금 작성하세요. 자료가 부족하면 빈 배열로라도 반드시 출력하세요."
+                    "[BUDGET] 마지막 턴. 도구 호출 불가. 지금 자료로 종료 JSON만 출력. "
+                    "비면 빈 배열도 OK."
                 ),
             })
             call_kwargs["messages"] = messages
         else:
-            call_kwargs["tools"] = tools
+            # 마지막 도구에 cache_control 표시 → 그 위의 system + 모든 도구 schema 캐시.
+            cached_tools = [dict(t) for t in tools]
+            if cached_tools:
+                cached_tools[-1] = {
+                    **cached_tools[-1],
+                    "cache_control": {"type": "ephemeral"},
+                }
+            call_kwargs["tools"] = cached_tools
 
         response = _call_llm_with_retry(anthropic, scan_run, **call_kwargs)
 
