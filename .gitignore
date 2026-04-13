@@ -41,3 +41,10 @@ codegate2023-fin/
 codegate2024-final/
 codegate2025-final/
 codegate2026-pre/
+
+# CTF eval — exploit 스크립트 / 대회 문제별 진행 파일 (저작권 보호)
+agent/eval/_*
+agent/eval/PROGRESS.md
+agent/eval/HANDOFF.md
+agent/eval/targets.yaml
+agent/eval/history.jsonl
