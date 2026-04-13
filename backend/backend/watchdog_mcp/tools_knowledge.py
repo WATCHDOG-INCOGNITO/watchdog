@@ -35,6 +35,11 @@ def _search(vuln_type: str | None, keyword: str | None, limit: int) -> dict:
             Q(name__icontains=kw)
             | Q(vuln_type__icontains=kw)
             | Q(request_template__icontains=kw)
+            # technique 의 attack_metadata JSON 본문(applies_when, steps, examples 등) 까지 검색.
+            # JSONField __icontains는 Postgres serialized JSON text에 대한 LIKE.
+            | Q(attack_metadata__icontains=kw)
+            | Q(safety_notes__icontains=kw)
+            | Q(tags__icontains=kw)
         )
 
     patterns = patterns.order_by("-is_gold", "-times_succeeded", "-times_used")[:limit]
