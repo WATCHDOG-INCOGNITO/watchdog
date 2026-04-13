@@ -135,7 +135,12 @@ def register(mcp):
             )
             return str(cand.cand_id)
 
-        cand_id = await sync_to_async(_create, thread_sensitive=False)()
+        # thread_sensitive=True 가 async event loop 내 ORM 호출에서 안전.
+        # 다른 도구들(record_pattern_use 등)이 우연히 통과하는 건 호출 빈도/타이밍 차이.
+        try:
+            cand_id = await sync_to_async(_create, thread_sensitive=True)()
+        except Exception as e:
+            return json.dumps({"error": f"create_candidate_manual failed: {e}"})
         return json.dumps({
             "cand_id": cand_id,
             "vuln_type": vuln_type,

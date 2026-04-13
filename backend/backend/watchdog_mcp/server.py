@@ -29,6 +29,9 @@ from .tools_analysis import register as register_analysis
 from .tools_storage import register as register_storage
 from .tools_report import register as register_report
 from .tools_benchmark import register as register_benchmark
+from .tools_knowledge import register as register_knowledge
+from .tools_handoff import register as register_handoff
+from .tools_oracle import register as register_oracle
 
 register_security(mcp)
 register_browser(mcp)
@@ -36,6 +39,9 @@ register_analysis(mcp)
 register_storage(mcp)
 register_report(mcp)
 register_benchmark(mcp)
+register_knowledge(mcp)
+register_handoff(mcp)
+register_oracle(mcp)
 
 def main():
     import sys

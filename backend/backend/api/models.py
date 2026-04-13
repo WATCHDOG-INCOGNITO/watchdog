@@ -1,6 +1,21 @@
 import uuid
 from django.db import models
 
+try:
+    from pgvector.django import VectorField
+    _PGVECTOR_AVAILABLE = True
+except ImportError:  # pgvector 미설치 환경 (로컬 lint 등)
+    _PGVECTOR_AVAILABLE = False
+
+    class VectorField(models.JSONField):  # type: ignore[no-redef]
+        """pgvector 미설치 시 fallback. 실제 Docker 런타임에는 pgvector 사용."""
+
+        def __init__(self, *args, dimensions: int = 1024, **kwargs):
+            self.dimensions = dimensions
+            kwargs.setdefault("null", True)
+            kwargs.setdefault("blank", True)
+            super().__init__(*args, **kwargs)
+
 # Scan 관련
 
 class ScanRun(models.Model):
@@ -346,6 +361,9 @@ class PayloadPattern(models.Model):
 
     source = models.CharField(max_length=64, null=True, blank=True)
     tags = models.JSONField(null=True, blank=True)
+
+    embedding = VectorField(dimensions=1024, null=True, blank=True)
+    embedding_model = models.CharField(max_length=64, null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

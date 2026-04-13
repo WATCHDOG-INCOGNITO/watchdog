@@ -1,0 +1,90 @@
+{
+  "timestamp": "2026-04-13T08:16:39.283294+00:00",
+  "phase": "3-multiagent-baseline",
+  "git_rev": "afa1c73",
+  "mcp": true,
+  "mean_f1": 0.0,
+  "mean_score": -0.0619,
+  "results": [
+    {
+      "target_id": "wargame",
+      "target_url": "http://wargame:5000",
+      "run_id": "9075722e-f318-48b7-bc7c-2ace113f5ad5",
+      "status": "finished",
+      "duration_s": 217.8,
+      "llm_calls": 20,
+      "llm_tokens": 137044,
+      "llm_cost_usd": 0.4388,
+      "turns": 20,
+      "endpoints_crawled": 0,
+      "candidates": 0,
+      "findings": 0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 7,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "score": -0.0619,
+      "expected": [
+        {
+          "endpoint": "/user",
+          "param": "id",
+          "vuln_type": "sqli",
+          "severity": "high",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/posts",
+          "param": "user_id",
+          "vuln_type": "sqli",
+          "severity": "high",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/login",
+          "param": "username",
+          "vuln_type": "sqli",
+          "severity": "high",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/search",
+          "param": "q",
+          "vuln_type": "xss",
+          "severity": "medium",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/profile",
+          "param": "uid",
+          "vuln_type": "idor",
+          "severity": "medium",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/fetch",
+          "param": "url",
+          "vuln_type": "ssrf",
+          "severity": "high",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/read",
+          "param": "file",
+          "vuln_type": "lfi",
+          "severity": "high",
+          "matched": false,
+          "matched_as": ""
+        }
+      ],
+      "extra_findings": []
+    }
+  ]
+}
