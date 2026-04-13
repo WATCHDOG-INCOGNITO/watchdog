@@ -404,11 +404,30 @@ def main(argv: list[str]) -> int:
         default=None,
         help="단일 타겟의 target_url을 오버라이드 (예: localhost)",
     )
+    p.add_argument(
+        "--only", default="",
+        help="쉼표로 구분된 target id 만 실행 (나머지 skip)",
+    )
+    p.add_argument(
+        "--setup", action="store_true",
+        help="각 target 시작 전 ctf_setup.sh 호출 (ctf_for_user + ctf_alias 있을 때만)",
+    )
+    p.add_argument(
+        "--teardown", action="store_true",
+        help="각 target 종료 후 ctf_teardown.sh 호출",
+    )
     args = p.parse_args(argv)
 
     cfg = yaml.safe_load(pathlib.Path(args.targets).read_text(encoding="utf-8"))
     targets = cfg.get("targets", [])
     metrics_cfg = cfg.get("metrics", {})
+
+    if args.only:
+        wanted = {s.strip() for s in args.only.split(",") if s.strip()}
+        targets = [t for t in targets if t.get("id") in wanted]
+        if not targets:
+            print(f"no target matched --only={args.only}")
+            return 1
 
     if args.target_url and targets:
         targets[0]["target_url"] = args.target_url
@@ -417,19 +436,36 @@ def main(argv: list[str]) -> int:
     deadline = time.time() + args.total_timeout
 
     print("=" * 70)
-    print(f"Watchdog eval  phase={args.phase}  mcp={args.mcp}  git={git_rev()}")
+    print(f"Watchdog eval  phase={args.phase}  mcp={args.mcp}  git={git_rev()}  "
+          f"targets={len(targets)}")
     print("=" * 70)
 
     if not wait_health(base, min(time.time() + 30, deadline)):
         print("health check FAIL — backend이 떠있지 않습니다.")
         return 1
 
+    setup_script = str(EVAL_DIR / "ctf_setup.sh")
+    teardown_script = str(EVAL_DIR / "ctf_teardown.sh")
+
     results: list[TargetResult] = []
     for t in targets:
         print(f"\n[run] {t['id']} → {t['target_url']}")
-        r = run_target(base, t, args.mcp, deadline)
-        r.score = composite_score(r, metrics_cfg)
-        results.append(r)
+        if args.setup and t.get("ctf_for_user") and t.get("ctf_alias"):
+            print(f"      [setup] {t['ctf_for_user']} alias={t['ctf_alias']}")
+            rc = subprocess.call(
+                ["bash", setup_script, t["ctf_for_user"], t["ctf_alias"]],
+            )
+            if rc != 0:
+                print(f"      [setup] FAILED rc={rc} — skipping target")
+                continue
+        try:
+            r = run_target(base, t, args.mcp, deadline)
+            r.score = composite_score(r, metrics_cfg)
+            results.append(r)
+        finally:
+            if args.teardown and t.get("ctf_for_user"):
+                print(f"      [teardown] {t['ctf_for_user']}")
+                subprocess.call(["bash", teardown_script, t["ctf_for_user"]])
 
     # ── baseline 비교 ──
     baseline = load_baseline()

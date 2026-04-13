@@ -30,13 +30,25 @@ MAX_FILE_BYTES = 1_000_000   # 1MB 하나의 read 상한
 MAX_TREE_ENTRIES = 2000
 MAX_GREP_MATCHES = 200
 
-# CTF용 채점 안전망 — for_organizer/exploit 디렉터리는 정답/flag 포함이라 차단.
-# 사람이 docker-compose mount를 잘못해도 에이전트가 못 읽게 이중 보호.
-FORBIDDEN_PATH_TOKENS = ("for_organizer", "/exploit/", "/exploit.md")
+# CTF 채점 안전망 — 정답/flag 포함 디렉터리/파일은 읽기 차단.
+# 여러 대회가 bulk mount되지만 이 필터가 에이전트 접근을 for_user/*만 허용.
+FORBIDDEN_PATH_TOKENS = (
+    "for_organizer",     # 출제자용 (풀이, flag 포함)
+    "/exploit/",         # 정답 exploit
+    "/exploit.md",
+    "/exploit.py",
+    "/anticheat/",       # 채점 모듈 (dynamic flag)
+    "/flag.txt",         # 플래그 파일
+    "/flag",
+    "info.yaml",         # flag 메타데이터 포함
+)
+# 대회 root 바로 아래 README.md는 출제자 풀이 가능성 → 차단.
+# for_user 안의 README 또는 source 파일은 허용 (참가자 문서).
+REQUIRED_PATH_SUBSTRING = "/for_user"
 
 
 def _resolve_safe(p: str) -> Path | None:
-    """root 화이트리스트 안의 경로 + 금지 토큰 미포함이면 Path 반환, 아니면 None."""
+    """안전 root + for_user 경로 + 금지 토큰 미포함이면 Path 반환, 아니면 None."""
     if not p:
         return None
     try:
@@ -44,11 +56,20 @@ def _resolve_safe(p: str) -> Path | None:
     except Exception:
         return None
     s = str(candidate).replace("\\", "/")
+    # 금지 토큰 차단 (정답/flag 노출 방지)
     if any(tok in s for tok in FORBIDDEN_PATH_TOKENS):
         return None
+    # CTF 대회 mount(`/sources/codegate*`)에 속하면 반드시 for_user 경로 포함
     for root in SOURCE_ROOTS:
         try:
-            candidate.relative_to(root)
+            rel = candidate.relative_to(root)
+            rel_str = str(rel).replace("\\", "/")
+            # 대회 디렉터리 아래는 for_user 경로 필수, 디렉터리 자체는 허용
+            if rel_str and "codegate" in rel_str.split("/", 1)[0].lower():
+                # for_user 경로 미포함이면 차단 (대회 디렉터리 또는 문제 디렉터리까지만 목록은 허용)
+                depth = len(rel.parts)
+                if depth >= 4 and REQUIRED_PATH_SUBSTRING not in "/" + rel_str:
+                    return None
             return candidate
         except ValueError:
             continue
