@@ -6,8 +6,11 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from asgiref.sync import sync_to_async
+
+logger = logging.getLogger("watchdog.kb")
 
 
 def _search(vuln_type: str | None, keyword: str | None, limit: int) -> dict:
@@ -79,11 +82,17 @@ def _search(vuln_type: str | None, keyword: str | None, limit: int) -> dict:
             "tags": p.tags,
         }
 
+    vuln_list = [_vuln_dict(v) for v in vulns[:limit]]
+    pat_list = [_pattern_dict(p) for p in patterns]
+    logger.info(
+        "search_knowledge called: vuln_type=%r keyword=%r → %d vulns, %d patterns",
+        vuln_type, keyword, len(vuln_list), len(pat_list),
+    )
     return {
         "query": {"vuln_type": vuln_type, "keyword": keyword, "limit": limit},
-        "vulnerabilities": [_vuln_dict(v) for v in vulns[:limit]],
-        "patterns": [_pattern_dict(p) for p in patterns],
-        "pattern_count": patterns.count() if hasattr(patterns, "count") else len(patterns),
+        "vulnerabilities": vuln_list,
+        "patterns": pat_list,
+        "pattern_count": len(pat_list),
     }
 
 
@@ -92,7 +101,13 @@ def _retrieve_similar(query: str, k: int, vuln_type: str | None) -> dict:
 
     from api.models import PayloadPattern
 
+    logger.info(
+        "retrieve_similar_patterns called: query=%r k=%d vuln_type=%r",
+        query, k, vuln_type,
+    )
+
     if not is_available():
+        logger.warning("retrieve_similar_patterns: voyage embedding not available")
         return {
             "available": False,
             "reason": "voyage embedding not configured (VOYAGE_API_KEY missing or voyageai not installed)",
@@ -132,6 +147,10 @@ def _retrieve_similar(query: str, k: int, vuln_type: str | None) -> dict:
                 "distance": round(float(p.distance), 4),
                 "similarity": round(1.0 - float(p.distance), 4),
             })
+        logger.info(
+            "retrieve_similar_patterns result: query=%r → %d patterns (top sim=%.4f)",
+            query, len(results), results[0]["similarity"] if results else 0.0,
+        )
         return {
             "available": True,
             "query": query,
