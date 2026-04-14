@@ -29,6 +29,7 @@ class ScanRun(models.Model):
     class Mode(models.TextChoices):
         HYBRID_MAX = "hybrid-max"
         HYBRID_LITE = "hybrid-lite"
+        DISCOVERY = "discovery"
 
     run_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     target_url = models.TextField()
@@ -453,6 +454,55 @@ class DeadEnd(models.Model):
     @property
     def fp_rate(self):
         return self.false_positive_count / self.times_used if self.times_used else 0.0
+
+# Discovery Queue — 단서 축적형 탐색 트리
+
+class DiscoveryNode(models.Model):
+    """탐색 중 발견한 단서 하나. parent를 따라가면 exploit chain이 자동 재구성된다.
+
+    Queue = DiscoveryNode.objects.filter(status="pending").order_by("-depth", "created_at")
+    """
+
+    class NodeType(models.TextChoices):
+        TARGET = "target"
+        ENDPOINT = "endpoint"
+        VULN = "vuln"
+        CLUE = "clue"
+        EXPLOIT_STEP = "exploit_step"
+        FLAG = "flag"
+        DEAD_END = "dead_end"
+
+    class Status(models.TextChoices):
+        PENDING = "pending"
+        EXPLORING = "exploring"
+        EXPLORED = "explored"
+        DEAD_END = "dead_end"
+        CONFIRMED = "confirmed"
+
+    node_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="discoveries")
+    parent = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.CASCADE, related_name="children",
+    )
+    depth = models.IntegerField(default=0)
+
+    node_type = models.CharField(max_length=32, choices=NodeType.choices)
+    endpoint = models.CharField(max_length=512, null=True, blank=True)
+    vuln_type = models.CharField(max_length=64, null=True, blank=True)
+    summary = models.TextField()
+    context = models.JSONField(default=dict, blank=True)
+
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    worker_id = models.CharField(max_length=64, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    explored_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "discovery_nodes"
+        indexes = [
+            models.Index(fields=["scan_run", "status", "-depth", "created_at"]),
+        ]
+
 
 class ReportArchive(models.Model):
     class ValidationStatus(models.TextChoices):

@@ -27,6 +27,7 @@ urlpatterns = [
     path("api/scan-runs/<str:run_id>/llm-analyze/", views.llm_analyze_candidates),
     path("api/scan-runs/<str:run_id>/verify/", views.start_verification),
     path("api/scan-runs/<str:run_id>/report/", views.scan_run_report),
+    path("api/scan-runs/<str:run_id>/discovery-tree/", views.discovery_tree),
 
     path("api/request-catalog/", views.create_request_catalog_item),
     path("api/request-catalog/list/", views.list_request_catalog),

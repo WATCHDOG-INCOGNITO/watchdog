@@ -448,6 +448,13 @@ def _call_llm_with_retry(anthropic, scan_run, **kwargs):
 
 
 TOOL_RESULT_MAX_CHARS = 2500  # 비용 vs 정보. 큰 도구 결과는 잘라서 messages 부피 감소.
+TOOL_RESULT_EXTENDED_CHARS = 4000  # 소스코드/체인 컨텍스트 등 정보 밀도가 높은 도구용.
+EXTENDED_LIMIT_TOOLS = {
+    "read_source", "grep_source", "list_source_tree",
+    "get_chain_context", "get_exploit_chains",
+    "get_secrets", "get_scan_notes",
+    "http_request", "curl_request", "http_session_request",
+}
 
 
 def _truncate_tool_result(text: str, limit: int = TOOL_RESULT_MAX_CHARS) -> str:
@@ -500,11 +507,11 @@ async def _execute_tool_calls(
             text = f"도구 오류: {e}"
             is_error = True
 
-        # 비용 절감 — 큰 도구 결과 cap (양끝 보존). 원본은 logger에만 남음.
+        limit = TOOL_RESULT_EXTENDED_CHARS if tool_name in EXTENDED_LIMIT_TOOLS else TOOL_RESULT_MAX_CHARS
         tool_results.append({
             "type": "tool_result",
             "tool_use_id": tb.id,
-            "content": _truncate_tool_result(text),
+            "content": _truncate_tool_result(text, limit),
             "is_error": is_error,
         })
     return tool_results
@@ -916,6 +923,247 @@ You are a Verifier Worker. Single attempt only — call oracle_*, judge, registe
 EXECUTOR_WORKER_TOOLS = EXECUTOR_TOOLS  # 같은 도구 — worker는 단지 더 짧은 input만 받음
 VERIFIER_WORKER_TOOLS = VERIFIER_TOOLS
 
+# ─────────────────────────────────────────────────────────────
+# Discovery mode — 단서 축적형 트리 탐색
+# ─────────────────────────────────────────────────────────────
+
+DISCOVERY_WORKER_COUNT = int(os.environ.get("WATCHDOG_DISCOVERY_WORKERS", "3"))
+DISCOVERY_WORKER_BUDGET = int(os.environ.get("WATCHDOG_DISCOVERY_WORKER_BUDGET", "14"))
+DISCOVERY_EXPLOIT_BUDGET = int(os.environ.get("WATCHDOG_DISCOVERY_EXPLOIT_BUDGET", "22"))
+DISCOVERY_CLUE_BUDGET = int(os.environ.get("WATCHDOG_DISCOVERY_CLUE_BUDGET", "18"))
+DISCOVERY_RECHECK_BUDGET = int(os.environ.get("WATCHDOG_DISCOVERY_RECHECK_BUDGET", "5"))
+DISCOVERY_QUIESCENCE_S = int(os.environ.get("WATCHDOG_DISCOVERY_QUIESCENCE_S", "45"))
+DISCOVERY_MAX_CALLS = int(os.environ.get("WATCHDOG_DISCOVERY_MAX_CALLS", "300"))
+DISCOVERY_MAX_COST_USD = Decimal(os.environ.get("WATCHDOG_DISCOVERY_MAX_COST_USD", "5.0"))
+
+EXPLORER_PROMPT = """\
+You are an Explorer Worker in discovery mode.
+You receive a single DiscoveryNode (a clue or discovery from a prior step) and must:
+1. Understand the full chain that led here (via get_chain_context).
+2. Check for stored secrets/notes from other workers (get_secrets, get_scan_notes).
+3. Investigate this node — send requests, run tools, gather evidence.
+4. Store any discovered credentials/tokens (store_secret) so other workers can use them.
+5. Push new discoveries as children (via push_discovery) for anything interesting found.
+6. If this node is a dead end, call mark_dead_end.
+
+## Context
+- Each node has a type: target, endpoint, vuln, clue, exploit_step, flag, dead_end.
+- You are exploring ONE node. Push child discoveries for anything new you find.
+- Other workers are exploring other nodes in parallel — avoid duplicating effort.
+  Use get_siblings to see what siblings already exist.
+
+## Discovery Tools
+- push_discovery(scan_run_id, parent_node_id, node_type, summary, context_json, endpoint, vuln_type)
+  → creates a child node for further exploration
+- get_chain_context(node_id) → full ancestor chain (root to current)
+- mark_dead_end(node_id, reason) → mark this node as dead end
+- get_siblings(node_id) → see sibling nodes to avoid duplication
+
+## Shared State Tools (CRITICAL for multi-step chains)
+- store_secret(scan_run_id, key, value, category) → store credential/token for ALL workers
+- get_secrets(scan_run_id, category) → retrieve secrets stored by any worker
+- add_scan_note(scan_run_id, topic, content) → share observations across workers
+- get_scan_notes(scan_run_id, topic) → read observations from other workers
+
+## Attack/Recon Tools (all available)
+- HTTP: http_request, http_session_request, curl_request
+- Scanners: sqlmap_scan, dalfox_scan, nuclei_scan, ffuf_scan
+- Browser: browser_navigate, browser_get_dom, browser_extract_api_endpoints,
+  browser_get_network_log, browser_screenshot
+- Source: list_source_tree, read_source, grep_source
+- KB: search_knowledge, retrieve_similar_patterns, record_pattern_use, mutate_payload
+- Oracles: oracle_xss, oracle_sqli_boolean, oracle_sqli_time, oracle_lfi,
+  oracle_ssrf, oracle_response_diff
+- Evidence: save_evidence, auto_collect_evidence, create_candidate_manual,
+  confirm_finding, dismiss_candidate
+- Living KB: recall_target, recall_dead_ends, learn_from_finding, learn_dead_end,
+  update_target_profile
+- OOB: oob_register_token, oob_get_hits, oob_wait_for_hit
+- Session: http_session_cookies, http_session_close
+
+## Strategy per node_type
+
+### target (root)
+- recall_target(host) to load any prior knowledge about this host (framework, WAF, etc.)
+- get_scan_notes to check if other workers left observations.
+- CHECK context for "previous_scan": if present, endpoint nodes are already seeded as
+  children. You do NOT need to re-discover endpoints — focus on finding NEW endpoints
+  or paths that were missed.
+- IF source_root is provided: list_source_tree → read_source / grep_source to map
+  endpoints, routes, and interesting code FIRST.
+  → When reading source: look for authentication logic, hardcoded secrets, internal APIs,
+    data flow between components, custom protocols, and request routing chains.
+  → Push an add_scan_note("architecture", "<summary of app architecture>")
+  → If you find hardcoded credentials or API keys: store_secret immediately.
+- THEN browser_navigate to the target URL
+- browser_extract_api_endpoints to discover endpoints
+- Note the server header, framework signatures, error page style → update_target_profile
+- Push EACH NEW found endpoint as a child node (skip endpoints already seeded)
+- Even if the root returns 403/404, push discovered paths as endpoint nodes
+
+### endpoint
+- CHECK context for "seeded_from": if present, this is from a previous scan.
+  Look at prev_vulns and prev_dead_ends. Skip already-failed patterns. Focus on NEW vectors.
+- get_secrets to retrieve any credentials discovered by other workers.
+- get_scan_notes("architecture") to understand app architecture context.
+- Inspect the endpoint: send a few requests, observe response structure, params, headers.
+- Based on what you see, think: "What vuln types could apply here?"
+  e.g. a URL param → maybe LFI/SSRF, a form field → maybe SQLi/XSS, a JSON body → maybe injection.
+- search_knowledge(vuln_type=...) for each suspected type to see what payloads the KB has.
+  Also recall_dead_ends to skip patterns that already failed on this host.
+- If KB has relevant patterns: push child (node_type="vuln") per suspected vuln_type,
+  include the KB pattern_ids in context_json so the vuln worker can use them directly.
+- If the endpoint reveals interesting behavior (unusual headers, internal URLs, error
+  messages with stack traces): push a "clue" node, add_scan_note, or store_secret.
+- If clean after inspection: mark_dead_end
+
+### vuln
+- You are investigating a specific vuln_type on a specific endpoint.
+- get_secrets — always check for credentials from other workers first.
+- IF context has "recheck": true — this vuln was SUCCESSFUL in a previous scan.
+  The target may have been patched since then. Your job:
+  1. Re-test the exact same attack vector with a quick probe.
+  2. If it still works → push exploit_step/flag + confirm_finding (still vulnerable).
+  3. If it FAILS (patched) → mark_dead_end with reason "patched since last scan",
+     then push a NEW vuln node to try bypass/alternative payloads for the same vuln_type.
+     The developer may have done an incomplete fix — test for filter bypasses.
+- FIRST: check if parent context_json has pattern_ids from KB. If so, load them.
+  Otherwise: search_knowledge(vuln_type=...) to get relevant payloads.
+- Try KB payloads first (they are battle-tested). Send each via http_request.
+- Use oracle_* tools to verify (oracle_sqli_boolean, oracle_xss, oracle_lfi, etc.)
+- After each attempt: record_pattern_use(pattern_id, succeeded=True/False)
+- If KB payloads fail but behavior is suspicious: mutate_payload to create variants,
+  or craft your own based on the response patterns you observed.
+- If confirmed: push child (node_type="exploit_step" or "flag") + confirm_finding
+  + learn_from_finding (so future scans benefit)
+- If partial success / interesting clue: push child (node_type="clue")
+- If all attempts failed: mark_dead_end + learn_dead_end (record what you tried)
+
+### clue
+- Investigate the clue (follow redirects, extract tokens, check responses).
+- If you discover a credential/token/secret: store_secret IMMEDIATELY.
+  Other workers need it for their exploit chains.
+- If the clue reveals a new attack surface: search_knowledge for relevant patterns.
+- If the clue reveals internal architecture (backend services, internal APIs, custom
+  protocols): add_scan_note("architecture", "<details>") for all workers.
+- Push children for further exploitation or new endpoints discovered.
+
+### exploit_step
+- This is a DEEP exploitation node. You are continuing a multi-step attack chain.
+- ALWAYS start with:
+  1. get_chain_context — understand the FULL chain that led here. Read every ancestor's
+     context carefully, including credentials, intermediate results, and technique details.
+  2. get_secrets — load ALL credentials/tokens from the scan's shared store.
+  3. get_scan_notes — check for architecture notes and other workers' observations.
+- Use http_session_request (same session_id) to maintain cookies across requests.
+- THINK about the full picture: Can you combine this with OTHER discovered vulns?
+  Check get_siblings and the chain context for other attack vectors that could combine.
+- Common chaining patterns:
+  * SSRF + LFI → read internal files via server-side request
+  * SQLi + file_read → extract secrets then use them for auth bypass
+  * Auth bypass + IDOR → access other users' data
+  * HTTP Smuggling + SSRF → reach internal services
+  * Command Injection via custom protocols → RCE
+  * Path traversal + config read → credential extraction → privilege escalation
+- IMPORTANT: When you discover intermediate results (leaked data, internal URLs,
+  error messages), ALWAYS:
+  * store_secret if it's a credential/token
+  * add_scan_note if it's architecture info
+  * Include it in context_json when pushing the next child node
+- If you reach a flag or final exploit: push flag node + confirm_finding + learn_from_finding
+- If stuck: search_knowledge or mutate_payload for bypass techniques, then push next step
+- If truly stuck after multiple attempts: push the remaining leads as child nodes
+  for other workers, describing what you tried and what might work
+
+### flag
+- Record the finding: confirm_finding + learn_from_finding + save_evidence
+- store_secret(key="flag", value="<the flag>", category="credential")
+
+## Chain Exploitation Strategy (CRITICAL)
+
+Real-world exploits rarely use a single vulnerability. Think like a pentester:
+
+1. **Build the attack surface map mentally**: What components exist? (web server,
+   backend API, database, internal services, custom protocols)
+2. **Identify primitives**: Each vuln gives you a "primitive" (read, write, execute,
+   redirect). Think about what primitives you have and what you need.
+3. **Combine primitives**: SSRF gives you "server-side request" primitive. If you also
+   have path injection, you can redirect that request anywhere. If you also have a
+   custom protocol with command injection, you can chain SSRF → protocol injection → RCE.
+4. **Store and share intermediates**: Every discovered credential, internal URL, or
+   config value should go into store_secret. Every architecture observation into
+   add_scan_note. This is how different workers collaborate on the same chain.
+5. **Push detailed context**: When creating exploit_step children, include ALL relevant
+   context in context_json: the exact HTTP request that worked, the response, the
+   credential used, the intermediate value needed for the next step.
+
+Example multi-step chain (what a successful discovery tree looks like):
+```
+target → endpoint(/api) → vuln(ssrf) → exploit_step(internal_api_access)
+  → clue(credential_leaked) → exploit_step(auth_bypass)
+    → exploit_step(admin_panel) → flag(RCE via admin upload)
+```
+
+## KB Usage Pattern (natural workflow)
+The KB is your arsenal. Use it like a pentester uses their notes:
+1. See something suspicious → "Do we have payloads for this?" → search_knowledge
+2. Get KB payloads → try them → record_pattern_use (succeeded or not)
+3. KB payload works → learn_from_finding (strengthen the KB)
+4. KB payload fails → mutate_payload or try your own → learn_dead_end if all fail
+5. New host → recall_target first, update_target_profile as you learn about it
+
+## Critical Rules
+- ALWAYS call get_chain_context first to understand how you got here.
+- ALWAYS call get_siblings to avoid duplicate exploration.
+- For exploit_step/clue nodes: ALWAYS call get_secrets and get_scan_notes too.
+- You MUST call push_discovery at least once per node unless it is truly a dead end.
+  Push discoveries generously — it's better to create nodes that turn out to be
+  dead ends than to miss potential attack paths.
+- For target nodes: you MUST push at least one endpoint child. Use source code, ffuf,
+  manual path probing — whatever it takes to find endpoints.
+- Use http_session_request for multi-step chains (same session_id).
+- When you find credentials/tokens: store_secret IMMEDIATELY. Do not just put them
+  in context_json — other workers on different branches need them too.
+- When [BUDGET] shows <= 3 remaining, stop exploring and push remaining leads as nodes.
+  Include ALL context needed for the next worker in context_json.
+- NEVER just summarize without pushing child nodes or marking dead_end.
+"""
+
+EXPLORER_TOOLS = {
+    # Discovery-specific
+    "push_discovery", "get_chain_context", "mark_dead_end", "get_siblings",
+    "get_exploit_chains",
+    # Shared state (cross-worker)
+    "store_secret", "get_secrets", "add_scan_note", "get_scan_notes",
+    # HTTP
+    "http_request", "http_session_request", "http_session_cookies",
+    "http_session_close", "curl_request",
+    # Scanners
+    "sqlmap_scan", "dalfox_scan", "nuclei_scan", "ffuf_scan",
+    "nikto_scan", "wafw00f_scan", "whatweb_scan",
+    # Browser
+    "browser_navigate", "browser_get_dom", "browser_extract_api_endpoints",
+    "browser_get_network_log", "browser_screenshot",
+    # Analysis
+    "analyze_endpoint", "list_candidates", "get_scan_summary",
+    # Source
+    "list_source_tree", "read_source", "grep_source",
+    # KB
+    "search_knowledge", "retrieve_similar_patterns", "retrieve_cve_variants",
+    "record_pattern_use", "mutate_payload",
+    # Oracles
+    "oracle_xss", "oracle_sqli_boolean", "oracle_sqli_time",
+    "oracle_lfi", "oracle_ssrf", "oracle_response_diff",
+    # Evidence & Findings
+    "save_evidence", "auto_collect_evidence", "create_candidate_manual",
+    "confirm_finding", "dismiss_candidate", "reopen_candidate",
+    # Living KB
+    "recall_target", "recall_dead_ends", "learn_from_finding",
+    "learn_dead_end", "update_target_profile",
+    # OOB
+    "oob_register_token", "oob_get_hits", "oob_wait_for_hit", "oob_clear_hits",
+}
+
 
 async def _executor_worker(
     name: str,
@@ -1158,8 +1406,417 @@ async def _run_swarm(
     )
 
 
+async def _explorer_worker(
+    name: str,
+    scan_run: ScanRun,
+    anthropic,
+    tools: list,
+    tool_router: dict,
+    acc: _Accumulator,
+    last_activity_ref: list,
+    done_event: asyncio.Event,
+):
+    """Discovery worker — DB queue에서 pending node를 pick, explore, push children."""
+    import time as _t
+    from asgiref.sync import sync_to_async
+    from watchdog_mcp.tools_discovery import pick_next_node
+
+    empty_streak = 0
+
+    while not done_event.is_set():
+        try:
+            raise_if_stop_requested(scan_run)
+        except Exception:
+            return
+
+        node = await sync_to_async(pick_next_node)(
+            str(scan_run.run_id), name,
+        )
+        if node is None:
+            empty_streak += 1
+            await asyncio.sleep(min(2 * empty_streak, 10))
+            continue
+
+        empty_streak = 0
+        last_activity_ref[0] = _t.time()
+
+        logger.info(
+            f"[{scan_run.run_id}] explorer[{name}] picked node "
+            f"{node.node_id} depth={node.depth} type={node.node_type} "
+            f"endpoint={node.endpoint or 'N/A'}"
+        )
+
+        scan_config = scan_run.config or {}
+        source_hint = ""
+        if scan_config.get("source_root"):
+            source_hint = (
+                f"\n## Source Code Available\n"
+                f"source_root: {scan_config['source_root']}\n"
+                f"Use list_source_tree, read_source, grep_source to analyze the app.\n"
+            )
+
+        shared_state_hint = ""
+        if node.node_type in ("exploit_step", "clue", "vuln") and node.depth >= 2:
+            shared_state_hint = (
+                "\n## Shared State\n"
+                "This is a deep node. Other workers may have discovered credentials or\n"
+                "architecture info. Call get_secrets and get_scan_notes EARLY.\n"
+                "If YOU discover credentials/tokens, call store_secret immediately.\n"
+            )
+
+        user_msg = (
+            f"target_url: {scan_run.target_url}\n"
+            f"scan_run_id: {scan_run.run_id}\n"
+            f"{source_hint}{shared_state_hint}\n"
+            f"## Your Node\n"
+            f"- node_id: {node.node_id}\n"
+            f"- node_type: {node.node_type}\n"
+            f"- depth: {node.depth}\n"
+            f"- endpoint: {node.endpoint or 'N/A'}\n"
+            f"- vuln_type: {node.vuln_type or 'N/A'}\n"
+            f"- summary: {node.summary}\n"
+            f"- context: {json.dumps(node.context, ensure_ascii=False)[:800]}\n\n"
+            f"Start by calling get_chain_context(node_id=\"{node.node_id}\") and "
+            f"get_siblings(node_id=\"{node.node_id}\"), then explore this node.\n"
+            f"Push child discoveries for anything interesting. "
+            f"Mark dead_end if nothing found."
+        )
+
+        is_recheck = (node.context or {}).get("recheck", False)
+        if is_recheck:
+            budget = DISCOVERY_RECHECK_BUDGET
+        elif node.node_type in ("exploit_step", "vuln"):
+            budget = DISCOVERY_EXPLOIT_BUDGET
+        elif node.node_type == "clue":
+            budget = DISCOVERY_CLUE_BUDGET
+        else:
+            budget = DISCOVERY_WORKER_BUDGET
+
+        try:
+            await _run_role_phase(
+                scan_run, anthropic, f"explorer:{name}", EXPLORER_PROMPT,
+                tools, tool_router, user_msg, acc,
+                max_turns=budget,
+            )
+        except Exception as e:
+            logger.error(
+                f"[{scan_run.run_id}] explorer[{name}] error on node "
+                f"{node.node_id}: {e}", exc_info=True,
+            )
+
+        await sync_to_async(
+            lambda: _mark_node_explored(node)
+        )()
+        last_activity_ref[0] = _t.time()
+
+
+def _mark_node_explored(node):
+    """Mark node as explored if still in exploring state."""
+    from api.models import DiscoveryNode
+    DiscoveryNode.objects.filter(
+        node_id=node.node_id, status="exploring",
+    ).update(status="explored", explored_at=timezone.now())
+
+
+def _normalize_target_url(url: str) -> str:
+    """Normalize target URL for comparison: lowercase scheme+host, strip trailing slash."""
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(url.strip())
+    return urlunparse((
+        parsed.scheme.lower(),
+        parsed.netloc.lower(),
+        parsed.path.rstrip("/") or "/",
+        parsed.params,
+        parsed.query,
+        "",
+    ))
+
+
+def _gather_previous_knowledge(target_url: str, current_run_id: str) -> dict | None:
+    """Find the most recent completed scan for the same target and extract useful nodes."""
+    from api.models import DiscoveryNode
+
+    normalized = _normalize_target_url(target_url)
+    candidates = (
+        ScanRun.objects
+        .filter(status__in=["finished", "failed"])
+        .exclude(run_id=current_run_id)
+        .order_by("-created_at")[:10]
+    )
+    prev_run = None
+    for run in candidates:
+        if _normalize_target_url(run.target_url) == normalized:
+            prev_run = run
+            break
+    if not prev_run:
+        return None
+
+    prev_nodes = DiscoveryNode.objects.filter(scan_run=prev_run).order_by("depth", "created_at")
+    if not prev_nodes.exists():
+        return None
+
+    endpoints = []
+    vulns = []
+    dead_ends = []
+    clues = []
+
+    for node in prev_nodes:
+        entry = {
+            "node_type": node.node_type,
+            "endpoint": node.endpoint or "",
+            "vuln_type": node.vuln_type or "",
+            "summary": node.summary[:300],
+            "status": node.status,
+            "depth": node.depth,
+        }
+        if node.node_type == "endpoint" and node.status != "dead_end":
+            endpoints.append(entry)
+        elif node.node_type == "vuln":
+            vulns.append(entry)
+        elif node.node_type == "dead_end" or node.status == "dead_end":
+            dead_ends.append(entry)
+        elif node.node_type in ("clue", "exploit_step"):
+            clues.append(entry)
+
+    if not endpoints and not vulns:
+        return None
+
+    return {
+        "prev_run_id": str(prev_run.run_id),
+        "endpoints": endpoints[:20],
+        "vulns": vulns[:15],
+        "dead_ends": dead_ends[:20],
+        "clues": clues[:10],
+    }
+
+
+SEED_BUDGET_RATIO = 0.3  # max 30% of DISCOVERY_MAX_NODES for seeded nodes
+
+def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> int:
+    """Seed endpoint + re-verify nodes from previous scan results."""
+    from api.models import DiscoveryNode
+    from watchdog_mcp.tools_discovery import DISCOVERY_MAX_NODES
+
+    seed_cap = int(DISCOVERY_MAX_NODES * SEED_BUDGET_RATIO)
+    seeded = 0
+    endpoint_node_map = {}
+
+    for ep in prev_knowledge.get("endpoints", []):
+        if seeded >= seed_cap:
+            break
+        if not ep.get("endpoint"):
+            continue
+        ep_node = DiscoveryNode.objects.create(
+            scan_run=scan_run,
+            parent=root_node,
+            depth=1,
+            node_type="endpoint",
+            endpoint=ep["endpoint"],
+            vuln_type="",
+            summary=f"[seeded] {ep['summary'][:200]}",
+            context={
+                "seeded_from": prev_knowledge.get("prev_run_id", ""),
+                "prev_status": ep.get("status", ""),
+            },
+            status="pending",
+        )
+        endpoint_node_map[ep["endpoint"]] = ep_node
+        seeded += 1
+
+    for vuln in prev_knowledge.get("vulns", []):
+        if seeded >= seed_cap:
+            break
+        if vuln.get("status") not in ("explored", "confirmed"):
+            continue
+        ep = vuln.get("endpoint", "")
+        parent = endpoint_node_map.get(ep, root_node)
+        DiscoveryNode.objects.create(
+            scan_run=scan_run,
+            parent=parent,
+            depth=parent.depth + 1,
+            node_type="vuln",
+            endpoint=ep,
+            vuln_type=vuln.get("vuln_type", ""),
+            summary=f"[re-verify] {vuln['summary'][:200]}",
+            context={
+                "seeded_from": prev_knowledge.get("prev_run_id", ""),
+                "recheck": True,
+                "prev_status": vuln.get("status", ""),
+                "action": "re-verify this vuln — it was successful before but may be patched now",
+            },
+            status="pending",
+        )
+        seeded += 1
+
+    return seeded
+
+
+async def _run_discovery_loop(
+    scan_run: ScanRun,
+    anthropic,
+    anthropic_tools: list,
+    tool_router: dict,
+):
+    """Discovery mode — queue-based tree exploration with concurrent workers.
+
+    1. Create root DiscoveryNode (type=target)
+    2. Spawn N explorer workers
+    3. Workers pick nodes from DB, explore, push children
+    4. Quiescence detection: all workers idle + queue empty → Reporter
+    """
+    import time as _t
+    from asgiref.sync import sync_to_async
+    from api.models import DiscoveryNode
+
+    acc = _Accumulator()
+    explorer_tools = _filter_tools(anthropic_tools, EXPLORER_TOOLS)
+    reporter_tools = _filter_tools(anthropic_tools, REPORTER_TOOLS)
+
+    logger.info(
+        f"[{scan_run.run_id}] discovery mode: workers={DISCOVERY_WORKER_COUNT}, "
+        f"worker_budget={DISCOVERY_WORKER_BUDGET}, "
+        f"quiescence={DISCOVERY_QUIESCENCE_S}s"
+    )
+
+    scan_config = scan_run.config or {}
+    root_context = {"target_url": scan_run.target_url}
+    if scan_config.get("source_root"):
+        root_context["source_root"] = scan_config["source_root"]
+
+    prev_knowledge = await sync_to_async(_gather_previous_knowledge)(
+        scan_run.target_url, str(scan_run.run_id),
+    )
+    if prev_knowledge:
+        root_context["previous_scan"] = prev_knowledge
+        logger.info(
+            f"[{scan_run.run_id}] seeded with previous knowledge: "
+            f"{len(prev_knowledge.get('endpoints', []))} endpoints, "
+            f"{len(prev_knowledge.get('vulns', []))} vulns, "
+            f"{len(prev_knowledge.get('dead_ends', []))} dead_ends"
+        )
+
+    root_node = await sync_to_async(DiscoveryNode.objects.create)(
+        scan_run=scan_run,
+        parent=None,
+        depth=0,
+        node_type="target",
+        endpoint=scan_run.target_url,
+        vuln_type="",
+        summary=f"Root target: {scan_run.target_url}",
+        context=root_context,
+        status="pending",
+    )
+
+    seeded_count = 0
+    if prev_knowledge:
+        seeded_count = await sync_to_async(_seed_from_previous)(
+            scan_run, root_node, prev_knowledge,
+        )
+
+    logger.info(
+        f"[{scan_run.run_id}] root node created: {root_node.node_id}, "
+        f"seeded {seeded_count} nodes from previous scan"
+    )
+
+    done_event = asyncio.Event()
+    last_activity = [_t.time()]
+
+    workers = [
+        asyncio.create_task(
+            _explorer_worker(
+                f"W{i+1}", scan_run, anthropic, explorer_tools, tool_router,
+                acc, last_activity, done_event,
+            ),
+            name=f"explorer-{i+1}",
+        )
+        for i in range(DISCOVERY_WORKER_COUNT)
+    ]
+
+    while True:
+        await asyncio.sleep(3)
+        try:
+            raise_if_stop_requested(scan_run)
+        except Exception:
+            logger.info(f"[{scan_run.run_id}] discovery stop requested")
+            break
+
+        if acc.calls >= DISCOVERY_MAX_CALLS:
+            logger.info(f"[{scan_run.run_id}] discovery hard cap: calls={acc.calls} >= {DISCOVERY_MAX_CALLS}")
+            break
+        await sync_to_async(scan_run.refresh_from_db)()
+        if scan_run.llm_cost_usd >= DISCOVERY_MAX_COST_USD:
+            logger.info(f"[{scan_run.run_id}] discovery hard cap: cost=${scan_run.llm_cost_usd} >= ${DISCOVERY_MAX_COST_USD}")
+            break
+
+        all_done = all(w.done() for w in workers)
+        idle_for = _t.time() - last_activity[0]
+
+        if all_done:
+            logger.info(f"[{scan_run.run_id}] all discovery workers finished")
+            break
+
+        pending_count = await sync_to_async(
+            lambda: DiscoveryNode.objects.filter(
+                scan_run=scan_run, status="pending",
+            ).count()
+        )()
+        exploring_count = await sync_to_async(
+            lambda: DiscoveryNode.objects.filter(
+                scan_run=scan_run, status="exploring",
+            ).count()
+        )()
+
+        if pending_count == 0 and exploring_count == 0 and idle_for > DISCOVERY_QUIESCENCE_S:
+            logger.info(
+                f"[{scan_run.run_id}] discovery quiescence reached "
+                f"(pending=0, exploring=0, idle={idle_for:.0f}s)"
+            )
+            break
+
+    done_event.set()
+    await asyncio.gather(*workers, return_exceptions=True)
+
+    total_nodes = await sync_to_async(
+        lambda: DiscoveryNode.objects.filter(scan_run=scan_run).count()
+    )()
+    confirmed = await sync_to_async(
+        lambda: DiscoveryNode.objects.filter(
+            scan_run=scan_run, status="confirmed",
+        ).count()
+    )()
+    dead_ends = await sync_to_async(
+        lambda: DiscoveryNode.objects.filter(
+            scan_run=scan_run, status="dead_end",
+        ).count()
+    )()
+
+    logger.info(
+        f"[{scan_run.run_id}] discovery tree: "
+        f"total={total_nodes}, confirmed={confirmed}, dead_ends={dead_ends}"
+    )
+
+    from watchdog_mcp.tools_discovery import build_exploit_chains
+    chains = await sync_to_async(build_exploit_chains)(str(scan_run.run_id))
+    chains_json = json.dumps(chains, ensure_ascii=False)[:3000] if chains else "[]"
+
+    reporter_msg = (
+        f"generate_report(run_id=\"{scan_run.run_id}\", format=\"json\") 만 호출.\n\n"
+        f"## Exploit Chains (discovery tree에서 재구성)\n```json\n{chains_json}\n```"
+    )
+    await _run_role_phase(
+        scan_run, anthropic, "reporter", REPORTER_PROMPT,
+        reporter_tools, tool_router, reporter_msg, acc,
+        max_turns=ROLE_TURN_BUDGET["reporter"],
+    )
+
+    logger.info(
+        f"[{scan_run.run_id}] discovery complete: {acc.calls} LLM calls, "
+        f"{acc.input_tokens + acc.output_tokens} tokens, ${scan_run.llm_cost_usd}"
+    )
+
+
 async def _connect_mcp_and_run(scan_run: ScanRun, mode: str):
-    """MCP 서버 연결 후 mode에 따라 single/multi/swarm loop를 실행."""
+    """MCP 서버 연결 후 mode에 따라 single/multi/swarm/discovery loop를 실행."""
     anthropic = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
     # `-m watchdog_mcp.server` 로 띄워야 server.py 의 relative import (`from .tools_*`)
@@ -1223,7 +1880,9 @@ async def _connect_mcp_and_run(scan_run: ScanRun, mode: str):
             f"[{scan_run.run_id}] total tools={len(anthropic_tools)} mode={mode}"
         )
 
-        if mode == "swarm":
+        if mode == "discovery":
+            await _run_discovery_loop(scan_run, anthropic, anthropic_tools, tool_router)
+        elif mode == "swarm":
             await _run_swarm(scan_run, anthropic, anthropic_tools, tool_router)
         elif mode == "multi":
             await _run_multi_agent_loop(scan_run, anthropic, anthropic_tools, tool_router)
@@ -1296,7 +1955,7 @@ def run_mcp_scan(scan_run: ScanRun):
         scan_run.error_log = None
         scan_run.save(update_fields=["status", "finished_at", "error_log"])
 
-        mode = AGENT_MODE_DEFAULT if AGENT_MODE_DEFAULT in ("swarm", "multi", "single") else "multi"
+        mode = AGENT_MODE_DEFAULT if AGENT_MODE_DEFAULT in ("discovery", "swarm", "multi", "single") else "multi"
         logger.info(f"[{scan_run.run_id}] starting MCP scan (mode={mode})")
         asyncio.run(_connect_mcp_and_run(scan_run, mode=mode))
 

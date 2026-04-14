@@ -77,6 +77,12 @@ def confirm_candidate(cand_id, severity=None, title=None, summary=None,
         candidate.status = "confirmed"
         candidate.save(update_fields=["status"])
 
+        # 2b. Discovery node 연동: 연결된 노드가 있으면 confirmed로 승격
+        disc_node_id = (candidate.features or {}).get("discovery_node_id")
+        if disc_node_id:
+            from api.models import DiscoveryNode
+            DiscoveryNode.objects.filter(node_id=disc_node_id).update(status="confirmed")
+
         # 3. Evidence 생성 + 링크
         created_evidence = []
         if evidence_list:

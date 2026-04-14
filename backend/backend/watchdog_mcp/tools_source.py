@@ -21,29 +21,30 @@ from pathlib import Path
 
 # ── 안전 root 화이트리스트 ─────────────────────────────────
 DEFAULT_ROOTS = ["/sources"]
-SOURCE_ROOTS = [
+_env_roots = [
     Path(p).resolve()
     for p in os.environ.get("SOURCE_ROOTS", ":".join(DEFAULT_ROOTS)).split(":")
     if p.strip()
 ]
+# /sources 의 심볼릭 링크가 /raw-sources 로 resolve 되므로 양쪽 모두 허용
+_RAW_SOURCES = Path("/raw-sources")
+SOURCE_ROOTS = list({*_env_roots, *([_RAW_SOURCES.resolve()] if _RAW_SOURCES.exists() else [])})
 MAX_FILE_BYTES = 1_000_000   # 1MB 하나의 read 상한
 MAX_TREE_ENTRIES = 2000
 MAX_GREP_MATCHES = 200
 
-# CTF 채점 안전망 — 정답/flag 포함 디렉터리/파일은 읽기 차단.
-# 여러 대회가 bulk mount되지만 이 필터가 에이전트 접근을 for_user/*만 허용.
+# 2차 안전망 — /sources 에는 for_user 심볼릭 링크만 존재하지만,
+# 만일의 마운트 실수에 대비해 소프트웨어 레벨에서도 차단.
 FORBIDDEN_PATH_TOKENS = (
-    "for_organizer",     # 출제자용 (풀이, flag 포함)
-    "/exploit/",         # 정답 exploit
+    "for_organizer",
+    "/exploit/",
     "/exploit.md",
     "/exploit.py",
-    "/anticheat/",       # 채점 모듈 (dynamic flag)
-    "/flag.txt",         # 플래그 파일
+    "/anticheat/",
+    "/flag.txt",
     "/flag",
-    "info.yaml",         # flag 메타데이터 포함
+    "info.yaml",
 )
-# 대회 root 바로 아래 README.md는 출제자 풀이 가능성 → 차단.
-# for_user 안의 README 또는 source 파일은 허용 (참가자 문서).
 REQUIRED_PATH_SUBSTRING = "/for_user"
 
 

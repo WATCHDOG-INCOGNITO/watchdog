@@ -36,6 +36,7 @@ from .tools_learn import register as register_learn
 from .tools_source import register as register_source
 from .tools_session import register as register_session
 from .tools_oob import register as register_oob
+from .tools_discovery import register as register_discovery
 
 register_security(mcp)
 register_browser(mcp)
@@ -50,6 +51,7 @@ register_learn(mcp)
 register_source(mcp)
 register_session(mcp)
 register_oob(mcp)
+register_discovery(mcp)
 
 def main():
     import sys

@@ -4,6 +4,7 @@ from .models import (
     FindingEvidenceLink, AgentTask, VerificationLoop, Hypothesis,
     VisualAnalysis, IDORTestSession, WAFBypassAttempt,
     VulnerabilityEntry, PayloadPattern, ReportArchive,
+    DiscoveryNode,
 )
 
 class ScanRunSerializer(serializers.ModelSerializer):
@@ -110,3 +111,19 @@ class ReportArchiveSerializer(serializers.ModelSerializer):
         model = ReportArchive
         fields = "__all__"
         read_only_fields = ["report_id", "created_at", "updated_at"]
+
+
+class DiscoveryNodeSerializer(serializers.ModelSerializer):
+    children_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DiscoveryNode
+        fields = [
+            "node_id", "parent", "depth", "node_type",
+            "endpoint", "vuln_type", "summary", "context",
+            "status", "worker_id", "created_at", "explored_at",
+            "children_count",
+        ]
+
+    def get_children_count(self, obj):
+        return obj._children_count if hasattr(obj, "_children_count") else 0

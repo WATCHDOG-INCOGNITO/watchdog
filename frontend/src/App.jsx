@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useState } from "react";
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 const API_BASE = process.env.REACT_APP_API_BASE || "";
@@ -578,11 +578,11 @@ function NewScanModal({ onClose, onCreated }) {
   );
 }
 
-function ScanCard({ scan, selected, onSelect, now }) {
+function ScanCard({ scan, selected, onSelect, now, compact }) {
   const statusMeta = getEffectiveStatus(scan, now);
 
   return (
-    <article className={`scan-card ${selected ? "selected" : ""}`}>
+    <article className={`scan-card ${selected ? "selected" : ""} ${compact ? "scan-card-compact" : ""}`}>
       <button type="button" className="scan-card-main" onClick={() => onSelect(scan.run_id)}>
         <div className="scan-card-head">
           <div className="hero-badges">
@@ -596,13 +596,67 @@ function ScanCard({ scan, selected, onSelect, now }) {
           </div>
         </div>
 
-        <div className="scan-target">{scan.target_url}</div>
+        {compact ? null : <div className="scan-target">{scan.target_url}</div>}
         <div className="scan-meta-row">
           <span>{formatDateTime(scan.created_at)}</span>
           <span>{String(scan.run_id).slice(0, 8)}</span>
         </div>
       </button>
     </article>
+  );
+}
+
+function groupScansByTarget(scans) {
+  const map = new Map();
+  for (const scan of scans) {
+    const key = scan.target_url || "(unknown)";
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(scan);
+  }
+  const groups = [];
+  for (const [targetUrl, runs] of map) {
+    groups.push({ targetUrl, runs, latest: runs[0] });
+  }
+  return groups;
+}
+
+function ScanGroup({ group, selectedRunId, onSelect, now, expandedTarget, onToggle }) {
+  const isExpanded = expandedTarget === group.targetUrl;
+  const hasSelected = group.runs.some((s) => s.run_id === selectedRunId);
+  const latestStatus = getEffectiveStatus(group.latest, now);
+
+  const runningCount = group.runs.filter((s) => s.status === "running").length;
+  const finishedCount = group.runs.filter((s) => s.status === "finished" || s.status === "completed").length;
+  const totalCost = group.runs.reduce((sum, s) => sum + Number(s.llm_cost_usd || 0), 0);
+
+  return (
+    <div className={`scan-group ${hasSelected ? "scan-group-active" : ""}`}>
+      <button type="button" className="scan-group-header" onClick={() => onToggle(isExpanded ? null : group.targetUrl)}>
+        <div className="scan-group-top">
+          <span className={`status-pill tone-${latestStatus.tone}`}>{latestStatus.label}</span>
+          <span className="scan-group-count">{group.runs.length}회</span>
+          <span className="scan-group-expand">{isExpanded ? "▲" : "▼"}</span>
+        </div>
+        <div className="scan-group-url">{group.targetUrl}</div>
+        <div className="scan-group-meta">
+          {runningCount > 0 ? <span className="scan-group-badge tone-running">{runningCount} 실행 중</span> : null}
+          {finishedCount > 0 ? <span className="scan-group-badge tone-finished">{finishedCount} 완료</span> : null}
+          <span>{formatCurrency(totalCost)}</span>
+        </div>
+      </button>
+
+      {isExpanded ? (
+        <div className="scan-group-runs">
+          {group.runs.map((scan) => (
+            <ScanCard key={scan.run_id} scan={scan} selected={scan.run_id === selectedRunId} onSelect={onSelect} now={now} compact />
+          ))}
+        </div>
+      ) : !isExpanded && !hasSelected ? (
+        <button type="button" className="scan-group-quick" onClick={() => onSelect(group.latest.run_id)}>
+          최신 결과 보기
+        </button>
+      ) : null}
+    </div>
   );
 }
 
@@ -614,6 +668,7 @@ function ResultsView({
   onOpenCandidates,
   onOpenRunDetails,
   onOpenLlmTrace,
+  onOpenDiscoveryTree,
   onStop,
   stopLoading,
 }) {
@@ -678,6 +733,16 @@ function ResultsView({
           helper={`${formatCount(scan.llm_tokens_used)} tokens | ${formatCurrency(scan.llm_cost_usd)}`}
           tone="warning"
         />
+        {scan.mode === "discovery" ? (
+          <StatCard
+            label="탐색 트리"
+            value="Tree"
+            helper="Discovery 탐색 과정"
+            tone="accent"
+            onClick={onOpenDiscoveryTree}
+            actionLabel="트리 보기"
+          />
+        ) : null}
       </div>
 
       <SectionCard title="상태" kicker="실행 메모">
@@ -699,6 +764,423 @@ function ResultsView({
         ) : null}
       </SectionCard>
     </>
+  );
+}
+
+const NODE_TYPE_META = {
+  target: { icon: "\u25C9", label: "\ud0c0\uac9f" },
+  endpoint: { icon: "\u2192", label: "\uc5d4\ub4dc\ud3ec\uc778\ud2b8" },
+  vuln: { icon: "\u26a0", label: "\ucde8\uc57d\uc810" },
+  clue: { icon: "\u2727", label: "\ub2e8\uc11c" },
+  exploit_step: { icon: "\u2191", label: "\uc775\uc2a4\ud50c\ub85c\uc787" },
+  flag: { icon: "\u2691", label: "\ud50c\ub798\uadf8" },
+  dead_end: { icon: "\u00d7", label: "\ub9c9\ub2e4\ub978 \uacf5" },
+};
+
+const NODE_STATUS_LABEL = {
+  pending: "\ub300\uae30",
+  exploring: "\ud0d0\uc0c9 \uc911",
+  explored: "\ud0d0\uc0c9 \uc644\ub8cc",
+  dead_end: "\ub9c9\ub2e4\ub978 \uacf5",
+  confirmed: "\ud655\uc815",
+};
+
+function buildTreeFromFlat(flatNodes) {
+  const map = new Map();
+  const roots = [];
+  for (const n of flatNodes) {
+    map.set(n.node_id, { ...n, children: [] });
+  }
+  for (const n of flatNodes) {
+    const node = map.get(n.node_id);
+    if (n.parent && map.has(n.parent)) {
+      map.get(n.parent).children.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+  return roots;
+}
+
+const CARD_W = 240;
+const CARD_H = 64;
+const GAP_X = 280;
+const GAP_Y = 90;
+const ZOOM_MIN = 0.25;
+const ZOOM_MAX = 2.5;
+
+function layoutTree(roots) {
+  const positions = new Map();
+  let nextY = 0;
+  function lay(node, depth) {
+    const childYs = [];
+    for (const child of node.children || []) {
+      lay(child, depth + 1);
+      childYs.push(positions.get(child.node_id).y);
+    }
+    const y = childYs.length ? (childYs[0] + childYs[childYs.length - 1]) / 2 : nextY++ * GAP_Y;
+    positions.set(node.node_id, { x: depth * GAP_X, y });
+  }
+  for (const root of roots) lay(root, 0);
+  return positions;
+}
+
+function collectEdges(roots) {
+  const edges = [];
+  function walk(node) {
+    for (const child of node.children || []) {
+      edges.push({ from: node.node_id, to: child.node_id });
+      walk(child);
+    }
+  }
+  for (const r of roots) walk(r);
+  return edges;
+}
+
+function CanvasEdges({ edges, positions }) {
+  const paths = [];
+  for (const { from, to } of edges) {
+    const a = positions.get(from);
+    const b = positions.get(to);
+    if (!a || !b) continue;
+    const x1 = a.x + CARD_W;
+    const y1 = a.y + CARD_H / 2;
+    const x2 = b.x;
+    const y2 = b.y + CARD_H / 2;
+    const cx = Math.min(80, Math.abs(x2 - x1) * 0.4);
+    paths.push(<path key={`${from}-${to}`} d={`M${x1},${y1} C${x1 + cx},${y1} ${x2 - cx},${y2} ${x2},${y2}`} />);
+  }
+  return (
+    <svg className="canvas-edges">
+      <g>{paths}</g>
+    </svg>
+  );
+}
+
+function CanvasNode({ node, x, y, selected, onSelect }) {
+  const meta = NODE_TYPE_META[node.node_type] || NODE_TYPE_META.clue;
+  const statusLabel = NODE_STATUS_LABEL[node.status] || node.status;
+  const isSelected = selected === node.node_id;
+
+  return (
+    <div
+      className={`canvas-node node-type-${node.node_type} ${isSelected ? "canvas-node-selected" : ""}`}
+      style={{ left: x, top: y }}
+      onClick={(e) => { e.stopPropagation(); onSelect(isSelected ? null : node.node_id); }}
+    >
+      <div className="node-head">
+        <span className="node-icon">{meta.icon}</span>
+        <span className="node-type-label">{meta.label}</span>
+        {node.vuln_type ? <span className="node-vuln-badge">{node.vuln_type}</span> : null}
+        <span className={`node-status-pill node-status-${node.status}`}>{statusLabel}</span>
+      </div>
+      <div className="node-summary">{node.summary}</div>
+    </div>
+  );
+}
+
+function NodeDetailPanel({ node, allNodes, onClose }) {
+  if (!node) return null;
+
+  const meta = NODE_TYPE_META[node.node_type] || NODE_TYPE_META.clue;
+  const statusLabel = NODE_STATUS_LABEL[node.status] || node.status;
+
+  const chain = useMemo(() => {
+    const path = [];
+    let current = node;
+    const nodeMap = new Map(allNodes.map((n) => [n.node_id, n]));
+    while (current) {
+      path.unshift(current);
+      current = current.parent ? nodeMap.get(current.parent) : null;
+    }
+    return path;
+  }, [node, allNodes]);
+
+  const children = useMemo(
+    () => allNodes.filter((n) => n.parent === node.node_id),
+    [node, allNodes],
+  );
+
+  const ctx = node.context || {};
+  const contextEntries = Object.entries(ctx).filter(([k]) => k !== "raw");
+
+  return (
+    <div className="node-panel" onClick={(e) => e.stopPropagation()}>
+      <div className="node-panel-head">
+        <div className="node-panel-title">
+          <span className="node-icon">{meta.icon}</span>
+          <span className={`node-type-label node-type-${node.node_type}`}>{meta.label}</span>
+          <span className={`node-status-pill node-status-${node.status}`}>{statusLabel}</span>
+        </div>
+        <button type="button" className="ghost-button" onClick={onClose}>닫기</button>
+      </div>
+
+      <div className="node-panel-summary">{node.summary}</div>
+
+      <div className="node-panel-grid">
+        {node.endpoint ? <div><span>Endpoint</span><strong>{node.endpoint}</strong></div> : null}
+        {node.vuln_type ? <div><span>취약점 유형</span><strong>{node.vuln_type}</strong></div> : null}
+        <div><span>깊이</span><strong>{node.depth}</strong></div>
+        <div><span>자식 노드</span><strong>{node.children_count}</strong></div>
+        {node.worker_id ? <div><span>Worker</span><strong>{node.worker_id}</strong></div> : null}
+        <div><span>생성</span><strong>{formatDateTime(node.created_at)}</strong></div>
+        {node.explored_at ? <div><span>탐색</span><strong>{formatDateTime(node.explored_at)}</strong></div> : null}
+      </div>
+
+      {chain.length > 1 ? (
+        <div className="node-panel-section">
+          <div className="mini-title">공격 경로</div>
+          <div className="node-chain">
+            {chain.map((c, i) => {
+              const m = NODE_TYPE_META[c.node_type] || NODE_TYPE_META.clue;
+              return (
+                <div key={c.node_id} className={`node-chain-step ${c.node_id === node.node_id ? "current" : ""}`}>
+                  <span className="node-chain-icon">{m.icon}</span>
+                  <span className="node-chain-text">{c.summary.slice(0, 80)}{c.summary.length > 80 ? "..." : ""}</span>
+                  {i < chain.length - 1 ? <span className="node-chain-arrow">→</span> : null}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+
+      {contextEntries.length > 0 ? (
+        <div className="node-panel-section">
+          <div className="mini-title">Context</div>
+          <pre className="node-panel-context">{JSON.stringify(ctx, null, 2)}</pre>
+        </div>
+      ) : null}
+
+      {children.length > 0 ? (
+        <div className="node-panel-section">
+          <div className="mini-title">자식 노드 ({children.length})</div>
+          <div className="node-children-list">
+            {children.map((c) => {
+              const cm = NODE_TYPE_META[c.node_type] || NODE_TYPE_META.clue;
+              const sl = NODE_STATUS_LABEL[c.status] || c.status;
+              return (
+                <div key={c.node_id} className="node-child-row">
+                  <span className="node-icon">{cm.icon}</span>
+                  <span className="node-child-summary">{c.summary.slice(0, 60)}</span>
+                  <span className={`node-status-pill node-status-${c.status}`}>{sl}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function flattenTree(roots) {
+  const out = [];
+  function walk(node) { out.push(node); for (const c of node.children || []) walk(c); }
+  for (const r of roots) walk(r);
+  return out;
+}
+
+function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
+  const [nodes, setNodes] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [selectedNodeId, setSelectedNodeId] = useState(null);
+
+  const [pan, setPan] = useState({ x: 40, y: 40 });
+  const [zoom, setZoom] = useState(1);
+  const dragRef = useRef(null);
+  const wasDragRef = useRef(false);
+  const vpRef = useRef(null);
+
+  async function fetchTree() {
+    setLoading(true);
+    try {
+      const data = await apiGet(`/api/scan-runs/${runId}/discovery-tree/`);
+      setNodes(Array.isArray(data) ? data : []);
+      setError("");
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    fetchTree();
+    if (scanStatus === "running") {
+      const timer = window.setInterval(fetchTree, 15000);
+      return () => window.clearInterval(timer);
+    }
+  }, [runId, scanStatus]);
+
+  const roots = useMemo(() => buildTreeFromFlat(nodes), [nodes]);
+  const positions = useMemo(() => layoutTree(roots), [roots]);
+  const edges = useMemo(() => collectEdges(roots), [roots]);
+  const allNodes = useMemo(() => flattenTree(roots), [roots]);
+
+  const stats = useMemo(() => {
+    const s = { total: nodes.length, confirmed: 0, dead_end: 0, pending: 0, exploring: 0, explored: 0, maxDepth: 0 };
+    for (const n of nodes) {
+      if (n.status === "confirmed") s.confirmed++;
+      else if (n.status === "dead_end") s.dead_end++;
+      else if (n.status === "pending") s.pending++;
+      else if (n.status === "exploring") s.exploring++;
+      else s.explored++;
+      if (n.depth > s.maxDepth) s.maxDepth = n.depth;
+    }
+    return s;
+  }, [nodes]);
+
+  const barSegments = useMemo(() => {
+    if (!stats.total) return [];
+    return [
+      { key: "confirmed", count: stats.confirmed, label: "\ud655\uc815" },
+      { key: "explored", count: stats.explored, label: "\ud0d0\uc0c9 \uc644\ub8cc" },
+      { key: "exploring", count: stats.exploring, label: "\ud0d0\uc0c9 \uc911" },
+      { key: "pending", count: stats.pending, label: "\ub300\uae30" },
+      { key: "dead_end", count: stats.dead_end, label: "\ub9c9\ub2e4\ub978 \uacf5" },
+    ].filter((s) => s.count > 0);
+  }, [stats]);
+
+  const handleWheel = useCallback((e) => {
+    e.preventDefault();
+    const vp = vpRef.current;
+    if (!vp) return;
+    const rect = vp.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const factor = e.deltaY < 0 ? 1.12 : 0.89;
+    setZoom((prev) => {
+      const next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, prev * factor));
+      const ratio = next / prev;
+      setPan((p) => ({ x: mx - ratio * (mx - p.x), y: my - ratio * (my - p.y) }));
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    const vp = vpRef.current;
+    if (!vp) return;
+    vp.addEventListener("wheel", handleWheel, { passive: false });
+    return () => vp.removeEventListener("wheel", handleWheel);
+  }, [handleWheel]);
+
+  const DRAG_THRESHOLD = 4;
+
+  const onPointerDown = useCallback((e) => {
+    if (e.button !== 0) return;
+    dragRef.current = { startX: e.clientX, startY: e.clientY, startPan: { ...pan }, dragging: false };
+  }, [pan]);
+
+  const onPointerMove = useCallback((e) => {
+    if (!dragRef.current) return;
+    const dx = e.clientX - dragRef.current.startX;
+    const dy = e.clientY - dragRef.current.startY;
+    if (!dragRef.current.dragging && (Math.abs(dx) > DRAG_THRESHOLD || Math.abs(dy) > DRAG_THRESHOLD)) {
+      dragRef.current.dragging = true;
+      e.currentTarget.setPointerCapture(e.pointerId);
+    }
+    if (dragRef.current.dragging) {
+      setPan({ x: dragRef.current.startPan.x + dx, y: dragRef.current.startPan.y + dy });
+    }
+  }, []);
+
+  const onPointerUp = useCallback(() => {
+    wasDragRef.current = !!dragRef.current?.dragging;
+    dragRef.current = null;
+  }, []);
+
+  const fitToView = useCallback(() => {
+    const vp = vpRef.current;
+    if (!vp || !positions.size) return;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const { x, y } of positions.values()) {
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x + CARD_W > maxX) maxX = x + CARD_W;
+      if (y + CARD_H > maxY) maxY = y + CARD_H;
+    }
+    const pad = 60;
+    const w = maxX - minX + pad * 2;
+    const h = maxY - minY + pad * 2;
+    const rect = vp.getBoundingClientRect();
+    const s = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.min(rect.width / w, rect.height / h)));
+    setZoom(s);
+    setPan({ x: (rect.width - w * s) / 2 - minX * s + pad * s, y: (rect.height - h * s) / 2 - minY * s + pad * s });
+  }, [positions]);
+
+  useEffect(() => {
+    if (positions.size && zoom === 1 && pan.x === 40 && pan.y === 40) fitToView();
+  }, [positions, fitToView, zoom, pan]);
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-card canvas-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <div className="section-kicker">Discovery</div>
+            <h2>탐색 캔버스</h2>
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <span className="canvas-zoom-label">{Math.round(zoom * 100)}%</span>
+            <button type="button" className="icon-button" title="화면 맞춤" onClick={fitToView}>⊞</button>
+            <button type="button" className="icon-button" title="새로고침" onClick={fetchTree}>↻</button>
+            <button type="button" className="ghost-button" onClick={onClose}>닫기</button>
+          </div>
+        </div>
+
+        <div className="discovery-stats">
+          <span>노드 <strong>{stats.total}</strong></span>
+          <span>확정 <strong>{stats.confirmed}</strong></span>
+          <span>막다른 곳 <strong>{stats.dead_end}</strong></span>
+          <span>대기 <strong>{stats.pending}</strong></span>
+          <span>최대 깊이 <strong>{stats.maxDepth}</strong></span>
+        </div>
+
+        {stats.total > 0 ? (
+          <div className="discovery-bar">
+            {barSegments.map((seg) => (
+              <div key={seg.key} className={`discovery-bar-seg discovery-bar-${seg.key}`} style={{ flex: seg.count }} title={`${seg.label}: ${seg.count}`} />
+            ))}
+          </div>
+        ) : null}
+
+        {error ? <div className="callout callout-error">{error}</div> : null}
+        {loading && !nodes.length ? <div className="callout callout-neutral">트리를 불러오는 중...</div> : null}
+
+        <div className="canvas-body">
+          <div
+            className="canvas-viewport"
+            ref={vpRef}
+            onPointerDown={onPointerDown}
+            onPointerMove={onPointerMove}
+            onPointerUp={onPointerUp}
+            onClick={() => { if (!wasDragRef.current) setSelectedNodeId(null); }}
+          >
+            <div className="canvas-world" style={{ transform: `translate(${pan.x}px,${pan.y}px) scale(${zoom})` }}>
+              <CanvasEdges edges={edges} positions={positions} />
+              {allNodes.map((node) => {
+                const pos = positions.get(node.node_id);
+                if (!pos) return null;
+                return <CanvasNode key={node.node_id} node={node} x={pos.x} y={pos.y} selected={selectedNodeId} onSelect={setSelectedNodeId} />;
+              })}
+            </div>
+            {!loading && !allNodes.length && !error ? (
+              <div className="canvas-empty callout callout-neutral">이 스캔에는 탐색 노드가 없습니다.</div>
+            ) : null}
+          </div>
+
+          {selectedNodeId ? (
+            <NodeDetailPanel
+              node={allNodes.find((n) => n.node_id === selectedNodeId)}
+              allNodes={allNodes}
+              onClose={() => setSelectedNodeId(null)}
+            />
+          ) : null}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -766,6 +1248,7 @@ export default function App() {
 
   const [scanListSnapshot, setScanListSnapshot] = useState({ scans: [], emitted_at: null });
   const [selectedRunId, setSelectedRunId] = useState(null);
+  const [expandedTarget, setExpandedTarget] = useState(null);
   const [runSnapshot, setRunSnapshot] = useState(null);
   const [llmTraceSnapshot, setLlmTraceSnapshot] = useState({ traces: [], count: 0 });
 
@@ -774,6 +1257,7 @@ export default function App() {
   const [showFindingsModal, setShowFindingsModal] = useState(false);
   const [showCandidatesModal, setShowCandidatesModal] = useState(false);
   const [showLlmTrace, setShowLlmTrace] = useState(false);
+  const [showDiscoveryTree, setShowDiscoveryTree] = useState(false);
 
   const [selectedFindingId, setSelectedFindingId] = useState(null);
   const [findingDetail, setFindingDetail] = useState(null);
@@ -789,6 +1273,7 @@ export default function App() {
   const [stopLoading, setStopLoading] = useState(false);
 
   const visibleScans = useMemo(() => scanListSnapshot.scans, [scanListSnapshot.scans]);
+  const scanGroups = useMemo(() => groupScansByTarget(visibleScans), [visibleScans]);
   const displayedScans = useMemo(
     () => visibleScans.slice(0, historyVisibleCount),
     [visibleScans, historyVisibleCount]
@@ -887,6 +1372,14 @@ export default function App() {
       setSelectedRunId(visibleScans[0].run_id);
     }
   }, [visibleScans, selectedRunId]);
+
+  useEffect(() => {
+    if (!selectedRunId || !scanGroups.length) return;
+    const group = scanGroups.find((g) => g.runs.some((s) => s.run_id === selectedRunId));
+    if (group && group.runs.length > 1) {
+      setExpandedTarget(group.targetUrl);
+    }
+  }, [selectedRunId, scanGroups]);
 
   useEffect(() => {
     if (!visibleScans.length) {
@@ -1043,22 +1536,24 @@ export default function App() {
 
           <div className="rail-summary">
               <div className="rail-summary-pill">
-                <strong>전체:{formatCount(visibleScans.length)}</strong>
+                <strong>{formatCount(scanGroups.length)}개 타겟 · {formatCount(visibleScans.length)}회 스캔</strong>
               </div>
           </div>
 
           {listError ? <div className="callout callout-error">{listError}</div> : null}
 
-          <div className="scan-card-list-shell" style={{ maxHeight: historyListHeight ? `${historyListHeight}px` : undefined }}>
+          <div className="scan-card-list-shell">
             <div id="scan-card-list-inner" className="scan-card-list">
-              {visibleScans.length ? (
-                displayedScans.map((scan) => (
-                  <ScanCard
-                    key={scan.run_id}
-                    scan={scan}
-                    selected={scan.run_id === selectedRunId}
+              {scanGroups.length ? (
+                scanGroups.map((group) => (
+                  <ScanGroup
+                    key={group.targetUrl}
+                    group={group}
+                    selectedRunId={selectedRunId}
                     onSelect={setSelectedRunId}
                     now={now}
+                    expandedTarget={expandedTarget}
+                    onToggle={setExpandedTarget}
                   />
                 ))
               ) : (
@@ -1069,36 +1564,6 @@ export default function App() {
               )}
             </div>
           </div>
-
-          {visibleScans.length > displayedScans.length ? (
-            <div className="history-more-actions">
-              <button
-                type="button"
-                className="ghost-button history-more-button"
-                onClick={() => setHistoryVisibleCount((current) => current + 5)}
-              >
-                더보기
-              </button>
-              {historyVisibleCount > 5 ? (
-                <button
-                  type="button"
-                  className="ghost-button history-more-button"
-                  onClick={() => setHistoryVisibleCount(5)}
-                >
-                  접기
-                </button>
-              ) : null}
-            </div>
-          ) : null}
-          {visibleScans.length <= displayedScans.length && historyVisibleCount > 5 ? (
-            <button
-              type="button"
-              className="ghost-button history-more-button"
-              onClick={() => setHistoryVisibleCount(5)}
-            >
-              접기
-            </button>
-          ) : null}
         </aside>
 
         <main className="content-stage">
@@ -1115,6 +1580,7 @@ export default function App() {
             onOpenCandidates={() => setShowCandidatesModal(true)}
             onOpenRunDetails={() => setShowRunDetails(true)}
             onOpenLlmTrace={() => setShowLlmTrace(true)}
+            onOpenDiscoveryTree={() => setShowDiscoveryTree(true)}
             onStop={handleStopRun}
             stopLoading={stopLoading}
           />
@@ -1168,6 +1634,14 @@ export default function App() {
           error={llmTraceError}
           onRefresh={() => refreshLlmTraces()}
           onClose={() => setShowLlmTrace(false)}
+        />
+      ) : null}
+
+      {showDiscoveryTree && selectedRunId ? (
+        <DiscoveryTreeModal
+          runId={selectedRunId}
+          scanStatus={currentScan?.status}
+          onClose={() => setShowDiscoveryTree(false)}
         />
       ) : null}
     </div>

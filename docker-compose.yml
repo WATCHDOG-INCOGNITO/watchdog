@@ -42,23 +42,20 @@ services:
       WATCHDOG_SWARM_VERIFIERS: "${WATCHDOG_SWARM_VERIFIERS:-2}"
       WATCHDOG_SWARM_QUIESCENCE_S: "${WATCHDOG_SWARM_QUIESCENCE_S:-30}"
       WATCHDOG_SWARM_MAX_HYPOTHESES: "${WATCHDOG_SWARM_MAX_HYPOTHESES:-20}"
-      # white-box CTF source 디렉터리. tools_source가 이 안만 안전 접근.
-      # 전체 대회 mount + tools_source의 for_user 경로 필수 검사 + 차단 토큰으로 정답 노출 차단.
       SOURCE_ROOTS: "/sources"
     volumes:
-      # 모든 secret 한 폴더에 모음 (host: ./secrets, container: /run/secrets, read-only)
       - ./secrets:/run/secrets:ro
-      # CTF 대회 디렉터리 bulk mount (read-only). tools_source가 for_user 경로만 허용 +
-      # for_organizer/exploit/flag/README/info.yaml/anticheat 차단. 이중 안전망.
-      - ./codegate2023-fin:/sources/codegate2023-fin:ro
-      - ./codegate2024-final:/sources/codegate2024-final:ro
-      - ./codegate2025-final:/sources/codegate2025-final:ro
-      - ./codegate2026-pre:/sources/codegate2026-pre:ro
+      # 대회 원본은 /raw-sources 에 read-only mount (에이전트 직접 접근 불가)
+      - ./codegate2023-fin:/raw-sources/codegate2023-fin:ro
+      - ./codegate2024-final:/raw-sources/codegate2024-final:ro
+      - ./codegate2025-final:/raw-sources/codegate2025-final:ro
+      - ./codegate2026-pre:/raw-sources/codegate2026-pre:ro
     depends_on:
       db:
         condition: service_healthy
     command: >
-      sh -c "python manage.py migrate --noinput &&
+      sh -c "python /app/scripts/link_for_user.py &&
+      python manage.py migrate --noinput &&
       python manage.py runserver 0.0.0.0:8000"
 
   mcp:

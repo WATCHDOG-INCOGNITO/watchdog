@@ -452,3 +452,18 @@ def scan_run_report(request, run_id):
     if fmt in ("md", "markdown"):
         return Response({"run_id": run_id, "format": "md", "content": rr.markdown})
     return Response({"run_id": run_id, "format": "json", "content": json_mod.loads(rr.json)})
+
+
+@api_view(["GET"])
+def discovery_tree(request, run_id):
+    from django.db.models import Count
+    from .models import DiscoveryNode
+    from .serializers import DiscoveryNodeSerializer
+
+    nodes = (
+        DiscoveryNode.objects
+        .filter(scan_run_id=run_id)
+        .annotate(_children_count=Count("children"))
+        .order_by("depth", "created_at")
+    )
+    return Response(DiscoveryNodeSerializer(nodes, many=True).data)
