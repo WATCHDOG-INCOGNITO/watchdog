@@ -164,7 +164,7 @@ def get_payloads(vuln_type: str, stage: int = 1) -> list:
     취약점 유형 + 단계에 맞는 페이로드 목록 반환.
 
     Args:
-        vuln_type: "sqli", "xss", "idor", "ssrf", "upload"
+        vuln_type: "sqli", "xss", "idor", "ssrf", "file_upload"
         stage: 1(탐지), 2(확인), 3(우회/추출)
 
     Returns:
@@ -176,7 +176,7 @@ def get_payloads(vuln_type: str, stage: int = 1) -> list:
         "idor": IDOR_PAYLOADS,
         "ssrf": SSRF_PAYLOADS,
         "lfi": UPLOAD_LFI_PAYLOADS,
-        "upload": UPLOAD_LFI_PAYLOADS,
+        "file_upload": UPLOAD_LFI_PAYLOADS,
     }
 
     payloads_by_type = payload_map.get(vuln_type, {})
@@ -200,7 +200,7 @@ def get_all_payloads(vuln_type: str) -> dict:
         "idor": IDOR_PAYLOADS,
         "ssrf": SSRF_PAYLOADS,
         "lfi": UPLOAD_LFI_PAYLOADS,
-        "upload": UPLOAD_LFI_PAYLOADS,
+        "file_upload": UPLOAD_LFI_PAYLOADS,
     }
     return payload_map.get(vuln_type, {})
 

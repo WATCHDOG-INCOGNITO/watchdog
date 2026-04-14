@@ -96,6 +96,9 @@ def _list_tree(root_path: str, max_depth: int, glob: str) -> dict:
                 rel = path.relative_to(base)
             except ValueError:
                 continue
+            path_str = str(path).replace("\\", "/")
+            if any(tok in path_str for tok in FORBIDDEN_PATH_TOKENS):
+                continue
             depth = len(rel.parts)
             if max_depth and depth > max_depth:
                 continue
@@ -192,6 +195,9 @@ def _grep(pattern: str, root_path: str, glob: str, flags: str) -> dict:
     try:
         for path in base.glob(pat):
             if not path.is_file():
+                continue
+            path_str = str(path).replace("\\", "/")
+            if any(tok in path_str for tok in FORBIDDEN_PATH_TOKENS):
                 continue
             files_seen += 1
             try:

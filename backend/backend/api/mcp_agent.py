@@ -61,15 +61,15 @@ logger = logging.getLogger(__name__)
 MAX_TURNS = 50
 MAX_TURNS_PER_ROLE = 18  # 기본값 (호출부에서 role별 override 가능)
 ROLE_TURN_BUDGET = {
-    "planner": 14,    # 정찰 + 가설. Planner는 짧게.
+    "planner": 18,    # 정찰 + KB lookup + 가설 emit. White-box 소스 분석 시 여유 필요.
     "executor": 18,   # hypothesis당 2~3턴 × 4~6개 + emit. 너무 길면 안전망 트리거.
     "verifier": 18,   # oracle 호출 + 판정.
     "reporter": 4,    # 단순 generate_report.
 }
 # swarm 모드 — worker가 hypothesis/attempt 단 하나만 처리하므로 turn 짧음.
 SWARM_BUDGET = {
-    "planner": 14,
-    "executor_worker": 8,    # 1 hypothesis만. 시도 1-2회 + emit_attempts 1.
+    "planner": 18,
+    "executor_worker": 12,   # 1 hypothesis: KB lookup + multi-step chain (3-6 HTTP) + emit.
     "verifier_worker": 10,   # 1 attempt만. oracle 1-3회 + confirm/dismiss + learn + emit.
     "reporter": 4,
 }
@@ -92,17 +92,25 @@ SYSTEM_PROMPT = """\
 ## 절차
 1. `browser_navigate`로 타겟에 접속하고 `browser_extract_api_endpoints`로 API 엔드포인트를 수집하세요.
 2. `analyze_endpoint`로 각 엔드포인트를 분석하여 의심 vuln_type을 결정하세요.
-3. **공격 전에 반드시 `search_knowledge(vuln_type=...)`를 호출**해 CWE/OWASP 맥락과 검증된 페이로드 패턴(request_template, matcher, safety_level)을 먼저 가져오세요. 가능하면 `is_gold` 또는 `success_rate`가 높은 패턴을 우선 사용합니다.
+3. **공격 전에 반드시 `search_knowledge(vuln_type=...)`를 호출**해 CWE/OWASP 맥락과 검증된 페이로드 패턴을 먼저 가져오세요. KB는 `attack_metadata`에 `technique_steps_md`(단계별 공격 가이드)와 `code_template`(검증된 익스플로잇 코드)를 포함합니다. **이를 읽고 현재 타겟에 맞게 응용하세요.**
 4. 필요하면 `retrieve_similar_patterns(query=...)`로 엔드포인트 설명/파라미터명과 의미적으로 가까운 패턴을 추가 조회하세요.
 5. 패턴의 `safety_level`이 "destructive"이면 사용 금지. "cautious"는 저빈도로만 사용하세요.
-6. 페이로드를 `http_request`로 전송하거나, 적절한 보안 도구(`sqlmap_scan`, `dalfox_scan`, `nuclei_scan` 등)를 실행하세요.
+6. **KB의 technique_steps_md가 multi-step chain이면 단계별로 따라하세요.** 예: "Step 1: SSRF로 내부 API 접근 → Step 2: 응답에서 토큰 추출 → Step 3: 토큰으로 플래그 획득". `http_session_request`로 세션을 유지하며 chain을 실행하세요.
 7. 시도한 각 패턴에 대해 `record_pattern_use(pattern_id=..., succeeded=..., false_positive=...)`를 호출해 Knowledge DB의 success_rate를 업데이트하세요.
 8. 취약점이 확인되면 `confirm_finding`으로 Finding을 생성하고, `auto_collect_evidence`로 증거를 수집하세요.
 9. 모든 분석이 완료되면 `generate_report`로 리포트를 생성하세요.
 
 ## Knowledge DB 활용
 - `search_knowledge`는 vuln_type/keyword 기준 lookup (정확 매칭).
-- `retrieve_similar_patterns`는 자연어 query 기준 semantic search (Voyage 임베딩, 사용 가능한 경우).
+  - vuln_type 카테고리 (27종):
+    Injection: sqli, nosqli, xss, cmdi, ssti, ldap_injection, xpath_injection, graphql
+    File: lfi, path_traversal, file_upload, xxe
+    Server: ssrf, rce, deserialization, http_smuggling, race_condition
+    Auth: idor, access_control, auth_bypass, csrf, jwt
+    Client: prototype_pollution, cors
+    Other: open_redirect, information_disclosure, logic_flaw
+  - 각 pattern은 `sub_technique` 필드로 세부 기법 분류 (예: ssrf/loopback, cmdi/newline_injection)
+- `retrieve_similar_patterns`는 자연어 query 기준 semantic search (로컬 임베딩).
 - 두 도구가 반환하는 `false_positive_hints`와 `evidence_points`를 검증 전략의 기준으로 삼으세요.
 
 ## DB 쿼리 (PostgreSQL MCP)
@@ -173,12 +181,28 @@ confirm_finding / dismiss_candidate (Verifier).
 1. Recon endpoints (small target <15 → cover all).
 2. analyze_endpoint for suspect vuln_type.
 3. update_target_profile when framework/server/WAF identified.
-4. KB lookups only as needed; never repeat same vuln_type query twice.
+4. **KB lookup (MANDATORY after recon)**:
+   - `search_knowledge(vuln_type=...)` for EACH identified vuln_type.
+     Available types (27): sqli, nosqli, xss, cmdi, ssti, ssrf, rce, lfi, path_traversal,
+     file_upload, xxe, idor, access_control, auth_bypass, csrf, jwt, deserialization,
+     http_smuggling, race_condition, prototype_pollution, cors, graphql,
+     open_redirect, information_disclosure, logic_flaw.
+   - `retrieve_similar_patterns(query="...")` with endpoint description / tech stack.
+   - **KB returns patterns with `sub_technique` (e.g., ssrf/loopback, cmdi/newline_injection)
+     and `attack_metadata` with `technique_steps_md` and `code_template`**.
+     Read these carefully — they contain proven exploit chains.
+   - If technique_steps_md describes a multi-step chain (e.g., "Step 1: SSRF → Step 2: pipe
+     injection → Step 3: read flag"), create a hypothesis that references the full chain.
+   - Include relevant `candidate_pattern_ids` from KB in hypothesis so Executor can look them up.
+   - Never repeat same vuln_type query twice.
 5. **Mode mix (zero-day matters)**:
-   - exploit: KB seed or learned_patterns (fast baseline).
+   - exploit: KB seed or learned_patterns (fast baseline). Include `technique_steps_md`
+     summary in hypothesis rationale so Executor knows the attack plan.
    - explore (≥1/3 of hypotheses): LLM-novel guesses commodity tools won't try
      (framework quirks, logic flaws, composition chains, exotic encoding).
-6. Emit immediately when hypotheses are enough.
+6. **CRITICAL: Call `emit_hypotheses` before budget runs out.**
+   Reserve at least 2 turns for hypothesis generation. Don't over-read source files.
+   When [BUDGET] shows ≤ 4 remaining, STOP recon and emit immediately.
 
 ## Exit JSON
 
@@ -217,15 +241,21 @@ confirm_finding / dismiss_candidate / generate_report (other roles).
 ## Flow
 
 0. Once: recall_dead_ends(target_host) — skip already-failed (endpoint, vuln_type, pattern).
-1. Per hypothesis:
-   - exploit: pick 1 pattern (non-destructive), fire http_request or specialty scanner.
-     Quick body/header glance for match — uncertain → matched=true, move on.
+1. **KB first**: For each new vuln_type, call `search_knowledge(vuln_type=...)` once.
+   KB has 27 vuln_type categories and `sub_technique` for fine-grained techniques.
+   Use `retrieve_similar_patterns(query="...")` with endpoint + tech description for extras.
+   **KB returns patterns with `sub_technique` and `attack_metadata` containing
+   `technique_steps_md` and `code_template`** — use them.
+2. Per hypothesis:
+   - exploit: Read KB's `technique_steps_md` and follow it step-by-step, adapting to this target.
+     Use `code_template` as a starting point, not a copy-paste. Multi-step chains →
+     use `http_session_request` with same session_id to chain requests.
    - explore: write a payload commodity tools won't try (framework quirk, logic flaw,
      composition chain, exotic encoding) — `mutate_payload` for KB variants.
-     1-2 tries max, no analysis.
-2. record_pattern_use once; matched → create_candidate_manual once; **next immediately**.
-3. evidence_summary short (<300 chars).
-4. After all hypotheses: emit_attempts. Resist extra tries — Verifier handles depth.
+   - **Don't fire generic payloads**. Craft target-specific attacks using KB + source/recon.
+3. record_pattern_use once; matched → create_candidate_manual once; **next immediately**.
+4. evidence_summary short (<300 chars).
+5. After all hypotheses: emit_attempts. Resist extra tries — Verifier handles depth.
    Empty attempts array OK.
 
 ## Critical — emit_attempts aggressively
@@ -417,7 +447,7 @@ def _call_llm_with_retry(anthropic, scan_run, **kwargs):
     raise RuntimeError("Rate limit 재시도 3회 초과")
 
 
-TOOL_RESULT_MAX_CHARS = 1500  # 비용 vs 정보. 큰 도구 결과는 잘라서 messages 부피 감소.
+TOOL_RESULT_MAX_CHARS = 2500  # 비용 vs 정보. 큰 도구 결과는 잘라서 messages 부피 감소.
 
 
 def _truncate_tool_result(text: str, limit: int = TOOL_RESULT_MAX_CHARS) -> str:
@@ -684,26 +714,32 @@ async def _run_multi_agent_loop(
         f"verifier={len(verifier_tools)} reporter={len(reporter_tools)}"
     )
 
-    # white-box 환경 자동 감지 — SOURCE_ROOTS 환경변수가 있고 디렉터리에 파일이 있으면
-    # Planner에게 명시. 자율성 원칙 — 강제 X, 정보만 알려주고 사용 결정은 에이전트.
+    scan_config = scan_run.config or {}
+    specific_source = scan_config.get("source_root", "")
     source_hint = ""
-    src_roots = os.environ.get("SOURCE_ROOTS", "").strip()
-    if src_roots:
-        try:
-            existing = []
-            for root in src_roots.split(":"):
-                root = root.strip()
-                if root and os.path.isdir(root):
-                    sub = [d for d in os.listdir(root) if not d.startswith(".")]
-                    if sub:
-                        existing.append((root, sub[:10]))
-            if existing:
-                lines = ["", "[WHITE-BOX] SOURCE_ROOTS 디렉터리에 코드가 있습니다 — `list_source_tree`/`read_source`/`grep_source` 활용 권장:"]
-                for root, subs in existing:
-                    lines.append(f"  - {root}: {', '.join(subs)}")
-                source_hint = "\n".join(lines)
-        except Exception:
-            pass
+    if specific_source and os.path.isdir(specific_source):
+        source_hint = (
+            f"\n[WHITE-BOX] 이 타겟의 소스 코드 위치: {specific_source}\n"
+            f"  `list_source_tree(root=\"{specific_source}\")` 로 시작하세요."
+        )
+    else:
+        src_roots = os.environ.get("SOURCE_ROOTS", "").strip()
+        if src_roots:
+            try:
+                existing = []
+                for root in src_roots.split(":"):
+                    root = root.strip()
+                    if root and os.path.isdir(root):
+                        sub = [d for d in os.listdir(root) if not d.startswith(".")]
+                        if sub:
+                            existing.append((root, sub[:10]))
+                if existing:
+                    lines = ["", "[WHITE-BOX] SOURCE_ROOTS 디렉터리에 코드가 있습니다 — `list_source_tree`/`read_source`/`grep_source` 활용 권장:"]
+                    for root, subs in existing:
+                        lines.append(f"  - {root}: {', '.join(subs)}")
+                    source_hint = "\n".join(lines)
+            except Exception:
+                pass
 
     plan_brief = (
         f"타겟 URL: {scan_run.target_url}\n"
@@ -810,7 +846,7 @@ async def _run_multi_agent_loop(
 
 EXECUTOR_WORKER_PROMPT = """\
 You are an Executor Worker. Single hypothesis only — fire payload, record, emit.
-**Don't judge** (Verifier handles). 1-2 tool calls max, then emit_attempts.
+**Don't judge** (Verifier handles). 3-6 tool calls, then emit_attempts.
 
 ## Tools
 - Stateful HTTP: http_session_request(session_id, ...) (multipart/cookie chain)
@@ -824,12 +860,30 @@ You are an Executor Worker. Single hypothesis only — fire payload, record, emi
 - Candidate: create_candidate_manual
 - Exit: emit_attempts(attempts_json='{"attempts":[{...}]}')
 
-## Flow (very tight)
+## Flow — KB-driven exploitation
 
-1. Optional: recall_dead_ends(target_host) once (skip already-failed).
-2. Send payload (1-2 calls). For explore mode: write LLM-novel payload commodity tools won't try.
-3. record_pattern_use; if matched, create_candidate_manual.
-4. emit_attempts immediately.
+1. **KB lookup**: `search_knowledge(vuln_type=<hypothesis vuln_type>)`.
+   KB has 27 categories with `sub_technique` for fine-grained classification.
+   The response includes patterns with `attack_metadata` containing:
+   - `technique_steps_md`: step-by-step exploit guide — **follow these steps**.
+   - `code_template`: working exploit code — **adapt to this target**.
+   - `applies_when`: conditions when the technique works — **verify they match**.
+   - `prerequisites`: required setup — **check these first**.
+2. recall_dead_ends(target_host) once (skip already-failed).
+3. **Apply KB knowledge** (this is the key step):
+   - If `technique_steps_md` exists, follow its steps sequentially using http_request
+     or http_session_request. Adapt URLs, params, payloads to match THIS target.
+   - If `code_template` exists, translate it into HTTP requests to the target.
+   - If the technique involves a **multi-step chain** (e.g., "Step 1: get token,
+     Step 2: use token to access admin, Step 3: exploit admin endpoint"),
+     use http_session_request with same session_id to maintain state across steps.
+   - Don't just send generic payloads. Read the KB technique and craft a specific
+     attack tailored to what source code / recon revealed about this target.
+4. record_pattern_use; if matched, create_candidate_manual.
+5. emit_attempts immediately.
+
+## Anti-pattern: don't just look up KB and fire a generic payload.
+Read technique_steps_md, understand the attack chain, and reproduce it step by step.
 """
 
 VERIFIER_WORKER_PROMPT = """\
@@ -982,24 +1036,32 @@ async def _run_swarm(
     )
 
     # ── 1. Planner — 초기 hypotheses 생성 ──
-    src_roots = os.environ.get("SOURCE_ROOTS", "").strip()
+    scan_config = scan_run.config or {}
+    specific_source = scan_config.get("source_root", "")
     source_hint = ""
-    if src_roots:
-        try:
-            existing = []
-            for root in src_roots.split(":"):
-                root = root.strip()
-                if root and os.path.isdir(root):
-                    sub = [d for d in os.listdir(root) if not d.startswith(".")]
-                    if sub:
-                        existing.append((root, sub[:10]))
-            if existing:
-                lines = ["", "[WHITE-BOX] SOURCE_ROOTS:"]
-                for root, subs in existing:
-                    lines.append(f"  - {root}: {', '.join(subs)}")
-                source_hint = "\n".join(lines)
-        except Exception:
-            pass
+    if specific_source and os.path.isdir(specific_source):
+        source_hint = (
+            f"\n[WHITE-BOX] 이 타겟의 소스 코드 위치: {specific_source}\n"
+            f"  `list_source_tree(root=\"{specific_source}\")` 로 시작하세요."
+        )
+    else:
+        src_roots = os.environ.get("SOURCE_ROOTS", "").strip()
+        if src_roots:
+            try:
+                existing = []
+                for root in src_roots.split(":"):
+                    root = root.strip()
+                    if root and os.path.isdir(root):
+                        sub = [d for d in os.listdir(root) if not d.startswith(".")]
+                        if sub:
+                            existing.append((root, sub[:10]))
+                if existing:
+                    lines = ["", "[WHITE-BOX] SOURCE_ROOTS:"]
+                    for root, subs in existing:
+                        lines.append(f"  - {root}: {', '.join(subs)}")
+                    source_hint = "\n".join(lines)
+            except Exception:
+                pass
 
     plan_brief = (
         f"target_url: {scan_run.target_url}\n"

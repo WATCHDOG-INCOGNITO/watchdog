@@ -126,6 +126,7 @@ def _learn_from_finding(
             vulnerability=seed.vulnerability if seed else None,
             name=f"[novel@{host}] {vuln_type} {endpoint or ''}".strip()[:256],
             vuln_type=vuln_type,
+            sub_technique=seed.sub_technique if seed else None,
             category="learned",
             request_template=template_value,
             matcher=seed.matcher if seed else None,

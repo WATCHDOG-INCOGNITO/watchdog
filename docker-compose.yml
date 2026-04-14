@@ -33,9 +33,7 @@ services:
       DB_HOST: ${DB_HOST:-db}
       DB_PORT: ${DB_PORT:-5432}
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
-      # 모든 secret(VOYAGE/GCP key 등)은 host의 ./secrets/ 폴더 한 곳에 모음.
-      # backend entrypoint 가 /run/secrets/voyage.key 가 있으면 VOYAGE_API_KEY 자동 export.
-      VOYAGE_API_KEY: "${VOYAGE_API_KEY:-}"
+      # 모든 secret(GCP key 등)은 host의 ./secrets/ 폴더 한 곳에 모음.
       GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-/run/secrets/gcp-key.json}
       GCS_BUCKET_NAME: ${GCS_BUCKET_NAME:-watchdog-evidence}
       # Multi-agent swarm 설정
@@ -60,10 +58,7 @@ services:
       db:
         condition: service_healthy
     command: >
-      sh -c "
-      [ -z \"$$VOYAGE_API_KEY\" ] && [ -f /run/secrets/voyage.key ] &&
-        export VOYAGE_API_KEY=\"$$(tr -d '[:space:]' < /run/secrets/voyage.key)\";
-      python manage.py migrate --noinput &&
+      sh -c "python manage.py migrate --noinput &&
       python manage.py runserver 0.0.0.0:8000"
 
   mcp:
@@ -83,7 +78,6 @@ services:
       DB_HOST: ${DB_HOST:-db}
       DB_PORT: ${DB_PORT:-5432}
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
-      VOYAGE_API_KEY: "${VOYAGE_API_KEY:-}"
       MCP_SSE: "1"
     depends_on:
       db:

@@ -259,7 +259,7 @@ def get_scan_findings_summary(run_id):
 
 def _estimate_severity(vuln_type, priority_score):
     """vuln_type + priority_score로 severity 추정"""
-    high_severity_types = {"sqli", "ssrf", "upload", "rce", "deserialization"}
+    high_severity_types = {"sqli", "ssrf", "file_upload", "rce", "deserialization"}
     medium_severity_types = {"xss", "idor", "csrf"}
 
     if vuln_type in high_severity_types:

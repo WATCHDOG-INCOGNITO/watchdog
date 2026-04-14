@@ -6,13 +6,63 @@
 
 | 자원 | 모델 | 무엇이 들어가나 | 누가 활용 |
 |---|---|---|---|
-| **Vulnerability catalog** | `VulnerabilityEntry` | OWASP/CWE 기본 카탈로그 (commodity) | LLM `search_knowledge(vuln_type)` |
+| **Vulnerability catalog** | `VulnerabilityEntry` | OWASP/CWE 기본 카탈로그 (27 카테고리) | LLM `search_knowledge(vuln_type)` |
 | **Payload pattern** | `PayloadPattern` (source='seed') | sqlmap/dalfox 류 표준 페이로드 | `search_knowledge`, `retrieve_similar_patterns` |
 | **Living KB — host-specific** | `PayloadPattern` (source='learned') + `TargetProfile` + `DeadEnd` | 우리 스캔에서 *실제로 통한* 페이로드 (host별), framework/server/WAF, 막힌 시도 | LLM `recall_target` / `recall_dead_ends` |
 | **★ Exploit Technique (transferable trick)** | `PayloadPattern` (source='technique') | **문제 박제가 아닌** 일반화된 trick — *"이런 조건 보이면 이렇게 풀어라"* | LLM `search_knowledge`, `retrieve_similar_patterns` |
 
 **핵심 통찰** — 우리 시스템의 차별화는 **★ Exploit Technique** 누적에서 나온다.
 sqlmap이 매번 시도하는 `1' OR '1'='1`은 KB에 저장 가치 0이지만, *EXIF passthrough + safe_eval attribute chain* 같은 트릭은 진짜 자산.
+
+---
+
+## Taxonomy — PayloadsAllTheThings 스타일 (27 카테고리)
+
+| ID | 카테고리 | CWE | 비고 |
+|---|---|---|---|
+| **Injection** | | | |
+| `sqli` | SQL Injection | CWE-89 | boolean/error/time/union-based |
+| `nosqli` | NoSQL Injection | CWE-943 | MongoDB $ne/$gt/$regex 등 |
+| `xss` | Cross-Site Scripting | CWE-79 | reflected/stored/DOM, CSP bypass |
+| `cmdi` | Command Injection | CWE-78 | chaining, filter bypass |
+| `ssti` | Server-Side Template Injection | CWE-1336 | Jinja2, Twig, Freemarker |
+| `ldap_injection` | LDAP Injection | CWE-90 | |
+| `xpath_injection` | XPath Injection | CWE-643 | |
+| `graphql` | GraphQL Injection | CWE-89 | introspection, batching |
+| **File** | | | |
+| `lfi` | Local File Inclusion | CWE-98 | php wrapper, open_basedir bypass |
+| `path_traversal` | Path Traversal | CWE-22 | encoding bypass, unicode |
+| `file_upload` | File Upload | CWE-434 | extension bypass, EXIF injection |
+| `xxe` | XML External Entity | CWE-611 | file read, OOB exfiltration |
+| **Server** | | | |
+| `ssrf` | Server-Side Request Forgery | CWE-918 | loopback bypass, gopher, protocol confusion |
+| `rce` | Remote Code Execution | CWE-94 | eval/exec, deserialization chain |
+| `deserialization` | Insecure Deserialization | CWE-502 | pickle, Java ObjectInputStream |
+| `http_smuggling` | HTTP Request Smuggling | CWE-444 | CL.TE, TE.CL |
+| `race_condition` | Race Condition | CWE-362 | TOCTOU, concurrent requests |
+| **Auth / Access** | | | |
+| `idor` | Insecure Direct Object Ref | CWE-639 | sequential id, uuid swap |
+| `access_control` | Broken Access Control | CWE-284 | privilege escalation |
+| `auth_bypass` | Authentication Bypass | CWE-287 | default creds, logic flaw |
+| `csrf` | Cross-Site Request Forgery | CWE-352 | SameSite bypass |
+| `jwt` | JWT Attack | CWE-345 | none alg, weak secret |
+| **Client** | | | |
+| `prototype_pollution` | Prototype Pollution | CWE-1321 | __proto__ injection |
+| `cors` | CORS Misconfiguration | CWE-942 | Origin reflect + credentials |
+| **Other** | | | |
+| `open_redirect` | Open Redirect | CWE-601 | |
+| `information_disclosure` | Information Disclosure | CWE-200 | .git, debug info, env leak |
+| `logic_flaw` | Business Logic Flaw | CWE-840 | price manipulation, step skip |
+
+### sub_technique 필드
+
+`PayloadPattern.sub_technique` (CharField, nullable) 로 세부 기법을 분류한다.
+
+예시:
+- `vuln_type="cmdi"`, `sub_technique="newline_pipe_injection"` — 파이프/개행 기반 명령 주입
+- `vuln_type="ssrf"`, `sub_technique="host_header_loopback_bypass"` — Host 헤더로 loopback
+- `vuln_type="xss"`, `sub_technique="csp_bypass"` — CSP 우회 XSS
+- `vuln_type="lfi"`, `sub_technique="open_basedir_bypass"` — PHP open_basedir 우회
 
 ---
 
@@ -49,12 +99,14 @@ sqlmap이 매번 시도하는 `1' OR '1'='1`은 KB에 저장 가치 0이지만, 
 |---|---|
 | `source` | `"technique"` (필수 — 검색 필터 키) |
 | `name` | snake_case 식별자 (예: `exif_passthrough_marker`) |
-| `vuln_type` | 가장 가까운 클래스 (`code_injection`, `ssti`, `file_upload_quirk`, ...) |
+| `vuln_type` | 27개 카테고리 중 하나 (`ssti`, `file_upload`, `ssrf`, ...) |
+| `sub_technique` | 세부 기법 분류 (예: `attribute_chain_filter_bypass`) |
 | `category` | `"exploitation"` (보통) |
 | `safety_level` | `safe` / `cautious` / `destructive` |
 | `request_template` | 보통 빈 문자열 (technique은 단일 페이로드 아님) |
 | `tags` | 짧은 키워드 배열 |
 | `attack_metadata` | 위 표준 구조 |
+| `vulnerability` | FK → `VulnerabilityEntry` (새로운 taxonomy 연결) |
 | `embedding` | 자동 생성 (`name + applies_when + prerequisites + steps + tags` 임베딩) |
 
 ---
@@ -78,7 +130,14 @@ sqlmap이 매번 시도하는 `1' OR '1'='1`은 KB에 저장 가치 0이지만, 
 - "어떤 sink에서" + "어떤 환경 조건이면" 적용 가능한지
 - LLM이 *비슷한 패턴* 만나면 hit 하도록 핵심 키워드 포함 (eval, allowed_globals, attribute, BLACKLIST 등)
 
-### 3) examples 누적
+### 3) vuln_type / sub_technique 선정
+
+- `vuln_type`: 27개 카테고리 중 **가장 적합한 하나** 선택
+- `sub_technique`: 세부 기법 이름 (snake_case). 예:
+  - safe_eval → `vuln_type="ssti"`, `sub_technique="attribute_chain_filter_bypass"`
+  - Host header SSRF → `vuln_type="ssrf"`, `sub_technique="host_header_loopback_bypass"`
+
+### 4) examples 누적
 
 같은 technique이 다른 문제에 적용될 때마다 `examples` 배열에 한 항목 추가. 각 항목:
 - `problem_id` — `2024-combination`, `2025-censored-board` 등
@@ -86,7 +145,7 @@ sqlmap이 매번 시도하는 `1' OR '1'='1`은 KB에 저장 가치 0이지만, 
 - `params` — 그 문제 특이 변수 (sink 이름, expr, 우회한 필터, output path 등)
 - `notes` — 미세한 차이 / 정답과 비교
 
-### 4) seed_techniques.py 에 추가
+### 5) seed_techniques.py 에 추가
 
 `backend/backend/api/management/commands/seed_techniques.py` 의 `TECHNIQUES` 리스트에 dict 한 개 추가 → `--reset` 플래그로 재시드.
 
@@ -154,7 +213,7 @@ update_target_profile(
 | MCP 도구 | 검색 대상 | 사용 시점 |
 |---|---|---|
 | `search_knowledge(vuln_type, keyword, limit)` | 모든 PayloadPattern + VulnerabilityEntry, 키워드 부분 일치 | Planner가 가설 만들 때, Executor가 페이로드 변종 찾을 때 |
-| `retrieve_similar_patterns(query, k, vuln_type)` | PayloadPattern, **Voyage 임베딩 cosine 유사도** | Planner가 자연어 query로 trick 찾을 때 (예: "BLACKLIST 우회 SSTI") |
+| `retrieve_similar_patterns(query, k, vuln_type)` | PayloadPattern, **임베딩 cosine 유사도** (alias 적용) | Planner가 자연어 query로 trick 찾을 때 (예: "BLACKLIST 우회 SSTI") |
 | `recall_target(target_host)` | TargetProfile + 그 host의 learned PayloadPattern + DeadEnd | 모든 스캔 시작 시 |
 | `recall_dead_ends(target_host, vuln_type, endpoint)` | DeadEnd 좁은 범위 | Executor 시도 직전 |
 
@@ -214,10 +273,12 @@ docker compose exec backend python manage.py loaddata /tmp/kb_latest.json
 ## 추가/수정 시 체크리스트
 
 - [ ] technique 이름이 snake_case
+- [ ] `vuln_type`이 27개 카테고리 중 하나
+- [ ] `sub_technique`이 적절한 세부 분류명
 - [ ] `applies_when` 에 LLM이 매칭할 핵심 키워드 포함
 - [ ] `prerequisites` 가 *적용 조건* 명확
 - [ ] `code_template` 에 `{placeholder}` 변수 표시
 - [ ] 적어도 1개 `examples` (검증 안 된 기법은 추가 보류)
 - [ ] `seed_techniques --reset` 으로 재시드
-- [ ] (옵션) `VOYAGE_API_KEY` 있으면 임베딩 자동
+- [ ] (옵션) 임베딩 모델 있으면 임베딩 자동
 - [ ] PROGRESS.md 의 해당 chain 줄에 *[추출 technique: name1, name2]* 표시

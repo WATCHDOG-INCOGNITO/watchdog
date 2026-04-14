@@ -46,7 +46,7 @@ def register(mcp):
     async def list_candidates(run_id: str, status: str = "", vuln_type: str = "") -> str:
         """스캔의 후보(candidate) 목록을 조회한다.
         status: open, verifying, confirmed, false_positive, dismissed
-        vuln_type: sqli, xss, idor, ssrf, upload
+        vuln_type: sqli, xss, idor, ssrf, file_upload, cmdi, ssti, nosqli, rce, etc.
         """
         def _query():
             qs = Candidate.objects.filter(scan_run_id=run_id).select_related("request")

@@ -39,7 +39,8 @@ from api.models import PayloadPattern, VulnerabilityEntry
 TECHNIQUES: list[dict] = [
     {
         "name": "exif_passthrough_marker",
-        "vuln_type": "file_upload_quirk",
+        "vuln_type": "file_upload",
+        "sub_technique": "exif_metadata_injection",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["exif", "image", "passthrough", "marker"],
@@ -93,6 +94,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "pdo_emulate_prepare_question_mark_smuggling",
         "vuln_type": "sqli",
+        "sub_technique": "pdo_emulate_prepare",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["sqli", "pdo", "emulate-prepare", "identifier-injection"],
@@ -150,7 +152,8 @@ TECHNIQUES: list[dict] = [
     },
     {
         "name": "safe_eval_attribute_chain",
-        "vuln_type": "code_injection",
+        "vuln_type": "ssti",
+        "sub_technique": "attribute_chain_filter_bypass",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["eval", "ssti", "attribute-chain", "filter-bypass"],
@@ -225,7 +228,8 @@ TECHNIQUES: list[dict] = [
     },
     {
         "name": "dyson_multi_request_host_smuggling",
-        "vuln_type": "ssrf_loopback_bypass",
+        "vuln_type": "ssrf",
+        "sub_technique": "host_header_loopback_bypass",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["ssrf", "host-header", "multi-request", "ip-bypass"],
@@ -291,7 +295,8 @@ TECHNIQUES: list[dict] = [
     },
     {
         "name": "js_asi_const_overwrite",
-        "vuln_type": "js_parser_quirk",
+        "vuln_type": "xss",
+        "sub_technique": "js_parser_quirk",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["javascript", "asi", "const", "parser-quirk", "nodejs"],
@@ -352,7 +357,8 @@ TECHNIQUES: list[dict] = [
     # ── NoSQL / path traversal techniques ────────────────────────
     {
         "name": "mongodb_regexp_injection_email_leak",
-        "vuln_type": "nosql_injection",
+        "vuln_type": "nosqli",
+        "sub_technique": "regexp_injection",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["nosql", "mongodb", "regex", "regexp-injection", "brute-force", "email-leak"],
@@ -414,7 +420,8 @@ TECHNIQUES: list[dict] = [
     },
     {
         "name": "nosql_operator_injection_token_bypass",
-        "vuln_type": "nosql_injection",
+        "vuln_type": "nosqli",
+        "sub_technique": "operator_injection",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["nosql", "mongodb", "operator-injection", "password-reset", "auth-bypass"],
@@ -477,6 +484,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "multer_unicode_path_traversal",
         "vuln_type": "path_traversal",
+        "sub_technique": "unicode_encoding_bypass",
         "category": "exploitation",
         "safety_level": "dangerous",
         "tags": ["path-traversal", "multer", "unicode", "file-upload", "nodejs", "encoding"],
@@ -538,7 +546,8 @@ TECHNIQUES: list[dict] = [
     # ── PHP sandbox escape technique ────────────────────────────
     {
         "name": "php_open_basedir_race_pcntl_fork",
-        "vuln_type": "open_basedir_bypass",
+        "vuln_type": "lfi",
+        "sub_technique": "open_basedir_bypass",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["php", "open-basedir", "race-condition", "pcntl-fork", "lfi", "sandbox-escape"],
@@ -621,6 +630,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "mysql_object_injection_auth_bypass",
         "vuln_type": "sqli",
+        "sub_technique": "object_injection",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["mysql", "object-injection", "auth-bypass", "type-confusion", "nodejs"],
@@ -675,6 +685,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "dompurify_mxss_custom_element_safe_for_templates",
         "vuln_type": "xss",
+        "sub_technique": "mxss_dom_clobbering",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["xss", "mxss", "dompurify", "custom-element", "mutation-xss", "sanitizer-bypass"],
@@ -728,6 +739,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "csp_split_brain_admin_unsafe_inline",
         "vuln_type": "xss",
+        "sub_technique": "csp_bypass",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["csp", "unsafe-inline", "admin", "xss", "policy-inconsistency"],
@@ -776,6 +788,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "ejs_theme_path_traversal_css_injection",
         "vuln_type": "path_traversal",
+        "sub_technique": "template_path_injection",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["path-traversal", "css-injection", "ejs", "theme", "ui-redress"],
@@ -825,6 +838,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "headless_bot_click_hijack_css_overlay",
         "vuln_type": "xss",
+        "sub_technique": "css_clickjacking",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["clickjacking", "headless-browser", "puppeteer", "css", "bot", "ui-redress"],
@@ -876,6 +890,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "css_import_escape_url_filter_bypass",
         "vuln_type": "xss",
+        "sub_technique": "css_filter_bypass",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["css", "import", "escape", "filter-bypass", "style-injection", "exfiltration"],
@@ -921,6 +936,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "firefox_content_visibility_hidden_layout_bug",
         "vuln_type": "xss",
+        "sub_technique": "browser_layout_quirk",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["firefox", "content-visibility", "checkVisibility", "css", "browser-bug", "defense-bypass"],
@@ -974,6 +990,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "css_font_ligature_width_side_channel",
         "vuln_type": "xss",
+        "sub_technique": "css_side_channel",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["css", "font", "ligature", "side-channel", "exfiltration", "container-query"],
@@ -1037,7 +1054,8 @@ TECHNIQUES: list[dict] = [
     # ── HTTP smuggling / protocol confusion techniques ──────────
     {
         "name": "safe_strlen_content_length_desync",
-        "vuln_type": "http_request_smuggling",
+        "vuln_type": "http_smuggling",
+        "sub_technique": "content_length_desync",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["smuggling", "content-length", "desync", "php", "control-char"],
@@ -1101,7 +1119,8 @@ TECHNIQUES: list[dict] = [
     },
     {
         "name": "memstorage_pipe_newline_command_injection",
-        "vuln_type": "command_injection",
+        "vuln_type": "cmdi",
+        "sub_technique": "newline_pipe_injection",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["protocol", "injection", "pipe", "newline", "tcp", "memstorage"],
@@ -1152,6 +1171,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "visit_redirect_ssrf_chain",
         "vuln_type": "ssrf",
+        "sub_technique": "redirect_chain",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["ssrf", "redirect", "visit", "file-read", "chain"],
@@ -1221,7 +1241,8 @@ TECHNIQUES: list[dict] = [
     },
     {
         "name": "http_to_tcp_protocol_confusion",
-        "vuln_type": "protocol_confusion",
+        "vuln_type": "ssrf",
+        "sub_technique": "protocol_confusion",
         "category": "exploitation",
         "safety_level": "safe",
         "tags": ["protocol-confusion", "http", "tcp", "ssrf", "file_get_contents"],
@@ -1286,6 +1307,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "smtp_content_id_path_traversal_rce",
         "vuln_type": "path_traversal",
+        "sub_technique": "smtp_content_id",
         "attack_metadata": {
             "name": "SMTP Content-ID path traversal → arbitrary file write → RCE",
             "applies_when": (
@@ -1360,6 +1382,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "express_req_property_traversal_leak",
         "vuln_type": "information_disclosure",
+        "sub_technique": "property_traversal",
         "attack_metadata": {
             "name": "Express req object property traversal — cookie/header leak",
             "applies_when": (
@@ -1413,7 +1436,8 @@ TECHNIQUES: list[dict] = [
     # ── 24. isSameSite null origin bypass ────────────────────────
     {
         "name": "isamesite_null_origin_bypass",
-        "vuln_type": "access_control_bypass",
+        "vuln_type": "csrf",
+        "sub_technique": "samesite_bypass",
         "attack_metadata": {
             "name": "postMessage isSameSite check bypass via null origin",
             "applies_when": (
@@ -1470,6 +1494,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "breach_gzip_compression_side_channel",
         "vuln_type": "information_disclosure",
+        "sub_technique": "compression_side_channel",
         "attack_metadata": {
             "name": "BREACH gzip compression side-channel for secret extraction",
             "applies_when": (
@@ -1538,6 +1563,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "python_sql_escape_type_bypass",
         "vuln_type": "sqli",
+        "sub_technique": "escape_type_bypass",
         "attack_metadata": {
             "name": "Python sql_escape type-confusion bypass — non-string values skip sanitization",
             "applies_when": (
@@ -1589,7 +1615,8 @@ TECHNIQUES: list[dict] = [
     # ── 27. Polyglot PNG + PHP LFI via include with DB-controlled path ──
     {
         "name": "polyglot_png_php_include_rce",
-        "vuln_type": "lfi_rce",
+        "vuln_type": "lfi",
+        "sub_technique": "polyglot_file_rce",
         "attack_metadata": {
             "name": "Polyglot PNG with appended PHP code + LFI via include with DB-controlled path",
             "applies_when": (
@@ -1653,7 +1680,8 @@ TECHNIQUES: list[dict] = [
     # ── 28. Hardcoded DB credentials + exposed port → direct DB manipulation ──
     {
         "name": "exposed_db_credentials_direct_manipulation",
-        "vuln_type": "access_control_bypass",
+        "vuln_type": "information_disclosure",
+        "sub_technique": "exposed_credentials",
         "attack_metadata": {
             "name": "Hardcoded DB credentials with exposed port → direct database manipulation",
             "applies_when": (
@@ -1710,6 +1738,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "css_attribute_selector_nonce_exfil",
         "vuln_type": "xss",
+        "sub_technique": "css_attribute_exfil",
         "attack_metadata": {
             "name": "CSS attribute selector nonce exfiltration — CSP bypass via style-src unsafe-inline",
             "applies_when": (
@@ -1790,6 +1819,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "param_array_type_confusion_sqli",
         "vuln_type": "sqli",
+        "sub_technique": "type_confusion",
         "attack_metadata": {
             "name": "HTTP parameter array type confusion — bypass string-only sanitization for SQL injection",
             "applies_when": (
@@ -1856,6 +1886,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "http2_stream_exhaustion_xs_leak",
         "vuln_type": "information_disclosure",
+        "sub_technique": "xs_leak_http2",
         "attack_metadata": {
             "name": "HTTP/2 stream multiplexing exhaustion — XS-Leak via pending response oracle",
             "applies_when": (
@@ -1936,6 +1967,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "magento_cosmicsting_xxe_cnext_rce",
         "vuln_type": "rce",
+        "sub_technique": "xxe_to_rce_chain",
         "attack_metadata": {
             "name": "Magento CosmicSting XXE + CNEXT glibc iconv heap overflow → RCE",
             "applies_when": (
@@ -2017,6 +2049,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "url_authority_edge_canonicalization_bypass",
         "vuln_type": "ssrf",
+        "sub_technique": "url_parsing_bypass",
         "attack_metadata": {
             "name": "URL authority parsing differential — edge canonicalization vs Go url.Parse",
             "applies_when": (
@@ -2082,6 +2115,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "html_card_thread_vs_action_link_confusion",
         "vuln_type": "logic_flaw",
+        "sub_technique": "action_link_confusion",
         "attack_metadata": {
             "name": "HTML card dual-extraction — thread marker uses first link, action uses last compatible link",
             "applies_when": (
@@ -2151,6 +2185,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "sliding_window_fragment_oracle",
         "vuln_type": "information_disclosure",
+        "sub_technique": "fragment_oracle",
         "attack_metadata": {
             "name": "Sliding window fragment oracle — 4-char window index enables character-by-character secret extraction",
             "applies_when": (
@@ -2215,6 +2250,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "charset_mismatch_iso2022jp_xss",
         "vuln_type": "xss",
+        "sub_technique": "charset_mismatch",
         "attack_metadata": {
             "name": "Charset mismatch XSS — server-side charset unsupported by browser triggers auto-detection to ISO-2022-JP",
             "applies_when": (
@@ -2298,6 +2334,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "jcmd_jfr_file_write_jsp_rce",
         "vuln_type": "rce",
+        "sub_technique": "jcmd_file_write",
         "attack_metadata": {
             "name": "jcmd argument injection via pid parameter → JFR file write to webroot → JSP webshell RCE",
             "applies_when": (
@@ -2380,6 +2417,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "spring_auth_handler_npe_role_escalation",
         "vuln_type": "auth_bypass",
+        "sub_technique": "npe_role_escalation",
         "attack_metadata": {
             "name": "Spring AuthenticationSuccessHandler NPE via empty JSON input → generic Exception catch grants admin role",
             "applies_when": (
@@ -2446,6 +2484,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "reflection_method_invocation_union_sqli",
         "vuln_type": "sqli",
+        "sub_technique": "reflection_method_invocation",
         "attack_metadata": {
             "name": "Kotlin reflection controller invokes DataProvider methods with user-controlled params → whitespace-free UNION SQLi",
             "applies_when": (
@@ -2522,6 +2561,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "chrome_extension_strict_loose_comparison_bypass",
         "vuln_type": "auth_bypass",
+        "sub_technique": "type_coercion_bypass",
         "attack_metadata": {
             "name": "Chrome extension content_script === vs background.js == comparison bypass via array action parameter",
             "applies_when": (
@@ -2605,6 +2645,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "svg_bitmap_measurement_side_channel_descramble",
         "vuln_type": "information_disclosure",
+        "sub_technique": "svg_side_channel",
         "attack_metadata": {
             "name": "SVG bitmap font side-channel — noisy measurement artifacts + PRNG descramble + majority voting recovers flag",
             "applies_when": (
@@ -2697,7 +2738,8 @@ TECHNIQUES: list[dict] = [
     # ── 42. GraphQL Relay Node interface authorization bypass ──
     {
         "name": "graphql_relay_node_interface_auth_bypass",
-        "vuln_type": "auth_bypass",
+        "vuln_type": "graphql",
+        "sub_technique": "relay_node_auth_bypass",
         "attack_metadata": {
             "name": "GraphQL Relay Node interface bypasses per-type authorization — node(id) lacks is_secret check that note(id) enforces",
             "applies_when": (
@@ -2769,6 +2811,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "jsonpath_plus_preventeval_rce",
         "vuln_type": "rce",
+        "sub_technique": "jsonpath_injection",
         "attack_metadata": {
             "name": "jsonpath-plus preventEval:false allows JavaScript code execution via script expressions",
             "applies_when": (
@@ -2836,6 +2879,7 @@ TECHNIQUES: list[dict] = [
     {
         "name": "postgresql_plperlu_env_var_flag_read",
         "vuln_type": "information_disclosure",
+        "sub_technique": "db_env_leak",
         "attack_metadata": {
             "name": "PostgreSQL PL/Perl(U) function reads container environment variables containing secrets",
             "applies_when": (
@@ -2921,17 +2965,24 @@ class Command(BaseCommand):
             deleted = PayloadPattern.objects.filter(source="technique").delete()
             self.stdout.write(self.style.WARNING(f"reset: deleted {deleted}"))
 
+        vuln_by_type: dict[str, VulnerabilityEntry] = {
+            v.vuln_type: v for v in VulnerabilityEntry.objects.all()
+        }
+
         created_cnt = 0
         updated_cnt = 0
         for t in TECHNIQUES:
+            vuln = vuln_by_type.get(t["vuln_type"])
             obj, created = PayloadPattern.objects.update_or_create(
                 name=t["name"],
                 source="technique",
                 defaults={
+                    "vulnerability": vuln,
                     "vuln_type": t["vuln_type"],
+                    "sub_technique": t.get("sub_technique"),
                     "category": t.get("category", "exploitation"),
                     "safety_level": t.get("safety_level", "safe"),
-                    "request_template": "",  # techniques are not single payloads
+                    "request_template": "",
                     "matcher": None,
                     "safety_notes": t["attack_metadata"].get("applies_when", "")[:500],
                     "tags": t.get("tags", []),
@@ -2939,8 +2990,9 @@ class Command(BaseCommand):
                     "is_active": True,
                 },
             )
+            fk_mark = "FK" if vuln else "!!"
             self.stdout.write(
-                f"  technique {'+' if created else '='} {t['name']:40s} ({t['vuln_type']})"
+                f"  technique {'+' if created else '='} [{fk_mark}] {t['name']:40s} ({t['vuln_type']})"
             )
             if created:
                 created_cnt += 1

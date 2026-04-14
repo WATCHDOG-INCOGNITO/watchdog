@@ -71,10 +71,14 @@ def pattern_text(p) -> str:
     """Serialize a PayloadPattern into text for embedding."""
     parts = [
         f"vuln_type: {p.vuln_type}",
+    ]
+    if getattr(p, "sub_technique", None):
+        parts.append(f"sub_technique: {p.sub_technique}")
+    parts.extend([
         f"name: {p.name}",
         f"category: {p.category}",
         f"safety_level: {p.safety_level}",
-    ]
+    ])
     if p.request_template:
         parts.append(f"template: {p.request_template}")
     if p.safety_notes:

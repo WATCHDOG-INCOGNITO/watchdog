@@ -35,7 +35,7 @@ SUSPICIOUS_PARAM_PATTERNS = [
     # SSRF 의심
     (r"(?i)(url|uri|link|src|source|target|dest|redirect|proxy|fetch|load|request|path|file)", "ssrf"),
     # 파일 업로드 의심
-    (r"(?i)(file|upload|attach|image|photo|document|import)", "upload"),
+    (r"(?i)(file|upload|attach|image|photo|document|import)", "file_upload"),
 ]
 
 # 엔드포인트 경로 기반 의심 패턴
@@ -44,7 +44,7 @@ SUSPICIOUS_PATH_PATTERNS = [
     (r"(?i)/api/", "sqli"),
     (r"(?i)/login", "sqli"),
     (r"(?i)/search", "xss"),
-    (r"(?i)/upload", "upload"),
+    (r"(?i)/upload", "file_upload"),
     (r"(?i)/profile", "idor"),
     (r"(?i)/user", "idor"),
     (r"(?i)/redirect", "ssrf"),

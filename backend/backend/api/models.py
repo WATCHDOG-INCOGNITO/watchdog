@@ -338,6 +338,7 @@ class PayloadPattern(models.Model):
     vulnerability = models.ForeignKey(VulnerabilityEntry, on_delete=models.SET_NULL, null=True, blank=True, related_name="patterns")
     name = models.CharField(max_length=256)
     vuln_type = models.CharField(max_length=64)
+    sub_technique = models.CharField(max_length=128, null=True, blank=True)
     category = models.CharField(max_length=64, default="detection")
 
     request_template = models.TextField(null=True, blank=True)

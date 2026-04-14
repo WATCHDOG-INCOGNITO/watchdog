@@ -13,6 +13,43 @@ from asgiref.sync import sync_to_async
 logger = logging.getLogger("watchdog.kb")
 
 
+VULN_TYPE_ALIASES: dict[str, list[str]] = {
+    "cmdi": ["command_injection"],
+    "command_injection": ["cmdi"],
+
+    "sqli": ["sql_injection"],
+    "sql_injection": ["sqli"],
+
+    "nosqli": ["nosql_injection"],
+    "nosql_injection": ["nosqli"],
+
+    "xss": ["cross_site_scripting"],
+    "cross_site_scripting": ["xss"],
+
+    "lfi": ["local_file_inclusion"],
+    "local_file_inclusion": ["lfi"],
+
+    "path_traversal": ["directory_traversal"],
+    "directory_traversal": ["path_traversal"],
+
+    "rfi": ["remote_file_inclusion"],
+    "remote_file_inclusion": ["rfi"],
+
+    "ssti": ["server_side_template_injection"],
+    "server_side_template_injection": ["ssti"],
+    "code_injection": ["rce", "ssti"],
+
+    "http_smuggling": ["http_request_smuggling"],
+    "http_request_smuggling": ["http_smuggling"],
+
+    "jwt": ["jwt_attack"],
+    "jwt_attack": ["jwt"],
+
+    "upload": ["file_upload"],
+    "file_upload": ["upload"],
+}
+
+
 def _search(vuln_type: str | None, keyword: str | None, limit: int) -> dict:
     from django.db.models import Q
 
@@ -23,8 +60,9 @@ def _search(vuln_type: str | None, keyword: str | None, limit: int) -> dict:
 
     if vuln_type:
         vt = vuln_type.strip().lower()
-        vulns = vulns.filter(vuln_type=vt)
-        patterns = patterns.filter(vuln_type=vt)
+        vt_set = {vt} | set(VULN_TYPE_ALIASES.get(vt, []))
+        vulns = vulns.filter(vuln_type__in=vt_set)
+        patterns = patterns.filter(vuln_type__in=vt_set)
 
     if keyword:
         kw = keyword.strip()
@@ -38,14 +76,19 @@ def _search(vuln_type: str | None, keyword: str | None, limit: int) -> dict:
             Q(name__icontains=kw)
             | Q(vuln_type__icontains=kw)
             | Q(request_template__icontains=kw)
-            # technique 의 attack_metadata JSON 본문(applies_when, steps, examples 등) 까지 검색.
-            # JSONField __icontains는 Postgres serialized JSON text에 대한 LIKE.
             | Q(attack_metadata__icontains=kw)
             | Q(safety_notes__icontains=kw)
             | Q(tags__icontains=kw)
         )
 
-    patterns = patterns.order_by("-is_gold", "-times_succeeded", "-times_used")[:limit]
+    from django.db.models import Case, When, Value, IntegerField
+    patterns = patterns.annotate(
+        has_metadata=Case(
+            When(attack_metadata__isnull=False, then=Value(1)),
+            default=Value(0),
+            output_field=IntegerField(),
+        )
+    ).order_by("-has_metadata", "-is_gold", "-times_succeeded", "-times_used")[:limit]
 
     def _vuln_dict(v: VulnerabilityEntry) -> dict:
         return {
@@ -64,9 +107,10 @@ def _search(vuln_type: str | None, keyword: str | None, limit: int) -> dict:
         }
 
     def _pattern_dict(p: PayloadPattern) -> dict:
-        return {
+        d = {
             "pattern_id": str(p.pattern_id),
             "vuln_type": p.vuln_type,
+            "sub_technique": p.sub_technique,
             "name": p.name,
             "category": p.category,
             "safety_level": p.safety_level,
@@ -81,6 +125,9 @@ def _search(vuln_type: str | None, keyword: str | None, limit: int) -> dict:
             "is_gold": p.is_gold,
             "tags": p.tags,
         }
+        if p.attack_metadata:
+            d["attack_metadata"] = p.attack_metadata
+        return d
 
     vuln_list = [_vuln_dict(v) for v in vulns[:limit]]
     pat_list = [_pattern_dict(p) for p in patterns]
@@ -124,7 +171,9 @@ def _retrieve_similar(query: str, k: int, vuln_type: str | None) -> dict:
 
     qs = PayloadPattern.objects.filter(is_active=True).exclude(embedding=None)
     if vuln_type:
-        qs = qs.filter(vuln_type=vuln_type.strip().lower())
+        vt = vuln_type.strip().lower()
+        vt_set = {vt} | set(VULN_TYPE_ALIASES.get(vt, []))
+        qs = qs.filter(vuln_type__in=vt_set)
 
     try:
         from pgvector.django import CosineDistance
@@ -132,9 +181,10 @@ def _retrieve_similar(query: str, k: int, vuln_type: str | None) -> dict:
         qs = qs.annotate(distance=CosineDistance("embedding", vec)).order_by("distance")[:k]
         results = []
         for p in qs:
-            results.append({
+            entry = {
                 "pattern_id": str(p.pattern_id),
                 "vuln_type": p.vuln_type,
+                "sub_technique": p.sub_technique,
                 "name": p.name,
                 "category": p.category,
                 "safety_level": p.safety_level,
@@ -146,7 +196,10 @@ def _retrieve_similar(query: str, k: int, vuln_type: str | None) -> dict:
                 "tags": p.tags,
                 "distance": round(float(p.distance), 4),
                 "similarity": round(1.0 - float(p.distance), 4),
-            })
+            }
+            if p.attack_metadata:
+                entry["attack_metadata"] = p.attack_metadata
+            results.append(entry)
         logger.info(
             "retrieve_similar_patterns result: query=%r → %d patterns (top sim=%.4f)",
             query, len(results), results[0]["similarity"] if results else 0.0,
@@ -227,6 +280,7 @@ def _mutate_payload(seed_pattern_id: str, mutation_type: str, hint: str) -> dict
         vulnerability=seed.vulnerability,
         name=f"{seed.name} [{mt}]",
         vuln_type=seed.vuln_type,
+        sub_technique=seed.sub_technique,
         category=seed.category,
         request_template=new_template,
         matcher=seed.matcher,
@@ -328,13 +382,21 @@ def register(mcp):
         공격 페이로드를 만들기 전에 반드시 호출해서 기존 성공 패턴을 우선 사용하라.
 
         Args:
-            vuln_type: 예 "sqli", "xss", "idor", "ssrf", "lfi", "open_redirect", "cmdi"
+            vuln_type: 취약점 카테고리. 예:
+              Injection: "sqli", "nosqli", "xss", "cmdi", "ssti", "ldap_injection",
+                         "xpath_injection", "graphql"
+              File:      "lfi", "path_traversal", "file_upload", "xxe"
+              Server:    "ssrf", "rce", "deserialization", "http_smuggling", "race_condition"
+              Auth:      "idor", "access_control", "auth_bypass", "csrf", "jwt"
+              Client:    "prototype_pollution", "cors"
+              Other:     "open_redirect", "information_disclosure", "logic_flaw"
             keyword: title/description/template에서 부분 일치 검색
             limit: 반환 항목 수 (기본 10)
 
         Returns:
             {vulnerabilities: [...], patterns: [...]} JSON.
-            각 pattern은 request_template / matcher / safety_level / success_rate 포함.
+            각 pattern은 vuln_type / sub_technique / request_template /
+            attack_metadata (technique_steps_md, code_template) 포함.
         """
         try:
             result = await sync_to_async(_search, thread_sensitive=False)(

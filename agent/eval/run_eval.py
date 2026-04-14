@@ -99,6 +99,32 @@ def page(url: str) -> list[dict]:
 
 # ── matching ───────────────────────────────────────────────────
 
+_VULN_TYPE_CANONICAL: dict[str, str] = {
+    "command_injection": "cmdi",
+    "sql_injection": "sqli",
+    "nosql_injection": "nosqli",
+    "cross_site_scripting": "xss",
+    "stored_xss": "xss",
+    "reflected_xss": "xss",
+    "dom_xss": "xss",
+    "local_file_inclusion": "lfi",
+    "remote_file_inclusion": "rfi",
+    "directory_traversal": "path_traversal",
+    "server_side_template_injection": "ssti",
+    "code_injection": "rce",
+    "css_injection": "xss",
+    "upload": "file_upload",
+    "http_request_smuggling": "http_smuggling",
+    "jwt_attack": "jwt",
+    "open_redirect_or_path_injection": "open_redirect",
+}
+
+
+def normalize_vuln_type(vt: str) -> str:
+    vt = vt.strip().lower()
+    return _VULN_TYPE_CANONICAL.get(vt, vt)
+
+
 def normalize_path(endpoint: str) -> str:
     if not endpoint:
         return ""
@@ -161,7 +187,7 @@ def match_expected(
     # finding 단위로 path/vuln 추출
     finding_signals: list[tuple[str, str]] = []
     for f in findings:
-        vt = (f.get("vuln_type") or "").lower()
+        vt = normalize_vuln_type(f.get("vuln_type") or "")
         cand_id = str(f.get("candidate") or "")
         path = ""
         cand = cand_by_id.get(cand_id)
@@ -174,7 +200,7 @@ def match_expected(
 
     cand_signals: list[tuple[str, str]] = []
     for c in candidates:
-        vt = (c.get("vuln_type") or "").lower()
+        vt = normalize_vuln_type(c.get("vuln_type") or "")
         req_id = str(c.get("request") or "")
         rc = req_by_id.get(req_id)
         path = normalize_path(rc.get("endpoint") or "") if rc else ""
@@ -186,10 +212,11 @@ def match_expected(
     # 1차: finding 매칭 (full credit)
     for exp in expected:
         exp_path = normalize_path(exp.endpoint)
+        exp_vt = normalize_vuln_type(exp.vuln_type)
         for i, (p, vt) in enumerate(finding_signals):
             if i in matched_finding_idx:
                 continue
-            if p == exp_path and vt == exp.vuln_type.lower():
+            if p == exp_path and vt == exp_vt:
                 exp.matched = True
                 exp.matched_as = "finding"
                 matched_finding_idx.add(i)
@@ -200,10 +227,11 @@ def match_expected(
         if exp.matched:
             continue
         exp_path = normalize_path(exp.endpoint)
+        exp_vt = normalize_vuln_type(exp.vuln_type)
         for i, (p, vt) in enumerate(cand_signals):
             if i in matched_cand_idx:
                 continue
-            if p == exp_path and vt == exp.vuln_type.lower():
+            if p == exp_path and vt == exp_vt:
                 exp.matched = True
                 exp.matched_as = "candidate"
                 matched_cand_idx.add(i)
@@ -213,7 +241,7 @@ def match_expected(
     fn = len(expected) - tp
 
     # FP: expected에 없는 finding (path, vuln) 조합
-    expected_set = {(normalize_path(e.endpoint), e.vuln_type.lower()) for e in expected}
+    expected_set = {(normalize_path(e.endpoint), normalize_vuln_type(e.vuln_type)) for e in expected}
     extra: list[dict] = []
     for i, (p, vt) in enumerate(finding_signals):
         if i in matched_finding_idx:
@@ -239,7 +267,10 @@ def run_target(base: str, target: dict, use_mcp: bool, deadline: float) -> Targe
     t0 = time.time()
 
     # 1. create scan run
-    st, body = req("POST", f"{base}/api/scan-runs/", {"target_url": target["target_url"]})
+    create_payload: dict = {"target_url": target["target_url"]}
+    if target.get("source_root"):
+        create_payload["config"] = {"source_root": target["source_root"]}
+    st, body = req("POST", f"{base}/api/scan-runs/", create_payload)
     if st not in (200, 201) or not isinstance(body, dict) or not body.get("run_id"):
         res.status = f"create_failed: {st} {body}"
         return res
