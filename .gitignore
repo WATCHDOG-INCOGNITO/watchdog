@@ -43,8 +43,9 @@ _*.php
 # Watchdog CLI helper
 # watchdog_cli.py  # now tracked — core interface for external AI agents
 
-# Cursor IDE
-.cursor/
+# Cursor IDE (track rules for agent workflow, ignore the rest)
+.cursor/*
+!.cursor/rules/
 
 # CTF 문제 디렉터리 (별도 repo로 clone, 크기 큼 + .git submodule)
 codegate2023-fin/
