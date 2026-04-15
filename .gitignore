@@ -40,8 +40,8 @@ frontend/node_modules/
 _*.py
 _*.php
 
-# Watchdog CLI helper (generated for manual pentesting)
-watchdog_cli.py
+# Watchdog CLI helper
+# watchdog_cli.py  # now tracked — core interface for external AI agents
 
 # Cursor IDE
 .cursor/

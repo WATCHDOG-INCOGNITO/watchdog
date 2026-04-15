@@ -159,9 +159,15 @@ def _learn_from_finding(
     profile.last_scan_at = timezone.now()
     profile.save()
 
+    # Auto-embed so retrieve_similar finds this pattern immediately
+    embedded = False
+    if learned.embedding is None:
+        embedded = _embed_learned_pattern(learned)
+
     return {
         "learned_pattern_id": str(learned.pattern_id),
         "created": created,
+        "embedded": embedded,
         "host": host,
         "vuln_type": vuln_type,
         "endpoint": endpoint,
@@ -169,6 +175,36 @@ def _learn_from_finding(
         "profile_findings_count": profile.confirmed_findings_count,
         "profile_learned_count": profile.learned_patterns_count,
     }
+
+
+def _embed_learned_pattern(pattern) -> bool:
+    """Generate embedding for a single learned pattern."""
+    try:
+        from api.embedding_service import (
+            EMBEDDING_MODEL, embed_documents, is_available as embeddings_available,
+        )
+        if not embeddings_available():
+            return False
+    except ImportError:
+        return False
+
+    meta = pattern.attack_metadata or {}
+    text = "\n".join([
+        f"name: {meta.get('name', pattern.name)}",
+        f"vuln_type: {pattern.vuln_type}",
+        f"applies_when: {meta.get('applies_when', meta.get('novelty_reason', ''))}",
+        f"endpoint: {meta.get('endpoint', '')}",
+        f"payload: {(pattern.request_template or '')[:300]}",
+        f"tags: {', '.join(pattern.tags or [])}",
+    ])
+
+    vectors = embed_documents([text])
+    if vectors and vectors[0]:
+        pattern.embedding = vectors[0]
+        pattern.embedding_model = EMBEDDING_MODEL
+        pattern.save(update_fields=["embedding", "embedding_model"])
+        return True
+    return False
 
 
 def _learn_dead_end(
