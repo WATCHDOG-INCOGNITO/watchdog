@@ -1,323 +1,146 @@
 ---
-description: Watchdog Discovery Agent — AI가 MCP 에이전트와 동일한 공격 체인을 watchdog_cli.py를 통해 자율적으로 수행. 타겟 URL 기반 블랙박스/화이트박스 침투 테스트.
+description: Watchdog Discovery Agent — 핵심 루프 + 라이프사이클 + 필수 규칙. 상세 절차는 watchdog-checklist / watchdog-node-actions / watchdog-tools 참조.
 globs:
 alwaysApply: false
 ---
 
-# Watchdog Discovery Agent
+# Watchdog Discovery Agent (Core)
 
-You are an autonomous penetration testing agent. You replicate the exact same attack chain as the Watchdog MCP discovery-mode agent, but through the CLI wrapper (`watchdog_cli.py`) running inside the Docker container.
-
-## ⚠️ MANDATORY PROTOCOL — NEVER SKIP ⚠️
-
-These rules are ABSOLUTE. Violating ANY of them makes the scan useless.
-
-### Rule 1: EVERY action MUST be traced
-
-After EVERY logical step (recon, endpoint found, vuln test, exploit attempt, etc.), you MUST call `record_trace`. Maintain a `CALL_INDEX` counter starting at 1 and increment after each trace.
-
-```powershell
-echo '{"scan_run_id":"SCAN_ID","call_index":CALL_INDEX,"stage":"STAGE","model":"cursor-claude","prompt_preview":"WHAT_YOU_DID","response_preview":"WHAT_HAPPENED"}' | docker compose exec -T backend python watchdog_cli.py record_trace
-```
-
-Stages: `init`, `recon`, `source_analysis`, `endpoint_enum`, `vuln_test`, `exploit_chain`, `flag`, `complete`
-
-### Rule 2: EVERY discovery MUST become a node
-
-The moment you discover ANYTHING — an endpoint, a suspicious parameter, a clue, an error message — you MUST call `push_discovery` to create a child node BEFORE continuing investigation.
-
-```powershell
-echo '{"scan_run_id":"SCAN_ID","parent_node_id":"PARENT_ID","node_type":"TYPE","summary":"SUMMARY","endpoint":"ENDPOINT","vuln_type":"VULN","context":CONTEXT_JSON}' | docker compose exec -T backend python watchdog_cli.py push_discovery
-```
-
-### Rule 3: NEVER send an attack payload without searching KB first
-
-Before ANY payload attempt: `search_knowledge` → get pattern IDs → try payloads → `record_pattern_use`.
-
-### Rule 4: NEVER move on from a dead end silently
-
-If an investigation path fails: `mark_dead_end` + `learn_dead_end`. ALWAYS.
-
-### Rule 5: NEVER discover a credential without storing it
-
-Any password, token, key, cookie → `store_secret` IMMEDIATELY.
-
-## Environment
-
-| Component | Detail |
-|-----------|--------|
-| Backend | `watchdog-backend-1` (Docker) |
-| CLI | `python watchdog_cli.py <tool>` (inside container) |
-| Frontend | `http://localhost:3000` (Discovery Tree UI) |
-
-## CLI Pattern
+Queue-based discovery loop. MCP 도구는 `http://localhost:8889/sse`로 직접 호출. CLI 전용 도구(create_scan, create_root, complete_scan, stop_scan, fail_scan, record_trace)만 CLI 사용:
 
 ```powershell
 echo '<JSON>' | docker compose exec -T backend python watchdog_cli.py <tool_name>
 ```
 
-Always use `-T`. Single-line JSON for PowerShell.
+## Architecture — Orchestrated BFS Loop
 
-## STEP-BY-STEP EXECUTION TEMPLATE
+```
+scan_next → EXPLORE node → validate_node → finalize → scan_next → ...
+                                                           ↓
+                                              (queue empty) → scan_selfcheck → complete_scan
+```
 
-Below is the EXACT sequence you must follow. Each step shows the mandatory tool calls. `SCAN_ID`, `ROOT_ID`, etc. are variables you track throughout.
+**오케스트레이션 3종 도구가 루프를 제어한다. 직접 노드를 골라서 탐색하지 말 것.**
+
+### 필수 루프 (STEP 1 대체)
+```
+WHILE true:
+  1. scan_next(scan_run_id)
+     → action="EXPLORE"  → 해당 노드 탐색 시작
+     → action="RESUME"   → 미완료 노드 마저 진행
+     → action="COMPLETE" → 큐 비었음 → scan_selfcheck로 이동
+
+  2. update_node_status(node_id, "exploring")
+
+  3. 노드 타입별 작업 수행 (scan_next 출력의 step_2_work 참조)
+
+  4. validate_node(node_id)
+     → passed=true  → finalize (update_node_status + record_trace)
+     → passed=false → 빠진 작업 수행 후 다시 validate_node
+
+  5. scan_next로 돌아감
+```
+
+### 스캔 종료
+```
+scan_selfcheck(scan_run_id)
+  → passed=true  → complete_scan
+  → passed=false → errors 목록의 빠진 작업 수행 → 다시 scan_selfcheck
+```
+
+> ⚠️ **validate_node 통과 없이 노드를 finalize하지 말 것.**
+> ⚠️ **scan_selfcheck 통과 없이 complete_scan하지 말 것.**
+
+## Node Status Lifecycle
+
+```
+pending → exploring → explored / confirmed / dead_end
+```
+
+| 전환 | 조건 | 도구 |
+|------|------|------|
+| → pending | 발견 시 | `push_discovery` |
+| → exploring | 탐색 시작 | `update_node_status(exploring)` |
+| → explored | 취약점 없음 | `update_node_status(explored)` |
+| → confirmed | 취약점 확인 | `update_node_status(confirmed)` |
+| → dead_end | 모든 시도 실패 | `mark_dead_end(reason)` |
+
+## ScanRun Status Lifecycle
+
+| 전환 | 조건 | 도구 |
+|------|------|------|
+| → running | 스캔 생성 | `create_scan` |
+| → finished | 정상 완료 | `complete_scan` |
+| → stopped | 중단 | `stop_scan(reason)` |
+| → failed | 오류 | `fail_scan(error)` |
+
+**절대 `running` 상태로 방치하지 않는다.**
+
+## 10 MANDATORY RULES
+
+### R1: 큐 규율 — pending 먼저, 테스트 나중
+`push_discovery`로 노드를 먼저 등록한 후 테스트. 테스트 후 등록 금지.
+
+### R2: 한 번에 하나, 나머지는 push
+다수 발견 시 전부 pending으로 push → 하나만 exploring → 나머지는 다음 반복.
+
+### R3: 관대하게 push
+"Push discoveries generously — it's better to create nodes that turn out to be dead ends than to miss potential attack paths."
+
+### R4: 성공·실패 모두 기록
+- 성공: `create_finding` → `save_evidence` → `confirm_finding` + `learn_from_finding` + `record_pattern_use(true)`
+- 실패: `mark_dead_end` + `learn_dead_end` + `record_pattern_use(false)`
+
+### R5: KB 먼저 — 페이로드 전송 전 반드시 `search_knowledge`
+
+### R6: 자격증명 → 즉시 `store_secret`
+
+### R7: 매 단계마다 `record_trace` — **tool_calls 배열 필수**
+```json
+{
+  "tool_calls": ["http_request", "push_discovery", "analyze_endpoint"],
+  "stage": "recon|endpoint_mapping|vuln_test|exploit|report|complete"
+}
+```
+> ⚠️ tool_calls를 빈 배열로 두지 말 것
+
+### R8: 엔드포인트 발견 → 3단계 의무
+1. `push_discovery(node_type="endpoint")` — 큐 등록
+2. `analyze_endpoint(endpoint, method, params)` — 분석
+3. `create_candidate_manual(endpoint, vuln_type)` — 분석 결과에 따라 후보 등록
+
+### R9: 취약점 확인 → 7단계 의무
+1. `create_finding` → 2. `save_evidence` → 3. `confirm_finding` → 4. `learn_from_finding` → 5. `record_pattern_use(true)` → 6. `update_node_status(confirmed)` → 7. `store_secret` (credential 있으면)
+
+### R10: 매 페이로드마다 `record_pattern_use(succeeded=true/false)`
+
+### R11: 오케스트레이션 도구 의무 사용
+- **`scan_next`**: 다음 노드를 직접 고르지 말고 반드시 `scan_next`로 받는다.
+- **`validate_node`**: 노드 finalize 전에 반드시 통과해야 한다. 실패 시 빠진 작업 수행.
+- **`scan_selfcheck`**: `complete_scan` 전에 반드시 통과해야 한다. 실패 시 errors 해결.
+
+> 이 3개를 건너뛰면 이전 스캔처럼 노드 5개, dead_end 0개, analyze_endpoint 0건의 부실 스캔이 반복된다.
 
 ---
 
-### STEP 0: Initialize (MANDATORY — do this FIRST, always)
+## 상세 참조 규칙
 
-```
-1. create_scan(target_url, mode="discovery", budget=200) → save SCAN_ID
-2. recall_target(target_host) → check prior knowledge
-3. create_root(scan_run_id=SCAN_ID, target_url) → save ROOT_ID
-4. record_trace(scan_run_id=SCAN_ID, call_index=1, stage="init",
-     prompt_preview="Initializing scan on TARGET",
-     response_preview="scan=SCAN_ID root=ROOT_ID")
-```
-
-### STEP 1: Reconnaissance
-
-```
-1. http_request(url=TARGET) → observe headers, status, HTML
-2. update_target_profile(target_host, framework, server)
-3. add_scan_note(scan_run_id=SCAN_ID, topic="architecture", content="...")
-4. record_trace(call_index=2, stage="recon",
-     prompt_preview="Initial HTTP recon on TARGET",
-     response_preview="Server: X, Framework: Y, Found login form at /login")
-```
-
-If white-box:
-```
-5. list_source_tree → read_source → grep_source
-6. add_scan_note(topic="source_analysis", content="...")
-7. record_trace(call_index=3, stage="source_analysis", ...)
-```
-
-### STEP 2: Endpoint Discovery + Registration
-
-For EVERY endpoint you find — from HTML parsing, path probing, source code, etc.:
-
-```
-1. push_discovery(scan_run_id=SCAN_ID, parent_node_id=ROOT_ID,
-     node_type="endpoint", endpoint="/path", summary="Description",
-     context={"methods":["GET","POST"], "params":[...]})
-   → save ENDPOINT_NODE_ID
-
-2. record_trace(call_index=N, stage="endpoint_enum",
-     prompt_preview="Found endpoint: GET /path",
-     response_preview="Registered as node ENDPOINT_NODE_ID")
-```
-
-REPEAT for every endpoint. Do NOT batch — register each one as you find it.
-
-### STEP 3: Per-Endpoint Vulnerability Analysis
-
-For EACH endpoint node:
-
-```
-1. get_chain_context(node_id=ENDPOINT_NODE_ID)
-2. get_siblings(node_id=ENDPOINT_NODE_ID)
-3. analyze_endpoint(endpoint, method, params) → get vuln_types + score
-4. search_knowledge(vuln_type=SUSPECTED_TYPE) → get KB patterns
-5. recall_dead_ends(target_host, vuln_type, endpoint) → skip failed ones
-
-6. push_discovery(parent_node_id=ENDPOINT_NODE_ID,
-     node_type="vuln", vuln_type=TYPE, endpoint="/path",
-     summary="Suspected SQLi in ?id param",
-     context={"pattern_ids":["uuid1","uuid2"], "params":{"id":"1"}})
-   → save VULN_NODE_ID
-
-7. record_trace(call_index=N, stage="vuln_test",
-     prompt_preview="Analyzing /path for sqli, xss",
-     response_preview="KB has 5 patterns. Created vuln node VULN_NODE_ID")
-```
-
-If NO vulns suspected after inspection:
-```
-mark_dead_end(node_id=ENDPOINT_NODE_ID, reason="Clean after inspection")
-record_trace(...)
-```
-
-### STEP 4: Vulnerability Testing
-
-For EACH vuln node:
-
-```
-1. get_chain_context(node_id=VULN_NODE_ID)
-2. get_secrets(scan_run_id=SCAN_ID) → any creds from other exploits?
-3. search_knowledge(vuln_type=TYPE) → load patterns with attack_metadata
-
---- FOR EACH KB pattern: ---
-4. http_request(url with payload) → observe response
-5. oracle_*(verify) → deterministic check
-6. record_pattern_use(pattern_id=ID, succeeded=true/false)
-7. record_trace(call_index=N, stage="vuln_test",
-     prompt_preview="Testing pattern X on /path",
-     response_preview="oracle says confirmed=false")
---- END LOOP ---
-
-IF CONFIRMED:
-8. push_discovery(node_type="exploit_step", ...)  → save EXPLOIT_NODE_ID
-9. create_finding(scan_run_id, node_id, title, vuln_type, severity, summary)
-10. save_evidence(finding_id, kind="request", content=PAYLOAD, role="primary")
-11. learn_from_finding(finding_id, target_host, payload_used, is_novel, ...)
-12. record_trace(stage="vuln_test", prompt_preview="CONFIRMED: sqli on /path")
-
-IF ALL FAIL:
-8. mark_dead_end(node_id=VULN_NODE_ID, reason="All N patterns failed")
-9. learn_dead_end(target_host, endpoint, vuln_type, payload_used, reason)
-10. record_trace(stage="vuln_test", prompt_preview="Dead end: sqli on /path")
-```
-
-### STEP 5: Exploit Chaining
-
-For exploit_step nodes (multi-step attacks):
-
-```
-1. get_chain_context(node_id) → read FULL ancestor chain
-2. get_secrets(scan_run_id) → load ALL creds/tokens
-3. get_scan_notes(scan_run_id) → architecture context
-4. http_request with session_id → maintain cookies across steps
-5. store_secret if new credential found
-6. push_discovery(node_type="exploit_step") for next chain step
-7. record_trace(stage="exploit_chain", ...)
-```
-
-### STEP 6: Flag / Goal
-
-```
-1. push_discovery(node_type="flag", summary="FLAG: ...", context={"flag":"...","chain":"..."})
-2. create_finding(severity="critical", ...)
-3. save_evidence(finding_id, kind="request", content=FULL_CHAIN, role="primary")
-4. store_secret(key="flag", value="FLAG_VALUE", category="credential")
-5. learn_from_finding(is_novel=true/false)
-6. record_trace(stage="flag", prompt_preview="FLAG CAPTURED", response_preview="FLAG_VALUE")
-```
-
-### STEP 7: Complete
-
-```
-1. get_exploit_chains(scan_run_id) → review attack tree
-2. get_scan_summary(run_id) → severity breakdown
-3. complete_scan(scan_run_id)
-4. record_trace(stage="complete", prompt_preview="Scan complete", response_preview="X findings, Y nodes")
-```
+| 파일 | 내용 |
+|------|------|
+| `watchdog-checklist.mdc` | 행동별 필수 호출 체크리스트 + 완료 전 자가 점검 |
+| `watchdog-node-actions.mdc` | 노드 타입별 상세 절차 (target/endpoint/vuln/exploit_step/clue/flag) + Init/Finalize |
+| `watchdog-tools.mdc` | 75개 MCP 도구 레퍼런스 카탈로그 |
 
 ---
 
-## Available Tools (46)
+## ⚠️ 이전 스캔에서 반복된 실수 — 절대 반복 금지
 
-### KB (Knowledge Base)
-| Tool | Input | Purpose |
-|------|-------|---------|
-| `search_knowledge` | `{"vuln_type":"sqli","keyword":"","limit":10}` | Lookup vuln definitions + battle-tested payload patterns |
-| `retrieve_similar` | `{"query":"PHP SSRF file_get_contents","k":5}` | Semantic search by natural language |
-| `retrieve_cve_variants` | `{"cve_id":"CVE-2024-XXXX"}` | CVE variant patterns |
-| `mutate_payload` | `{"seed_pattern_id":"<ID>","mutation_type":"double_encoding","hint":""}` | WAF bypass variants |
-| `record_pattern_use` | `{"pattern_id":"<ID>","succeeded":true}` | Record success/failure (updates success_rate) |
-
-### Living KB (Host-Specific Memory)
-| Tool | Input | Purpose |
-|------|-------|---------|
-| `recall_target` | `{"target_host":"<HOST>"}` | Load prior knowledge (framework, WAF, learned patterns, dead ends) |
-| `recall_dead_ends` | `{"target_host":"<HOST>","vuln_type":"ssrf","endpoint":"/api"}` | Skip previously failed patterns |
-| `learn_from_finding` | `{"finding_id":"<ID>","target_host":"<HOST>","payload_used":"...","is_novel":true,"novelty_reason":"..."}` | Teach KB from confirmed vuln |
-| `learn_dead_end` | `{"target_host":"<HOST>","endpoint":"/api","vuln_type":"ssrf","payload_used":"...","reason":"WAF blocks"}` | Record failed attempt |
-| `update_target_profile` | `{"target_host":"<HOST>","framework":"Express.js","server":"nginx","fingerprint_json":"{}"}` | Store host fingerprint |
-
-### Source Code Analysis (White-Box)
-| Tool | Input | Purpose |
-|------|-------|---------|
-| `list_source_tree` | `{"root":"/sources/","max_depth":3}` | Directory tree listing |
-| `read_source` | `{"path":"/sources/.../app.js"}` | Read file contents |
-| `grep_source` | `{"pattern":"exec|eval|system","root":"/sources/","glob":"**/*.py","flags":"i"}` | Regex search |
-
-### Discovery Tree
-| Tool | Input | Purpose |
-|------|-------|---------|
-| `push_discovery` | `{"scan_run_id":"<ID>","parent_node_id":"<ID>","node_type":"endpoint","summary":"...","endpoint":"/api","vuln_type":"","context":{}}` | Create child node |
-| `get_chain_context` | `{"node_id":"<ID>"}` | Full ancestor chain (root→current) |
-| `mark_dead_end` | `{"node_id":"<ID>","reason":"..."}` | Mark node as dead end |
-| `get_siblings` | `{"node_id":"<ID>"}` | See sibling nodes (avoid duplication) |
-| `get_exploit_chains` | `{"scan_run_id":"<ID>"}` | Reconstruct full exploit chains |
-| `store_secret` | `{"scan_run_id":"<ID>","key":"admin_token","value":"...","category":"credential"}` | Store credential/token |
-| `get_secrets` | `{"scan_run_id":"<ID>"}` | Retrieve all stored secrets |
-| `add_scan_note` | `{"scan_run_id":"<ID>","topic":"architecture","content":"..."}` | Share observations |
-| `get_scan_notes` | `{"scan_run_id":"<ID>","topic":"architecture"}` | Read observations |
-
-### Scan Lifecycle
-| Tool | Input | Purpose |
-|------|-------|---------|
-| `create_scan` | `{"target_url":"<URL>","mode":"discovery","budget":200}` | Create new scan run |
-| `create_root` | `{"scan_run_id":"<ID>","target_url":"<URL>"}` | Create root node |
-| `create_finding` | `{"scan_run_id":"<ID>","node_id":"<ID>","title":"...","vuln_type":"sqli","severity":"critical","summary":"..."}` | Register finding |
-| `complete_scan` | `{"scan_run_id":"<ID>"}` | Mark scan complete |
-| `list_nodes` | `{"scan_run_id":"<ID>"}` | List all discovery nodes |
-
-### HTTP
-| Tool | Input | Purpose |
-|------|-------|---------|
-| `http_request` | `{"url":"<URL>","method":"GET","headers":{},"body":"","form":{},"session_id":""}` | HTTP request (session support) |
-
-### Oracle (Deterministic Verification)
-| Tool | Input | Purpose |
-|------|-------|---------|
-| `oracle_response_diff` | `{"baseline_url":"<URL>","payload_url":"<URL>","control_url":""}` | General response diff (novel lines) |
-| `oracle_sqli_boolean` | `{"url_true":"<URL>","url_false":"<URL>","url_baseline":""}` | Boolean-based SQLi verification |
-| `oracle_sqli_time` | `{"url_payload":"<URL>","url_baseline":"<URL>","expected_delay_ms":3000,"samples":3}` | Time-based SQLi verification |
-| `oracle_lfi` | `{"url":"<URL>"}` | LFI signature matching |
-| `oracle_ssrf` | `{"url":"<URL>"}` | SSRF signature matching |
-
-### Storage (Finding Management)
-| Tool | Input | Purpose |
-|------|-------|---------|
-| `confirm_finding` | `{"cand_id":"<ID>","severity":"high","title":"...","summary":"...","evidence_json":"[...]"}` | Confirm candidate → finding |
-| `dismiss_candidate` | `{"cand_id":"<ID>","reason":"false_positive"}` | Dismiss false positive |
-| `save_evidence` | `{"finding_id":"<ID>","kind":"request","content":"...","role":"primary"}` | Attach evidence to finding |
-| `get_finding` | `{"finding_id":"<ID>"}` | Get finding detail |
-| `get_scan_summary` | `{"run_id":"<ID>"}` | Severity/vuln_type counts + finding list |
-
-### Analysis (Candidate Management)
-| Tool | Input | Purpose |
-|------|-------|---------|
-| `analyze_endpoint` | `{"endpoint":"/api/login","method":"POST","params":"{}","run_id":"<ID>"}` | Rule-based vuln type scoring |
-| `list_candidates` | `{"run_id":"<ID>","status":"open","vuln_type":""}` | List candidate vulnerabilities |
-| `create_candidate_manual` | `{"run_id":"<ID>","endpoint":"/api","method":"GET","vuln_type":"sqli","params":"{}","hypothesis":"..."}` | Manually register candidate |
-
-### OOB (Out-of-Band Callbacks)
-| Tool | Input | Purpose |
-|------|-------|---------|
-| `oob_register_token` | `{"scan_run_id":"<ID>"}` | Get callback URL for blind attacks |
-| `oob_get_hits` | `{"token":"<TOKEN>","since_iso":"","limit":50}` | Poll for OOB callbacks |
-| `oob_clear_hits` | `{"token":"<TOKEN>"}` | Clear hits for retry |
-| `oob_wait_for_hit` | `{"token":"<TOKEN>","timeout_s":30,"poll_interval_s":2}` | Block until hit arrives |
-
-### LLM Trace
-| Tool | Input | Purpose |
-|------|-------|---------|
-| `record_trace` | `{"scan_run_id":"<ID>","call_index":1,"stage":"recon","model":"cursor-claude","prompt_preview":"...","response_preview":"..."}` | Log agent action |
-
-## Vuln Types (27)
-
-**Injection**: sqli, nosqli, xss, cmdi, ssti, ldap_injection, xpath_injection, graphql
-**File**: lfi, path_traversal, file_upload, xxe
-**Server**: ssrf, rce, deserialization, http_smuggling, race_condition
-**Auth**: idor, access_control, auth_bypass, csrf, jwt
-**Client**: prototype_pollution, cors
-**Other**: open_redirect, information_disclosure, logic_flaw
-
-## Chain Exploitation Strategy
-
-1. **Map attack surface**: web server, backend API, DB, internal services, protocols
-2. **Identify primitives**: read / write / execute / redirect
-3. **Combine**: SSRF → internal API → leaked creds → auth bypass → admin → RCE
-4. **Store + share**: credential → `store_secret`, architecture → `add_scan_note`
-5. **Push context**: every `exploit_step` gets ALL prior context in context_json
-
-### Common Chains
-- SSRF + LFI → internal file read
-- SQLi + file_read → secret extraction → auth bypass
-- Auth bypass + IDOR → cross-user data
-- Path traversal + config → credential → privilege escalation
-- Deserialization → RCE → shell
-- Race condition + TOCTOU → validation bypass
+1. 엔드포인트 발견 → push_discovery 안 함 → **R8 위반**
+2. 취약점 확인 → create_finding/save_evidence/confirm_finding 안 함 → **R9 위반**
+3. 페이로드 시도 → record_pattern_use 안 함 → **R10 위반**
+4. record_trace에 tool_calls 누락 → **R7 위반**
+5. analyze_endpoint / create_candidate_manual 미사용 → **R8 위반**
+6. CLI만 사용, MCP 미사용 → MCP 네이티브 호출 우선
+7. **BFS 루프 무시** → 노드 5개, dead_end 0개, 결과만 요약한 부실 트리 → **R1/R2/R3/R11 위반**
+8. **validate_node 없이 finalize** → 필수 호출 누락 방치 → **R11 위반**
+9. **scan_selfcheck 없이 complete_scan** → 누락된 채 스캔 종료 → **R11 위반**

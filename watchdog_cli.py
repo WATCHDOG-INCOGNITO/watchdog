@@ -208,7 +208,7 @@ def cmd_push_discovery(p):
         vuln_type=p.get("vuln_type", ""),
         summary=p.get("summary", ""),
         context=ctx,
-        status="explored",
+        status=p.get("status", "pending"),
     )
 
     result = {"node_id": str(node.node_id), "depth": depth}
@@ -277,6 +277,35 @@ def cmd_mark_dead_end(p):
     node.explored_at = timezone.now()
     node.save(update_fields=["status", "explored_at"])
     _json_out({"node_id": str(node.node_id), "status": "dead_end"})
+
+
+VALID_STATUSES = {"pending", "exploring", "explored", "dead_end", "confirmed"}
+
+
+def cmd_update_node_status(p):
+    node_id = p.get("node_id")
+    new_status = p.get("status", "")
+    if new_status not in VALID_STATUSES:
+        _json_out({"error": f"invalid status '{new_status}'. valid: {sorted(VALID_STATUSES)}"})
+        return
+    try:
+        node = DiscoveryNode.objects.get(node_id=node_id)
+    except DiscoveryNode.DoesNotExist:
+        _json_out({"error": f"node {node_id} not found"})
+        return
+
+    old_status = node.status
+    node.status = new_status
+    fields = ["status"]
+    if new_status == "exploring":
+        node.explored_at = timezone.now()
+        fields.append("explored_at")
+    node.save(update_fields=fields)
+    _json_out({
+        "node_id": str(node.node_id),
+        "old_status": old_status,
+        "new_status": new_status,
+    })
 
 
 def cmd_get_siblings(p):
@@ -410,14 +439,38 @@ def cmd_create_finding(p):
 
 
 def cmd_complete_scan(p):
+    from django.utils import timezone
     sr = ScanRun.objects.get(run_id=p["scan_run_id"])
-    sr.status = "completed"
-    sr.save(update_fields=["status"])
+    sr.status = "finished"
+    sr.finished_at = timezone.now()
+    sr.save(update_fields=["status", "finished_at"])
 
-    # Auto-export learned patterns to .md files
     exported = _auto_export_learned()
 
-    _json_out({"status": "completed", "auto_export": exported})
+    _json_out({"status": "finished", "finished_at": str(sr.finished_at), "auto_export": exported})
+
+
+def cmd_stop_scan(p):
+    """Mark a scan as stopped (user-initiated cancellation or interruption)."""
+    from django.utils import timezone
+    sr = ScanRun.objects.get(run_id=p["scan_run_id"])
+    sr.status = "stopped"
+    if not sr.finished_at:
+        sr.finished_at = timezone.now()
+    sr.error_log = p.get("reason", "User requested stop")
+    sr.save(update_fields=["status", "finished_at", "error_log"])
+    _json_out({"status": "stopped", "finished_at": str(sr.finished_at), "reason": sr.error_log})
+
+
+def cmd_fail_scan(p):
+    """Mark a scan as failed due to an error."""
+    from django.utils import timezone
+    sr = ScanRun.objects.get(run_id=p["scan_run_id"])
+    sr.status = "failed"
+    sr.finished_at = timezone.now()
+    sr.error_log = p.get("error", "Unknown error")
+    sr.save(update_fields=["status", "finished_at", "error_log"])
+    _json_out({"status": "failed", "finished_at": str(sr.finished_at), "error": sr.error_log})
 
 
 def _auto_export_learned():
@@ -919,6 +972,330 @@ def cmd_export_learned(p):
 
 
 # ═══════════════════════════════════════════════════════
+# Orchestration — BFS Loop Driver + Validator
+# ═══════════════════════════════════════════════════════
+
+_REQUIRED_ACTIONS = {
+    "target": {
+        "init": ["update_node_status(exploring)"],
+        "work": [
+            "http_request (initial recon)",
+            "update_target_profile",
+            "add_scan_note(topic=architecture)",
+            "EACH endpoint → push_discovery(node_type=endpoint) + analyze_endpoint + create_candidate_manual",
+        ],
+        "finalize": ["update_node_status(explored)", "record_trace"],
+    },
+    "endpoint": {
+        "init": ["update_node_status(exploring)"],
+        "work": [
+            "analyze_endpoint(endpoint, method, params)",
+            "EACH suspected vuln_type → push_discovery(node_type=vuln) + create_candidate_manual",
+            "IF no suspects → mark_dead_end",
+        ],
+        "finalize": ["update_node_status(explored|dead_end)", "record_trace"],
+    },
+    "vuln": {
+        "init": ["update_node_status(exploring)", "search_knowledge(vuln_type)", "recall_dead_ends"],
+        "work": [
+            "EACH payload → http_request + record_pattern_use(succeeded=T/F)",
+            "IF confirmed → create_finding + save_evidence + confirm_finding + learn_from_finding + store_secret(if cred) + push_discovery(exploit_step)",
+            "IF all failed → mark_dead_end + learn_dead_end",
+        ],
+        "finalize": ["update_node_status(confirmed|dead_end)", "record_trace"],
+    },
+    "exploit_step": {
+        "init": ["update_node_status(exploring)", "get_chain_context", "get_secrets"],
+        "work": [
+            "Execute exploit using chain context",
+            "EACH new discovery → push_discovery + analyze_endpoint(if endpoint) + create_candidate_manual",
+            "store_secret (if new cred found)",
+        ],
+        "finalize": ["update_node_status(confirmed|explored)", "record_trace"],
+    },
+    "clue": {
+        "init": ["update_node_status(exploring)"],
+        "work": [
+            "Investigate clue (http_request, source analysis)",
+            "IF useful → push_discovery(child node)",
+            "IF dead end → mark_dead_end",
+        ],
+        "finalize": ["update_node_status(explored|dead_end)", "record_trace"],
+    },
+    "flag": {
+        "init": ["update_node_status(exploring)"],
+        "work": [
+            "create_finding(severity=critical, title=Flag Captured)",
+            "save_evidence(finding_id, kind=response, content=FLAG)",
+            "confirm_finding(cand_id)",
+            "learn_from_finding(is_novel)",
+            "store_secret(key=flag, value=FLAG)",
+        ],
+        "finalize": ["update_node_status(confirmed)", "record_trace"],
+    },
+}
+
+
+def cmd_scan_next(p):
+    """BFS loop driver: pick next pending node, show required actions."""
+    sr = ScanRun.objects.get(run_id=p["scan_run_id"])
+
+    # Check if any node is currently "exploring" (in-progress)
+    exploring = DiscoveryNode.objects.filter(scan_run=sr, status="exploring").first()
+    if exploring:
+        actions = _REQUIRED_ACTIONS.get(exploring.node_type, {})
+        _json_out({
+            "action": "RESUME",
+            "message": f"Node {str(exploring.node_id)[:8]} is still 'exploring'. Finish it first.",
+            "node_id": str(exploring.node_id),
+            "node_type": exploring.node_type,
+            "depth": exploring.depth,
+            "summary": exploring.summary,
+            "required_work": actions.get("work", []),
+            "required_finalize": actions.get("finalize", []),
+        })
+        return
+
+    # Pick next pending node (BFS: lowest depth first, then oldest)
+    pending = DiscoveryNode.objects.filter(
+        scan_run=sr, status="pending"
+    ).order_by("depth", "created_at").first()
+
+    if not pending:
+        total = DiscoveryNode.objects.filter(scan_run=sr).count()
+        by_status = {}
+        for n in DiscoveryNode.objects.filter(scan_run=sr):
+            by_status[n.status] = by_status.get(n.status, 0) + 1
+
+        # If only root exists, initial recon hasn't been done yet
+        if total <= 1:
+            root = DiscoveryNode.objects.filter(scan_run=sr, depth=0).first()
+            actions = _REQUIRED_ACTIONS.get("target", {})
+            _json_out({
+                "action": "INIT_RECON",
+                "message": "Root exists but no endpoints pushed yet. Do initial recon on the target and push_discovery for all discovered endpoints.",
+                "root_id": str(root.node_id) if root else None,
+                "target_url": sr.target_url,
+                "step_1_work": actions.get("work", []),
+                "step_2_finalize": ["Push all endpoints as pending nodes, then call scan_next again."],
+                "reminder": "R3: Push generously. R8: Each endpoint needs push_discovery + analyze_endpoint + create_candidate_manual.",
+            })
+            return
+
+        findings = Finding.objects.filter(scan_run=sr).count()
+        _json_out({
+            "action": "COMPLETE",
+            "message": "Queue empty. Run scan_selfcheck then complete_scan.",
+            "total_nodes": total,
+            "by_status": by_status,
+            "findings": findings,
+        })
+        return
+
+    # Pick this node — show what to do
+    actions = _REQUIRED_ACTIONS.get(pending.node_type, {})
+    siblings = DiscoveryNode.objects.filter(
+        scan_run=sr, parent=pending.parent, status="pending"
+    ).count()
+
+    _json_out({
+        "action": "EXPLORE",
+        "message": f"Pick node {str(pending.node_id)[:8]} and start exploring.",
+        "node_id": str(pending.node_id),
+        "node_type": pending.node_type,
+        "depth": pending.depth,
+        "summary": pending.summary,
+        "parent_id": str(pending.parent_id)[:8] if pending.parent_id else None,
+        "pending_siblings": siblings - 1,
+        "step_1_init": actions.get("init", []),
+        "step_2_work": actions.get("work", []),
+        "step_3_finalize": actions.get("finalize", []),
+        "reminder": "Call update_node_status(exploring) FIRST, then do the work, then finalize.",
+    })
+
+
+def cmd_validate_node(p):
+    """Validate a node has all required tool calls before finalize."""
+    node = DiscoveryNode.objects.get(node_id=p["node_id"])
+    sr = node.scan_run
+    ntype = node.node_type
+    errors = []
+    warnings = []
+
+    # 1. Node must not be 'pending' — should be at least 'exploring'
+    if node.status == "pending":
+        errors.append("Node is still 'pending'. Call update_node_status(exploring) first.")
+
+    # 2. Check children exist (target/endpoint should have pushed children)
+    children = DiscoveryNode.objects.filter(scan_run=sr, parent=node).count()
+
+    if ntype == "target" and children == 0:
+        errors.append("R8: target node has 0 children. Must push_discovery for discovered endpoints.")
+
+    if ntype == "endpoint":
+        vuln_children = DiscoveryNode.objects.filter(
+            scan_run=sr, parent=node, node_type="vuln"
+        ).count()
+        if vuln_children == 0 and node.status != "dead_end":
+            warnings.append("Endpoint has 0 vuln children. If no suspects, use mark_dead_end.")
+
+    # 3. Check candidates exist for endpoint nodes (R8)
+    if ntype == "endpoint":
+        endpoint_str = node.endpoint or (node.context or {}).get("endpoint", "")
+        if not endpoint_str:
+            import re as _re
+            m = _re.search(r'((?:GET|POST|PUT|DELETE|PATCH)\s+)?(/\S+)', node.summary)
+            endpoint_str = m.group(2) if m else node.summary[:60]
+        cands = Candidate.objects.filter(scan_run=sr, features__endpoint__icontains=endpoint_str[:30]).count()
+        analyzed = RequestCatalog.objects.filter(scan_run=sr, endpoint__icontains=endpoint_str[:30]).count()
+        if analyzed == 0:
+            errors.append("R8: No analyze_endpoint found for this endpoint.")
+        if cands == 0 and node.status != "dead_end":
+            warnings.append("R8: No create_candidate_manual for this endpoint.")
+
+    # 4. Check findings for confirmed vuln nodes (R9)
+    if ntype == "vuln" and node.status == "confirmed":
+        findings = Finding.objects.filter(scan_run=sr).count()
+        if findings == 0:
+            errors.append("R9: Node is confirmed but no findings exist.")
+
+    # 5. Check dead_end has learn_dead_end (R4)
+    if node.status == "dead_end":
+        target_host = sr.target_url.split("//")[-1].rstrip("/") if sr.target_url else ""
+        dead_ends = DeadEnd.objects.filter(target_host__icontains=target_host[:20]).count()
+        if dead_ends == 0:
+            warnings.append("R4: No learn_dead_end recorded for this target.")
+
+    # 6. Check record_trace exists (R7)
+    traces = LLMTrace.objects.filter(scan_run=sr).count()
+    if traces == 0:
+        errors.append("R7: No record_trace found for this scan.")
+
+    # 7. Check secrets stored (R6) — only warn
+    secrets_count = len((sr.config or {}).get("_secrets", {}))
+
+    passed = len(errors) == 0
+    _json_out({
+        "node_id": str(node.node_id)[:8],
+        "node_type": ntype,
+        "status": node.status,
+        "children": children,
+        "passed": passed,
+        "errors": errors,
+        "warnings": warnings,
+        "stats": {
+            "children": children,
+            "traces": traces,
+            "secrets": secrets_count,
+        },
+        "verdict": "✅ OK to finalize" if passed else "❌ FIX ERRORS before finalize",
+    })
+
+
+def cmd_scan_selfcheck(p):
+    """Pre-complete_scan validation. Checks all rules are satisfied."""
+    sr = ScanRun.objects.get(run_id=p["scan_run_id"])
+    errors = []
+    warnings = []
+
+    all_nodes = list(DiscoveryNode.objects.filter(scan_run=sr))
+    target_url = sr.target_url or ""
+    target_host = target_url.split("//")[-1].rstrip("/") if target_url else ""
+
+    # 1. No pending nodes
+    pending = [n for n in all_nodes if n.status == "pending"]
+    if pending:
+        errors.append(f"PENDING nodes remain: {len(pending)} nodes. Explore or mark_dead_end them all.")
+        for n in pending[:5]:
+            errors.append(f"  - {str(n.node_id)[:8]} d{n.depth} {n.node_type} | {n.summary[:60]}")
+
+    # 2. No exploring nodes (stuck)
+    exploring = [n for n in all_nodes if n.status == "exploring"]
+    if exploring:
+        errors.append(f"EXPLORING nodes stuck: {len(exploring)} nodes. Finalize them.")
+        for n in exploring[:5]:
+            errors.append(f"  - {str(n.node_id)[:8]} d{n.depth} {n.node_type} | {n.summary[:60]}")
+
+    # 3. Endpoint count check
+    endpoints = [n for n in all_nodes if n.node_type == "endpoint"]
+    if len(endpoints) < 3:
+        warnings.append(f"Only {len(endpoints)} endpoint nodes. Did you push all discovered endpoints? (R3: push generously)")
+
+    # 4. Dead-end count check (should have some if testing was thorough)
+    dead_ends = [n for n in all_nodes if n.status == "dead_end"]
+    if len(dead_ends) == 0:
+        warnings.append("0 dead_end nodes. Were all attack attempts successful? If not, mark failures as dead_end. (R4)")
+
+    # 5. Findings check
+    findings = Finding.objects.filter(scan_run=sr)
+    confirmed_nodes = [n for n in all_nodes if n.status == "confirmed"]
+    if confirmed_nodes and findings.count() == 0:
+        errors.append("Confirmed nodes exist but 0 findings. Call create_finding for each. (R9)")
+
+    # 6. R8: analyze_endpoint coverage
+    analyzed = set(RequestCatalog.objects.filter(scan_run=sr).values_list("endpoint", flat=True))
+    ep_summaries = [n.summary for n in endpoints]
+    if endpoints and len(analyzed) == 0:
+        errors.append("R8: 0 analyze_endpoint calls found. Must analyze each endpoint.")
+
+    # 7. R10: record_pattern_use check
+    # Can't easily check without pattern-level tracking, so just check if any patterns were recorded
+    patterns_used = PayloadPattern.objects.filter(
+        target_host__icontains=target_host[:20],
+    ).count() if target_host else 0
+
+    # 8. R7: record_trace check
+    traces = LLMTrace.objects.filter(scan_run=sr).count()
+    if traces == 0:
+        errors.append("R7: 0 record_trace calls. Must record at least one per stage.")
+
+    # 9. Secrets check
+    secrets = (sr.config or {}).get("_secrets", {})
+
+    # 10. Candidates check
+    cands = Candidate.objects.filter(scan_run=sr)
+    open_cands = cands.filter(status="open").count()
+    if open_cands > 0:
+        warnings.append(f"{open_cands} candidates still 'open'. Confirm or dismiss them all.")
+
+    # 11. learn_dead_end check
+    learned_de = DeadEnd.objects.filter(target_host__icontains=target_host[:20]).count() if target_host else 0
+    if dead_ends and learned_de == 0:
+        errors.append("R4: dead_end nodes exist but no learn_dead_end recorded.")
+
+    # 12. Notes check
+    notes = (sr.config or {}).get("_notes", [])
+
+    passed = len(errors) == 0
+
+    by_status = {}
+    by_type = {}
+    for n in all_nodes:
+        by_status[n.status] = by_status.get(n.status, 0) + 1
+        by_type[n.node_type] = by_type.get(n.node_type, 0) + 1
+
+    _json_out({
+        "passed": passed,
+        "verdict": "✅ Ready for complete_scan" if passed else "❌ FIX ERRORS before complete_scan",
+        "errors": errors,
+        "warnings": warnings,
+        "stats": {
+            "total_nodes": len(all_nodes),
+            "by_status": by_status,
+            "by_type": by_type,
+            "findings": findings.count(),
+            "candidates": cands.count(),
+            "open_candidates": open_cands,
+            "traces": traces,
+            "secrets": len(secrets),
+            "notes": len(notes),
+            "dead_ends_learned": learned_de,
+            "endpoints_analyzed": len(analyzed),
+        },
+    })
+
+
+# ═══════════════════════════════════════════════════════
 # Tool registry
 # ═══════════════════════════════════════════════════════
 
@@ -941,6 +1318,7 @@ TOOLS = {
     "grep_source":            cmd_grep_source,
     # Discovery
     "push_discovery":         cmd_push_discovery,
+    "update_node_status":     cmd_update_node_status,
     "get_chain_context":      cmd_get_chain_context,
     "mark_dead_end":          cmd_mark_dead_end,
     "get_siblings":           cmd_get_siblings,
@@ -954,6 +1332,8 @@ TOOLS = {
     "create_root":            cmd_create_root,
     "create_finding":         cmd_create_finding,
     "complete_scan":          cmd_complete_scan,
+    "stop_scan":              cmd_stop_scan,
+    "fail_scan":              cmd_fail_scan,
     "list_nodes":             cmd_list_nodes,
     # HTTP
     "http_request":           cmd_http_request,
@@ -982,6 +1362,10 @@ TOOLS = {
     "record_trace":           cmd_record_trace,
     # Export
     "export_learned":         cmd_export_learned,
+    # Orchestration
+    "scan_next":              cmd_scan_next,
+    "validate_node":          cmd_validate_node,
+    "scan_selfcheck":         cmd_scan_selfcheck,
 }
 
 

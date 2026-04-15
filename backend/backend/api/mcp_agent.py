@@ -1504,6 +1504,51 @@ async def _explorer_worker(
                 f"{node.node_id}: {e}", exc_info=True,
             )
 
+        # ── Orchestrator validation: check compliance before finalize ──
+        node.refresh_from_db()
+        passed, violations = await sync_to_async(
+            lambda: _validate_node_compliance(node)
+        )()
+
+        if not passed:
+            logger.warning(
+                f"[{scan_run.run_id}] explorer[{name}] node {node.node_id} "
+                f"FAILED validation: {violations}"
+            )
+            fix_msg = (
+                f"⚠️ ORCHESTRATOR VALIDATION FAILED for node {node.node_id}.\n"
+                f"You MUST fix these violations before this node can be finalized:\n\n"
+                + "\n".join(f"- {v}" for v in violations)
+                + "\n\nFix them NOW. Call the required tools listed above."
+            )
+            try:
+                await _run_role_phase(
+                    scan_run, anthropic, f"explorer:{name}:fix",
+                    EXPLORER_PROMPT, tools, tool_router, fix_msg, acc,
+                    max_turns=VALIDATION_BUDGET,
+                )
+            except Exception as e:
+                logger.error(
+                    f"[{scan_run.run_id}] explorer[{name}] fix phase error: {e}",
+                    exc_info=True,
+                )
+
+            # Re-validate after fix attempt (log only, don't loop forever)
+            node.refresh_from_db()
+            passed2, violations2 = await sync_to_async(
+                lambda: _validate_node_compliance(node)
+            )()
+            if not passed2:
+                logger.warning(
+                    f"[{scan_run.run_id}] explorer[{name}] node {node.node_id} "
+                    f"still has violations after fix: {violations2}"
+                )
+            else:
+                logger.info(
+                    f"[{scan_run.run_id}] explorer[{name}] node {node.node_id} "
+                    f"PASSED validation after fix"
+                )
+
         await sync_to_async(
             lambda: _mark_node_explored(node)
         )()
@@ -1516,6 +1561,198 @@ def _mark_node_explored(node):
     DiscoveryNode.objects.filter(
         node_id=node.node_id, status="exploring",
     ).update(status="explored", explored_at=timezone.now())
+
+
+# ═══════════════════════════════════════════════════════
+# Orchestrator — Post-exploration compliance validation
+# ═══════════════════════════════════════════════════════
+
+VALIDATION_BUDGET = 6
+
+_NODE_REQUIREMENTS = {
+    "target": {
+        "must_have_children": True,
+        "min_children": 1,
+        "check_analyze_endpoint": False,
+        "check_record_pattern_use": False,
+    },
+    "endpoint": {
+        "must_have_children": False,
+        "min_children": 0,
+        "check_analyze_endpoint": True,
+        "check_record_pattern_use": False,
+    },
+    "vuln": {
+        "must_have_children": False,
+        "min_children": 0,
+        "check_analyze_endpoint": False,
+        "check_record_pattern_use": True,
+    },
+    "exploit_step": {
+        "must_have_children": False,
+        "min_children": 0,
+        "check_analyze_endpoint": False,
+        "check_record_pattern_use": False,
+    },
+    "clue": {
+        "must_have_children": False,
+        "min_children": 0,
+        "check_analyze_endpoint": False,
+        "check_record_pattern_use": False,
+    },
+}
+
+
+def _validate_node_compliance(node) -> tuple[bool, list[str]]:
+    """Check if a node's exploration meets mandatory rules.
+
+    Returns (passed, list_of_violations).
+    Runs synchronously — call from sync context or wrap with sync_to_async.
+    """
+    from api.models import (
+        DiscoveryNode, Candidate, Finding, RequestCatalog, DeadEnd,
+    )
+
+    violations = []
+    sr = node.scan_run
+    ntype = node.node_type
+    reqs = _NODE_REQUIREMENTS.get(ntype, {})
+
+    children = DiscoveryNode.objects.filter(scan_run=sr, parent=node)
+    child_count = children.count()
+
+    # R3/R8: target must push endpoint children
+    if reqs.get("must_have_children") and child_count < reqs.get("min_children", 1):
+        violations.append(
+            f"R8: {ntype} node must push child discoveries. "
+            f"Found {child_count} children, need >= {reqs.get('min_children', 1)}. "
+            f"Call push_discovery for each discovered endpoint/vuln."
+        )
+
+    # R8: endpoint should have analyze_endpoint
+    if reqs.get("check_analyze_endpoint"):
+        ep = node.endpoint or ""
+        if not ep:
+            import re
+            m = re.search(r'((?:GET|POST|PUT|DELETE|PATCH)\s+)?(/\S+)', node.summary)
+            if m:
+                ep = m.group(2)
+        analyzed = RequestCatalog.objects.filter(
+            scan_run=sr, endpoint__icontains=ep[:40],
+        ).exists() if ep else False
+        if not analyzed and ep:
+            violations.append(
+                f"R8: No analyze_endpoint found for endpoint '{ep}'. "
+                f"Call analyze_endpoint(endpoint=\"{ep}\", method=..., params=...)."
+            )
+
+    # Confirmed node must have a finding
+    if node.status == "confirmed":
+        has_finding = Finding.objects.filter(scan_run=sr).exists()
+        if not has_finding:
+            violations.append(
+                "R9: Node is confirmed but no finding exists. "
+                "Call create_finding + save_evidence + confirm_finding."
+            )
+
+    # Dead-end node should have learn_dead_end
+    if node.status == "dead_end":
+        from urllib.parse import urlparse
+        host = urlparse(sr.target_url or "").hostname or ""
+        has_learned = DeadEnd.objects.filter(
+            target_host__icontains=host[:30],
+            endpoint__icontains=(node.endpoint or "")[:30],
+        ).exists() if host else True
+        if not has_learned:
+            violations.append(
+                "R4: dead_end node without learn_dead_end. "
+                "Call learn_dead_end(target_host, endpoint, vuln_type, payloads_tried, reason)."
+            )
+
+    # Endpoint with no children and not dead_end → should be marked dead_end or have children
+    if ntype == "endpoint" and child_count == 0 and node.status != "dead_end":
+        violations.append(
+            "R3: Endpoint has 0 child vuln nodes and is not marked dead_end. "
+            "Either push_discovery(node_type='vuln') for suspected vulns, "
+            "or mark_dead_end if clean."
+        )
+
+    return len(violations) == 0, violations
+
+
+def _scan_selfcheck(scan_run) -> dict:
+    """Scan-level compliance check before completion.
+
+    Returns dict with 'passed', 'errors', 'warnings', 'stats'.
+    """
+    from api.models import (
+        DiscoveryNode, Candidate, Finding, RequestCatalog, DeadEnd,
+        LLMTrace,
+    )
+    from urllib.parse import urlparse
+
+    errors = []
+    warnings = []
+
+    all_nodes = list(DiscoveryNode.objects.filter(scan_run=scan_run))
+    host = urlparse(scan_run.target_url or "").hostname or ""
+
+    pending = [n for n in all_nodes if n.status == "pending"]
+    if pending:
+        errors.append(f"{len(pending)} pending nodes remain — explore or mark_dead_end.")
+
+    exploring = [n for n in all_nodes if n.status == "exploring"]
+    if exploring:
+        errors.append(f"{len(exploring)} exploring nodes stuck — finalize them.")
+
+    endpoints = [n for n in all_nodes if n.node_type == "endpoint"]
+    if len(endpoints) < 3:
+        warnings.append(f"Only {len(endpoints)} endpoint nodes. Push generously (R3).")
+
+    dead_ends = [n for n in all_nodes if n.status == "dead_end"]
+    if len(dead_ends) == 0 and len(endpoints) > 3:
+        warnings.append("0 dead_end nodes. Were all tests successful?")
+
+    confirmed_nodes = [n for n in all_nodes if n.status == "confirmed"]
+    findings_count = Finding.objects.filter(scan_run=scan_run).count()
+    if confirmed_nodes and findings_count == 0:
+        errors.append("Confirmed nodes exist but 0 findings (R9).")
+
+    analyzed = RequestCatalog.objects.filter(scan_run=scan_run).count()
+    if endpoints and analyzed == 0:
+        errors.append("R8: 0 analyze_endpoint calls.")
+
+    traces = LLMTrace.objects.filter(scan_run=scan_run).count()
+
+    open_cands = Candidate.objects.filter(scan_run=scan_run, status="open").count()
+    if open_cands > 5:
+        warnings.append(f"{open_cands} candidates still 'open'.")
+
+    learned_de = DeadEnd.objects.filter(
+        target_host__icontains=host[:30],
+    ).count() if host else 0
+
+    by_status = {}
+    for n in all_nodes:
+        by_status[n.status] = by_status.get(n.status, 0) + 1
+
+    return {
+        "passed": len(errors) == 0,
+        "errors": errors,
+        "warnings": warnings,
+        "stats": {
+            "total_nodes": len(all_nodes),
+            "confirmed": len(confirmed_nodes),
+            "dead_ends": len(dead_ends),
+            "endpoints": len(endpoints),
+            "findings": findings_count,
+            "candidates_open": open_cands,
+            "traces": traces,
+            "analyzed": analyzed,
+            "learned_dead_ends": learned_de,
+            **by_status,
+        },
+    }
 
 
 def _normalize_target_url(url: str) -> str:
@@ -1776,23 +2013,27 @@ async def _run_discovery_loop(
     done_event.set()
     await asyncio.gather(*workers, return_exceptions=True)
 
-    total_nodes = await sync_to_async(
-        lambda: DiscoveryNode.objects.filter(scan_run=scan_run).count()
+    # ── Orchestrator scan-level selfcheck ──
+    selfcheck_result = await sync_to_async(
+        lambda: _scan_selfcheck(scan_run)
     )()
-    confirmed = await sync_to_async(
-        lambda: DiscoveryNode.objects.filter(
-            scan_run=scan_run, status="confirmed",
-        ).count()
-    )()
-    dead_ends = await sync_to_async(
-        lambda: DiscoveryNode.objects.filter(
-            scan_run=scan_run, status="dead_end",
-        ).count()
-    )()
+    if selfcheck_result["errors"]:
+        logger.warning(
+            f"[{scan_run.run_id}] scan selfcheck FAILED: {selfcheck_result['errors']}"
+        )
+    else:
+        logger.info(
+            f"[{scan_run.run_id}] scan selfcheck PASSED"
+        )
+
+    total_nodes = selfcheck_result["stats"]["total_nodes"]
+    confirmed = selfcheck_result["stats"].get("confirmed", 0)
+    dead_ends = selfcheck_result["stats"].get("dead_ends", 0)
 
     logger.info(
         f"[{scan_run.run_id}] discovery tree: "
-        f"total={total_nodes}, confirmed={confirmed}, dead_ends={dead_ends}"
+        f"total={total_nodes}, confirmed={confirmed}, dead_ends={dead_ends}, "
+        f"selfcheck={'PASS' if not selfcheck_result['errors'] else 'FAIL'}"
     )
 
     from watchdog_mcp.tools_discovery import build_exploit_chains
