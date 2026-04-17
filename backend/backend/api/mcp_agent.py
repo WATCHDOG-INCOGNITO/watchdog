@@ -2237,24 +2237,44 @@ def _normalize_target_url(url: str) -> str:
     ))
 
 
-def _gather_previous_knowledge(target_url: str, current_run_id: str) -> dict | None:
-    """Find the most recent completed scan for the same target and extract useful nodes."""
+def _gather_previous_knowledge(
+    target_url: str,
+    current_run_id: str,
+    resume_from: str = "",
+) -> dict | None:
+    """Find a previous scan and extract useful nodes for cold-start avoidance.
+
+    resume_from:
+      - "off"        → 자동 resume 끔. None 반환 (신규 cold scan).
+      - "<run_id>"   → 그 특정 scan 에서 가져옴 (target 일치 무관).
+      - 미지정/"auto"→ 같은 target_url 의 최근 finished/failed scan 자동 탐지 (기본).
+    """
     from api.models import DiscoveryNode
 
-    normalized = _normalize_target_url(target_url)
-    candidates = (
-        ScanRun.objects
-        .filter(status__in=["finished", "failed"])
-        .exclude(run_id=current_run_id)
-        .order_by("-created_at")[:10]
-    )
-    prev_run = None
-    for run in candidates:
-        if _normalize_target_url(run.target_url) == normalized:
-            prev_run = run
-            break
-    if not prev_run:
+    rf = (resume_from or "").strip().lower()
+    if rf == "off":
         return None
+
+    prev_run = None
+    if resume_from and rf not in ("", "auto"):
+        # 명시적 run_id (UUID 형태). target_url 일치 안 해도 강제 resume.
+        prev_run = ScanRun.objects.filter(run_id=resume_from).exclude(run_id=current_run_id).first()
+        if not prev_run:
+            return None
+    else:
+        normalized = _normalize_target_url(target_url)
+        recent = (
+            ScanRun.objects
+            .filter(status__in=["finished", "failed"])
+            .exclude(run_id=current_run_id)
+            .order_by("-created_at")[:10]
+        )
+        for run in recent:
+            if _normalize_target_url(run.target_url) == normalized:
+                prev_run = run
+                break
+        if not prev_run:
+            return None
 
     prev_nodes = DiscoveryNode.objects.filter(scan_run=prev_run).order_by("depth", "created_at")
     if not prev_nodes.exists():
@@ -2274,12 +2294,14 @@ def _gather_previous_knowledge(target_url: str, current_run_id: str) -> dict | N
             "status": node.status,
             "depth": node.depth,
         }
-        if node.node_type == "endpoint" and node.status != "dead_end":
+        # status=dead_end 가 type 보다 우선. node_type='vuln' 이어도 status=dead_end 면
+        # dead_end 로 분류해야 다음 scan 에서 dead_end 노드로 seeding (회피).
+        if node.status == "dead_end" or node.node_type == "dead_end":
+            dead_ends.append(entry)
+        elif node.node_type == "endpoint":
             endpoints.append(entry)
         elif node.node_type == "vuln":
             vulns.append(entry)
-        elif node.node_type == "dead_end" or node.status == "dead_end":
-            dead_ends.append(entry)
         elif node.node_type in ("clue", "exploit_step"):
             clues.append(entry)
 
@@ -2297,17 +2319,25 @@ def _gather_previous_knowledge(target_url: str, current_run_id: str) -> dict | N
 
 SEED_BUDGET_RATIO = 0.3  # max 30% of DISCOVERY_MAX_NODES for seeded nodes
 
-def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> int:
-    """Seed endpoint + re-verify nodes from previous scan results."""
+def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
+    """Seed endpoint + re-verify + dead_end + clue nodes from previous scan results.
+
+    Returns: {"endpoints": N, "vulns": N, "dead_ends": N, "clues": N, "total": N}
+    """
     from api.models import DiscoveryNode
     from watchdog_mcp.tools_discovery import DISCOVERY_MAX_NODES
 
     seed_cap = int(DISCOVERY_MAX_NODES * SEED_BUDGET_RATIO)
-    seeded = 0
+    counts = {"endpoints": 0, "vulns": 0, "dead_ends": 0, "clues": 0}
     endpoint_node_map = {}
+    prev_run_id = prev_knowledge.get("prev_run_id", "")
 
+    def _seeded_total() -> int:
+        return sum(counts.values())
+
+    # 1) endpoint nodes — pending 으로 push (worker 가 다시 탐색 + 새 vuln 발견 가능)
     for ep in prev_knowledge.get("endpoints", []):
-        if seeded >= seed_cap:
+        if _seeded_total() >= seed_cap:
             break
         if not ep.get("endpoint"):
             continue
@@ -2320,16 +2350,17 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> int:
             vuln_type="",
             summary=f"[seeded] {ep['summary'][:200]}",
             context={
-                "seeded_from": prev_knowledge.get("prev_run_id", ""),
+                "seeded_from": prev_run_id,
                 "prev_status": ep.get("status", ""),
             },
             status="pending",
         )
         endpoint_node_map[ep["endpoint"]] = ep_node
-        seeded += 1
+        counts["endpoints"] += 1
 
+    # 2) vuln nodes — explored/confirmed 만 recheck=True 로 push (패치 여부 확인)
     for vuln in prev_knowledge.get("vulns", []):
-        if seeded >= seed_cap:
+        if _seeded_total() >= seed_cap:
             break
         if vuln.get("status") not in ("explored", "confirmed"):
             continue
@@ -2344,16 +2375,73 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> int:
             vuln_type=vuln.get("vuln_type", ""),
             summary=f"[re-verify] {vuln['summary'][:200]}",
             context={
-                "seeded_from": prev_knowledge.get("prev_run_id", ""),
+                "seeded_from": prev_run_id,
                 "recheck": True,
                 "prev_status": vuln.get("status", ""),
                 "action": "re-verify this vuln — it was successful before but may be patched now",
             },
             status="pending",
         )
-        seeded += 1
+        counts["vulns"] += 1
 
-    return seeded
+    # 3) dead_end nodes — status=dead_end 로 직접 push.
+    # worker pick_next_node 가 pending/exploring 만 잡으니 dead_end 는 자동 skip.
+    # 동시에 트리에 시각적으로 박혀 있어서 LLM/사람이 "이건 이미 막혔다" 알 수 있고,
+    # check_payload_dedup / recall_dead_ends 의 매칭 정확도도 높아짐.
+    from django.utils import timezone as _tz
+    for de in prev_knowledge.get("dead_ends", []):
+        if _seeded_total() >= seed_cap:
+            break
+        ep = de.get("endpoint", "")
+        if not ep:
+            continue
+        parent = endpoint_node_map.get(ep, root_node)
+        DiscoveryNode.objects.create(
+            scan_run=scan_run,
+            parent=parent,
+            depth=parent.depth + 1,
+            node_type="vuln",
+            endpoint=ep,
+            vuln_type=de.get("vuln_type", ""),
+            summary=f"[prev dead_end] {de['summary'][:200]}",
+            context={
+                "seeded_from": prev_run_id,
+                "prev_dead_end": True,
+                "skip_reason": de.get("summary", "")[:300],
+            },
+            status="dead_end",
+            explored_at=_tz.now(),
+        )
+        counts["dead_ends"] += 1
+
+    # 4) clue / exploit_step — 부분 chain 정보 보존. status=pending 으로 push 해
+    # worker 가 follow-up 가능. 단 깊이 2 이상이면 적절한 부모 없을 수 있어 root 자식.
+    for cl in prev_knowledge.get("clues", []):
+        if _seeded_total() >= seed_cap:
+            break
+        ep = cl.get("endpoint", "")
+        parent = endpoint_node_map.get(ep, root_node)
+        nt = cl.get("node_type") or "clue"
+        if nt not in ("clue", "exploit_step"):
+            continue
+        DiscoveryNode.objects.create(
+            scan_run=scan_run,
+            parent=parent,
+            depth=parent.depth + 1,
+            node_type=nt,
+            endpoint=ep,
+            vuln_type=cl.get("vuln_type", ""),
+            summary=f"[prev {nt}] {cl['summary'][:200]}",
+            context={
+                "seeded_from": prev_run_id,
+                "prev_status": cl.get("status", ""),
+            },
+            status="pending",
+        )
+        counts["clues"] += 1
+
+    counts["total"] = _seeded_total()
+    return counts
 
 
 async def _run_discovery_loop(
@@ -2388,17 +2476,23 @@ async def _run_discovery_loop(
     if scan_config.get("source_root"):
         root_context["source_root"] = scan_config["source_root"]
 
+    resume_from = (scan_config.get("resume_from") or "").strip()
     prev_knowledge = await sync_to_async(_gather_previous_knowledge)(
-        scan_run.target_url, str(scan_run.run_id),
+        scan_run.target_url, str(scan_run.run_id), resume_from,
     )
     if prev_knowledge:
         root_context["previous_scan"] = prev_knowledge
         logger.info(
-            f"[{scan_run.run_id}] seeded with previous knowledge: "
-            f"{len(prev_knowledge.get('endpoints', []))} endpoints, "
-            f"{len(prev_knowledge.get('vulns', []))} vulns, "
-            f"{len(prev_knowledge.get('dead_ends', []))} dead_ends"
+            f"[{scan_run.run_id}] seeded with previous knowledge "
+            f"(resume_from={resume_from or 'auto'}): "
+            f"prev_run={prev_knowledge.get('prev_run_id')} "
+            f"endpoints={len(prev_knowledge.get('endpoints', []))} "
+            f"vulns={len(prev_knowledge.get('vulns', []))} "
+            f"dead_ends={len(prev_knowledge.get('dead_ends', []))} "
+            f"clues={len(prev_knowledge.get('clues', []))}"
         )
+    elif resume_from.lower() == "off":
+        logger.info(f"[{scan_run.run_id}] resume_from=off → cold scan (no prev seeding)")
 
     root_node = await sync_to_async(DiscoveryNode.objects.create)(
         scan_run=scan_run,
@@ -2412,15 +2506,17 @@ async def _run_discovery_loop(
         status="pending",
     )
 
-    seeded_count = 0
+    seeded = {"total": 0}
     if prev_knowledge:
-        seeded_count = await sync_to_async(_seed_from_previous)(
+        seeded = await sync_to_async(_seed_from_previous)(
             scan_run, root_node, prev_knowledge,
         )
 
     logger.info(
-        f"[{scan_run.run_id}] root node created: {root_node.node_id}, "
-        f"seeded {seeded_count} nodes from previous scan"
+        f"[{scan_run.run_id}] root node created: {root_node.node_id}, seeded "
+        f"total={seeded.get('total', 0)} "
+        f"endpoints={seeded.get('endpoints', 0)} vulns={seeded.get('vulns', 0)} "
+        f"dead_ends={seeded.get('dead_ends', 0)} clues={seeded.get('clues', 0)}"
     )
 
     done_event = asyncio.Event()
