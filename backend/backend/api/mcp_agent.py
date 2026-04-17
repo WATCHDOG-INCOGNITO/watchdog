@@ -1234,6 +1234,18 @@ A target (root) node: target_url, optional source_root.
    → 그 endpoint 들은 push_discovery 로 바로 시드 (정찰 단계 최소화). 추가
    recall_endpoint_specs(host) 로 더 자세한 정보 (params/sinks/suspected_vuln_types)
    조회 가능.
+
+   **CHECK ROOT CONTEXT — credentials_available**: 사용자가 로그인 정보를
+   제공했으면 root.context.credentials_available 에 type 표시. get_secrets()
+   로 실제 값 회상:
+     · type=form  → login_url + username + password (+ field names) 회상 →
+       http_session_request(POST login_url, form_json={username_field:USR,
+       password_field:PWD}, session_id="<scan-id>-auth") 로 로그인 →
+       이후 모든 worker 가 같은 session_id 로 보호 endpoint 접근
+     · type=bearer → bearer_token → 모든 요청에 Authorization: Bearer <T> 헤더
+     · type=cookie → cookies dict → 모든 요청에 Cookie 헤더 attach
+     · type=basic  → username/password → HTTP Basic Auth header
+   credentials 없으면 unauth 영역만 정찰. 있으면 protected endpoint 도 push.
 2. (white-box) list_source_tree → read_source / grep_source on routes/handlers.
 3. (black-box) browser_navigate + browser_extract_api_endpoints + browser_get_dom.
 4. update_target_profile with framework/server/WAF when identified.
@@ -2245,6 +2257,57 @@ def _persist_selfcheck(scan_run, result: dict) -> None:
     scan_run.save(update_fields=["config"])
 
 
+def _seed_credentials(scan_run, creds: dict) -> None:
+    """사용자 제공 credentials 를 ScanRun.config["_secrets"] 에 저장.
+
+    store_secret 도구와 같은 storage layer (config["_secrets"] dict) 사용 →
+    LLM 의 get_secrets() 호출 시 그대로 회상.
+
+    type:
+      form    — login_url + username + password (+ optional username_field/password_field)
+      bearer  — token (Authorization: Bearer ... 헤더로 attach)
+      cookie  — cookies dict
+      basic   — username + password (HTTP Basic Auth)
+    """
+    import json as _json
+    from django.utils import timezone
+    ctype = (creds.get("type") or "").strip().lower()
+    if ctype not in ("form", "bearer", "cookie", "basic"):
+        logger.warning(f"[{scan_run.run_id}] unknown credential type: {ctype}")
+        return
+
+    config = scan_run.config or {}
+    secrets = dict(config.get("_secrets") or {})
+    now = str(timezone.now())
+
+    def _put(key: str, value, category: str = "credential") -> None:
+        secrets[key] = {
+            "value": value if isinstance(value, str) else _json.dumps(value, ensure_ascii=False),
+            "category": category,
+            "stored_at": now,
+            "source": "user_provided",
+        }
+
+    _put("auth_type", ctype, category="config")
+    if ctype == "form":
+        if creds.get("login_url"): _put("login_url", creds["login_url"], category="config")
+        if creds.get("username"):  _put("username", creds["username"])
+        if creds.get("password"):  _put("password", creds["password"])
+        if creds.get("username_field"): _put("username_field", creds["username_field"], category="config")
+        if creds.get("password_field"): _put("password_field", creds["password_field"], category="config")
+    elif ctype == "bearer":
+        if creds.get("token"): _put("bearer_token", creds["token"])
+    elif ctype == "cookie":
+        if creds.get("cookies"): _put("cookies", creds["cookies"])
+    elif ctype == "basic":
+        if creds.get("username"): _put("username", creds["username"])
+        if creds.get("password"): _put("password", creds["password"])
+
+    config["_secrets"] = secrets
+    scan_run.config = config
+    scan_run.save(update_fields=["config"])
+
+
 def _normalize_target_url(url: str) -> str:
     """Normalize target URL for comparison: lowercase scheme+host, strip trailing slash."""
     from urllib.parse import urlparse, urlunparse
@@ -2497,6 +2560,24 @@ async def _run_discovery_loop(
     root_context = {"target_url": scan_run.target_url}
     if scan_config.get("source_root"):
         root_context["source_root"] = scan_config["source_root"]
+
+    # 사용자 제공 credentials 자동 처리 — store_secret 으로 박아 worker 가
+    # get_secrets 로 회상 + RouteMap prompt 에 hint 주입.
+    creds = scan_config.get("credentials") or {}
+    if isinstance(creds, dict) and creds.get("type"):
+        await sync_to_async(_seed_credentials)(scan_run, creds)
+        root_context["credentials_available"] = {
+            "type": creds.get("type"),
+            "note": (
+                "User-provided credentials are stored via get_secrets. "
+                "Login first (form: POST login_url with username/password fields, "
+                "or attach Authorization/Cookie headers for bearer/cookie/basic), "
+                "then explore protected endpoints with http_session_request."
+            ),
+        }
+        logger.info(
+            f"[{scan_run.run_id}] user credentials loaded: type={creds.get('type')}"
+        )
 
     resume_from = (scan_config.get("resume_from") or "").strip()
     prev_knowledge = await sync_to_async(_gather_previous_knowledge)(

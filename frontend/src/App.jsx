@@ -513,6 +513,53 @@ function NewScanModal({ onClose, onCreated }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
+  // 로그인 정보 (선택) — type/form 별 동적 입력
+  const [showAuth, setShowAuth] = useState(false);
+  const [authType, setAuthType] = useState("form");
+  const [loginUrl, setLoginUrl] = useState("");
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [usernameField, setUsernameField] = useState("username");
+  const [passwordField, setPasswordField] = useState("password");
+  const [bearerToken, setBearerToken] = useState("");
+  const [cookiesText, setCookiesText] = useState("");
+
+  function buildCredentials() {
+    if (!showAuth) return null;
+    const t = authType;
+    if (t === "form") {
+      if (!authUsername || !authPassword) return null;
+      const c = { type: "form", username: authUsername, password: authPassword };
+      if (loginUrl.trim()) c.login_url = loginUrl.trim();
+      if (usernameField !== "username") c.username_field = usernameField;
+      if (passwordField !== "password") c.password_field = passwordField;
+      return c;
+    }
+    if (t === "bearer") {
+      if (!bearerToken.trim()) return null;
+      return { type: "bearer", token: bearerToken.trim() };
+    }
+    if (t === "cookie") {
+      if (!cookiesText.trim()) return null;
+      // "k=v; k2=v2" 형식 또는 JSON 둘 다 허용
+      const txt = cookiesText.trim();
+      try {
+        if (txt.startsWith("{")) return { type: "cookie", cookies: JSON.parse(txt) };
+      } catch { /* fall through */ }
+      const cookies = {};
+      for (const part of txt.split(";")) {
+        const [k, ...rest] = part.trim().split("=");
+        if (k && rest.length) cookies[k.trim()] = rest.join("=").trim();
+      }
+      return Object.keys(cookies).length ? { type: "cookie", cookies } : null;
+    }
+    if (t === "basic") {
+      if (!authUsername || !authPassword) return null;
+      return { type: "basic", username: authUsername, password: authPassword };
+    }
+    return null;
+  }
+
   async function handleSubmit() {
     if (!targetUrl.trim()) return;
     setSubmitting(true);
@@ -521,6 +568,9 @@ function NewScanModal({ onClose, onCreated }) {
     try {
       const config = { mode: "mcp" };
       if (forceSpa) config.force_spa = true;
+
+      const creds = buildCredentials();
+      if (creds) config.credentials = creds;
 
       const created = await apiPost("/api/scan-runs/", {
         target_url: targetUrl.trim(),
@@ -566,6 +616,94 @@ function NewScanModal({ onClose, onCreated }) {
           <input type="checkbox" checked={forceSpa} onChange={(event) => setForceSpa(event.target.checked)} />
           <span>SPA 모드 강제 사용</span>
         </label>
+
+        <label className="checkbox-row">
+          <input type="checkbox" checked={showAuth} onChange={(e) => setShowAuth(e.target.checked)} />
+          <span>로그인 정보 추가 (선택) — 인증 후 endpoint 도 정찰</span>
+        </label>
+
+        {showAuth ? (
+          <div style={{
+            marginTop: 8, padding: 12, border: "1px solid #d3dae4",
+            borderRadius: 6, background: "#f7f9fc",
+          }}>
+            <label className="field">
+              <span>인증 방식</span>
+              <select value={authType} onChange={(e) => setAuthType(e.target.value)}>
+                <option value="form">Form login (POST username/password)</option>
+                <option value="bearer">Bearer token (Authorization 헤더)</option>
+                <option value="cookie">Cookie (이미 로그인된 세션)</option>
+                <option value="basic">HTTP Basic Auth</option>
+              </select>
+            </label>
+
+            {authType === "form" ? (
+              <>
+                <label className="field">
+                  <span>로그인 URL (선택 — 미지정 시 LLM 이 자동 탐색)</span>
+                  <input value={loginUrl} onChange={(e) => setLoginUrl(e.target.value)}
+                    placeholder="http://target/login or /api/auth/login" />
+                </label>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <label className="field">
+                    <span>username 필드명</span>
+                    <input value={usernameField} onChange={(e) => setUsernameField(e.target.value)}
+                      placeholder="email / username / id" />
+                  </label>
+                  <label className="field">
+                    <span>password 필드명</span>
+                    <input value={passwordField} onChange={(e) => setPasswordField(e.target.value)}
+                      placeholder="password / pw" />
+                  </label>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <label className="field">
+                    <span>username</span>
+                    <input value={authUsername} onChange={(e) => setAuthUsername(e.target.value)}
+                      placeholder="admin@example.com" />
+                  </label>
+                  <label className="field">
+                    <span>password</span>
+                    <input type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} />
+                  </label>
+                </div>
+              </>
+            ) : null}
+
+            {authType === "bearer" ? (
+              <label className="field">
+                <span>Bearer token</span>
+                <input type="password" value={bearerToken} onChange={(e) => setBearerToken(e.target.value)}
+                  placeholder="eyJhbGciOiJIUzI1NiIs..." />
+              </label>
+            ) : null}
+
+            {authType === "cookie" ? (
+              <label className="field">
+                <span>Cookies (key=value; key2=value2 또는 JSON)</span>
+                <input value={cookiesText} onChange={(e) => setCookiesText(e.target.value)}
+                  placeholder='session=abc123; csrf=xyz   또는   {"session":"abc123"}' />
+              </label>
+            ) : null}
+
+            {authType === "basic" ? (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                <label className="field">
+                  <span>username</span>
+                  <input value={authUsername} onChange={(e) => setAuthUsername(e.target.value)} />
+                </label>
+                <label className="field">
+                  <span>password</span>
+                  <input type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} />
+                </label>
+              </div>
+            ) : null}
+
+            <div style={{ marginTop: 6, fontSize: "0.8em", opacity: 0.6 }}>
+              ⚠ 입력값은 ScanRun.config 평문 저장. 운영 환경에선 별도 secret store 권장.
+            </div>
+          </div>
+        ) : null}
 
         <div className="modal-actions" style={{ marginTop: 18 }}>
           <button type="button" className="ghost-button" onClick={onClose}>취소</button>
