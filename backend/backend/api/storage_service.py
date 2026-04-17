@@ -80,7 +80,8 @@ def confirm_candidate(cand_id, severity=None, title=None, summary=None,
         # 2b. Discovery node 연동: 연결된 노드가 있으면 confirmed로 승격.
         # features.discovery_node_id 가 없으면 endpoint+vuln_type 매칭으로 fallback —
         # create_candidate_manual 이 link 안 했던 candidate 도 자동으로 노드 상태 회복.
-        from api.models import DiscoveryNode
+        from api.models import DiscoveryNode, EndpointSpec
+        from urllib.parse import urlparse as _urlparse
         disc_node_id = (candidate.features or {}).get("discovery_node_id")
         if disc_node_id:
             DiscoveryNode.objects.filter(node_id=disc_node_id).update(status="confirmed")
@@ -98,6 +99,26 @@ def confirm_candidate(cand_id, severity=None, title=None, summary=None,
             picked = picked or qs.order_by("-created_at").first()
             if picked:
                 DiscoveryNode.objects.filter(node_id=picked.node_id).update(status="confirmed")
+
+        # 2c. EndpointSpec 안전망 — 확정된 vuln_type 을 그 endpoint 의 명세에
+        # 자동 추가 (다음 scan 의 RouteMap/EntryPoint 가 즉시 활용).
+        try:
+            target_url = candidate.scan_run.target_url or ""
+            host = _urlparse(target_url).hostname
+            ep = (candidate.request.endpoint if candidate.request else "") or ""
+            method = (candidate.request.method if candidate.request else "GET") or "GET"
+            if host and ep:
+                spec, _ = EndpointSpec.objects.get_or_create(
+                    target_host=host, method=method, endpoint=ep,
+                    defaults={"suspected_vuln_types": [candidate.vuln_type]},
+                )
+                cur = list(spec.suspected_vuln_types or [])
+                if candidate.vuln_type and candidate.vuln_type not in cur:
+                    cur.append(candidate.vuln_type)
+                    spec.suspected_vuln_types = sorted(cur)
+                    spec.save(update_fields=["suspected_vuln_types"])
+        except Exception as e:
+            logger.warning(f"EndpointSpec auto-update failed: {e}")
 
         # 3. Evidence 생성 + 링크
         created_evidence = []

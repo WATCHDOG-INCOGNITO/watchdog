@@ -389,8 +389,12 @@ def _update_target_profile(
 # ─────────────────────────────────────────────────────────────
 
 def _recall_target(target_host: str) -> dict:
-    """이 host에 대해 이전 스캔에서 누적된 모든 지식 한 방에 반환."""
-    from api.models import DeadEnd, PayloadPattern, TargetProfile
+    """이 host에 대해 이전 스캔에서 누적된 모든 지식 한 방에 반환.
+
+    포함: profile (framework/server/WAF/fingerprint), learned_patterns, dead_ends,
+          endpoint_specs (KB 화된 API 명세 — 같은 host 재방문 시 정찰 단축).
+    """
+    from api.models import DeadEnd, EndpointSpec, PayloadPattern, TargetProfile
 
     host = _host_of(target_host)
     if not host:
@@ -399,11 +403,15 @@ def _recall_target(target_host: str) -> dict:
     try:
         profile = TargetProfile.objects.get(host=host)
     except TargetProfile.DoesNotExist:
-        return {
-            "host": host,
-            "known": False,
-            "note": "이 host는 처음 스캔. living KB 비어있음.",
-        }
+        # profile 없어도 EndpointSpec 은 있을 수 있음 (다른 흐름으로 누적됐을 때)
+        spec_count = EndpointSpec.objects.filter(target_host=host).count()
+        if spec_count == 0:
+            return {
+                "host": host,
+                "known": False,
+                "note": "이 host는 처음 스캔. living KB 비어있음.",
+            }
+        profile = None
 
     learned = PayloadPattern.objects.filter(
         target_host=host, source="learned", is_active=True
@@ -411,19 +419,21 @@ def _recall_target(target_host: str) -> dict:
 
     dead = DeadEnd.objects.filter(target_host=host).order_by("-times_seen")[:20]
 
+    specs = EndpointSpec.objects.filter(target_host=host).order_by("-last_seen_at")[:30]
+
     return {
         "host": host,
         "known": True,
         "profile": {
-            "framework": profile.framework,
-            "server": profile.server,
-            "waf": profile.waf,
-            "fingerprint": profile.fingerprint,
-            "notes": profile.notes,
-            "confirmed_findings_count": profile.confirmed_findings_count,
-            "learned_patterns_count": profile.learned_patterns_count,
-            "dead_ends_count": profile.dead_ends_count,
-            "last_scan_at": str(profile.last_scan_at) if profile.last_scan_at else None,
+            "framework": profile.framework if profile else None,
+            "server": profile.server if profile else None,
+            "waf": profile.waf if profile else None,
+            "fingerprint": profile.fingerprint if profile else None,
+            "notes": profile.notes if profile else None,
+            "confirmed_findings_count": profile.confirmed_findings_count if profile else 0,
+            "learned_patterns_count": profile.learned_patterns_count if profile else 0,
+            "dead_ends_count": profile.dead_ends_count if profile else 0,
+            "last_scan_at": (str(profile.last_scan_at) if profile and profile.last_scan_at else None),
         },
         "learned_patterns": [
             {
@@ -445,6 +455,166 @@ def _recall_target(target_host: str) -> dict:
                 "times_seen": d.times_seen,
             }
             for d in dead
+        ],
+        # KB 화된 API 명세 — RouteMap 이 정찰 skip + EntryPoint 가 sink_hints 로 가설 좁힘
+        "endpoint_specs": [
+            {
+                "spec_id": str(s.spec_id),
+                "method": s.method,
+                "endpoint": s.endpoint,
+                "params_schema": s.params_schema,
+                "auth_required": s.auth_required,
+                "suspected_vuln_types": s.suspected_vuln_types or [],
+                "sink_hints": s.sink_hints or [],
+                "times_seen": s.times_seen,
+                "last_seen_at": str(s.last_seen_at) if s.last_seen_at else None,
+            }
+            for s in specs
+        ],
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# EndpointSpec — API 명세 KB (host 별 endpoint 메타 누적)
+# ─────────────────────────────────────────────────────────────
+
+def _record_endpoint_spec(
+    target_host: str,
+    method: str,
+    endpoint: str,
+    params_schema: str = "",
+    headers_required: str = "",
+    auth_required: bool = False,
+    response_shape: str = "",
+    suspected_vuln_types: str = "",
+    sink_hints: str = "",
+    notes: str = "",
+) -> dict:
+    """endpoint 명세를 KB 에 기록 (같은 host 재방문 시 정찰 단축용).
+
+    같은 (host, method, endpoint) 가 있으면 기존 spec 갱신 — params/sinks/vuln_types 는
+    union 합집합 (정보 누적), times_seen += 1.
+    """
+    import json as _json
+    from django.db.models import F
+    from api.models import EndpointSpec
+
+    host = _host_of(target_host)
+    if not host or not endpoint or not method:
+        return {"error": "target_host, method, endpoint 필수"}
+
+    method = method.upper()
+
+    def _parse_json(s, default):
+        if not s:
+            return default
+        if isinstance(s, (dict, list)):
+            return s
+        try:
+            return _json.loads(s)
+        except (_json.JSONDecodeError, TypeError):
+            return default
+
+    new_params = _parse_json(params_schema, {}) if params_schema else None
+    new_headers = _parse_json(headers_required, []) if headers_required else None
+    new_response = _parse_json(response_shape, {}) if response_shape else None
+    new_suspected = _parse_json(suspected_vuln_types, []) if suspected_vuln_types else []
+    new_sinks = _parse_json(sink_hints, []) if sink_hints else []
+    if isinstance(new_suspected, str):
+        new_suspected = [new_suspected]
+    if isinstance(new_sinks, str):
+        new_sinks = [new_sinks]
+
+    existing = EndpointSpec.objects.filter(
+        target_host=host, method=method, endpoint=endpoint,
+    ).first()
+
+    if existing:
+        # 정보 누적 — 새 데이터 들어오면 union/덮어쓰기
+        if new_params:
+            merged_p = dict(existing.params_schema or {})
+            merged_p.update(new_params)
+            existing.params_schema = merged_p
+        if new_headers:
+            merged_h = list(set((existing.headers_required or []) + new_headers))
+            existing.headers_required = merged_h
+        if auth_required and not existing.auth_required:
+            existing.auth_required = True
+        if new_response:
+            merged_r = dict(existing.response_shape or {})
+            merged_r.update(new_response)
+            existing.response_shape = merged_r
+        if new_suspected:
+            existing.suspected_vuln_types = sorted(set((existing.suspected_vuln_types or []) + new_suspected))
+        if new_sinks:
+            existing.sink_hints = sorted(set((existing.sink_hints or []) + new_sinks))
+        if notes:
+            existing.notes = ((existing.notes or "") + "\n" + notes).strip()[:4000]
+        existing.save(update_fields=[
+            "params_schema", "headers_required", "auth_required",
+            "response_shape", "suspected_vuln_types", "sink_hints", "notes",
+        ])
+        EndpointSpec.objects.filter(pk=existing.pk).update(times_seen=F("times_seen") + 1)
+        existing.refresh_from_db()
+        return {
+            "spec_id": str(existing.spec_id),
+            "created": False,
+            "times_seen": existing.times_seen,
+            "host": host,
+            "endpoint": endpoint,
+        }
+
+    spec = EndpointSpec.objects.create(
+        target_host=host,
+        method=method,
+        endpoint=endpoint,
+        params_schema=new_params,
+        headers_required=new_headers,
+        auth_required=bool(auth_required),
+        response_shape=new_response,
+        suspected_vuln_types=new_suspected,
+        sink_hints=new_sinks,
+        notes=notes or None,
+    )
+    return {
+        "spec_id": str(spec.spec_id),
+        "created": True,
+        "times_seen": 1,
+        "host": host,
+        "endpoint": endpoint,
+    }
+
+
+def _recall_endpoint_specs(target_host: str, vuln_type: str = "", limit: int = 30) -> dict:
+    """특정 host (선택: vuln_type) 의 endpoint 명세 목록 조회."""
+    from api.models import EndpointSpec
+    host = _host_of(target_host)
+    if not host:
+        return {"error": "target_host 필수"}
+    qs = EndpointSpec.objects.filter(target_host=host)
+    if vuln_type:
+        qs = qs.filter(suspected_vuln_types__icontains=vuln_type)
+    specs = list(qs.order_by("-last_seen_at")[:limit])
+    return {
+        "host": host,
+        "vuln_type_filter": vuln_type or None,
+        "count": len(specs),
+        "specs": [
+            {
+                "spec_id": str(s.spec_id),
+                "method": s.method,
+                "endpoint": s.endpoint,
+                "params_schema": s.params_schema,
+                "headers_required": s.headers_required,
+                "auth_required": s.auth_required,
+                "response_shape": s.response_shape,
+                "suspected_vuln_types": s.suspected_vuln_types or [],
+                "sink_hints": s.sink_hints or [],
+                "times_seen": s.times_seen,
+                "notes": (s.notes or "")[:500],
+                "last_seen_at": str(s.last_seen_at) if s.last_seen_at else None,
+            }
+            for s in specs
         ],
     }
 
@@ -516,6 +686,68 @@ def register(mcp):
             return json.dumps(result, ensure_ascii=False, default=str)
         except Exception as e:
             return json.dumps({"error": f"recall_dead_ends failed: {e}"})
+
+    @mcp.tool()
+    async def record_endpoint_spec(
+        target_host: str,
+        method: str,
+        endpoint: str,
+        params_schema: str = "",
+        headers_required: str = "",
+        auth_required: bool = False,
+        response_shape: str = "",
+        suspected_vuln_types: str = "",
+        sink_hints: str = "",
+        notes: str = "",
+    ) -> str:
+        """API endpoint 명세를 KB 에 누적. 같은 host 재방문 시 정찰 단축용.
+
+        EntryPoint sub-agent 가 endpoint 분석 끝에 호출 권장. 같은
+        (host, method, endpoint) 가 있으면 갱신 (params/sinks/vuln_types union, times_seen+=1).
+
+        Args:
+            target_host: 대상 host (예: "juice-shop:3000")
+            method: HTTP method (GET/POST/...)
+            endpoint: 경로 (예: "/rest/user/login")
+            params_schema: JSON 문자열. 예: '{"email":{"type":"str","in":"body","required":true}}'
+            headers_required: JSON list. 예: '["Authorization","X-CSRF"]'
+            auth_required: 인증 필요 여부
+            response_shape: JSON. 예: '{"status_codes":[200,401], "fields":["id","email"]}'
+            suspected_vuln_types: JSON list 또는 문자열. 예: '["sqli","auth_bypass"]'
+            sink_hints: JSON list. 예: '["bcrypt_compare","raw_sql_query"]'
+            notes: 자유 메모
+        """
+        try:
+            result = await sync_to_async(_record_endpoint_spec, thread_sensitive=True)(
+                target_host=target_host, method=method, endpoint=endpoint,
+                params_schema=params_schema, headers_required=headers_required,
+                auth_required=bool(auth_required), response_shape=response_shape,
+                suspected_vuln_types=suspected_vuln_types, sink_hints=sink_hints,
+                notes=notes,
+            )
+            return json.dumps(result, ensure_ascii=False, default=str)
+        except Exception as e:
+            return json.dumps({"error": f"record_endpoint_spec failed: {e}"})
+
+    @mcp.tool()
+    async def recall_endpoint_specs(
+        target_host: str,
+        vuln_type: str = "",
+        limit: int = 30,
+    ) -> str:
+        """특정 host (선택: vuln_type 매칭) 의 endpoint 명세 목록.
+
+        RouteMap 이 새 scan 시작 시 호출하면 이전 정찰 결과로 endpoint 후보 즉시 확보.
+        EntryPoint 도 sink_hints 보고 가설 좁히는 데 활용.
+        """
+        try:
+            result = await sync_to_async(_recall_endpoint_specs, thread_sensitive=True)(
+                target_host=target_host, vuln_type=vuln_type,
+                limit=int(limit) if limit else 30,
+            )
+            return json.dumps(result, ensure_ascii=False, default=str)
+        except Exception as e:
+            return json.dumps({"error": f"recall_endpoint_specs failed: {e}"})
 
     @mcp.tool()
     async def learn_from_finding(

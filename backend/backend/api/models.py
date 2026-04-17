@@ -461,6 +461,53 @@ class DeadEnd(models.Model):
     def fp_rate(self):
         return self.false_positive_count / self.times_used if self.times_used else 0.0
 
+
+class EndpointSpec(models.Model):
+    """API endpoint 명세 KB — host 별 endpoint 메타데이터 누적.
+
+    PayloadPattern (technique/learned/cve) 가 *어떻게 공격할지* 라면, 이건
+    *어디를 공격할지* 의 누적. 같은 host 재방문 시 RouteMap 이 정찰을
+    skip 하고 바로 EntryPoint 단계로 진입 가능.
+
+    Resume + EndpointSpec 활용 흐름:
+      1. 첫 scan: EntryPoint 가 endpoint 분석 → record_endpoint_spec 호출
+      2. 다음 scan: RouteMap 이 recall_target(host) → endpoint specs 받음 →
+         재정찰 skip + EntryPoint 노드로 바로 시드
+      3. 변화 감지: 같은 host 같은 endpoint 인데 response_shape 달라지면
+         "변경됨" 표시 → 재분석 트리거
+    """
+    spec_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    target_host = models.CharField(max_length=255, db_index=True)
+    method = models.CharField(max_length=8)
+    endpoint = models.TextField()
+    # endpoint param 명세 — JSON Schema-lite. 예: {"q": {"type":"str","in":"query","required":true}}
+    params_schema = models.JSONField(null=True, blank=True)
+    headers_required = models.JSONField(null=True, blank=True)  # ["Authorization", "X-CSRF"]
+    auth_required = models.BooleanField(default=False)
+    # 응답 구조: {"status_codes":[200,401], "content_types":["application/json"], "fields":["id","email"]}
+    response_shape = models.JSONField(null=True, blank=True)
+    # EntryPoint sub-agent 가 분석한 의심 vuln_type — KB의 "이 endpoint는 이 공격 받을 가능성"
+    suspected_vuln_types = models.JSONField(null=True, blank=True)  # ["sqli", "xss"]
+    # 코드/응답에서 식별한 sink hint
+    sink_hints = models.JSONField(null=True, blank=True)  # ["db_query", "render_html", "include"]
+    notes = models.TextField(null=True, blank=True)
+    times_seen = models.IntegerField(default=1)
+    last_seen_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    embedding = VectorField(dimensions=768, null=True, blank=True)
+    embedding_model = models.CharField(max_length=64, null=True, blank=True)
+
+    class Meta:
+        db_table = "endpoint_specs"
+        unique_together = [("target_host", "method", "endpoint")]
+        indexes = [
+            models.Index(fields=["target_host", "last_seen_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.method} {self.endpoint} @ {self.target_host}"
+
+
 # Discovery Queue — 단서 축적형 탐색 트리
 
 class DiscoveryNode(models.Model):

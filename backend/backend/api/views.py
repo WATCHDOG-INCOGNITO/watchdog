@@ -470,3 +470,44 @@ def discovery_tree(request, run_id):
         .order_by("depth", "created_at")
     )
     return Response(DiscoveryNodeSerializer(nodes, many=True).data)
+
+
+@api_view(["GET"])
+def scan_run_endpoint_specs(request, run_id):
+    """이 scan 의 target_host 에 누적된 EndpointSpec 목록.
+    frontend NodeDetailPanel 이 endpoint 노드에 명세 표시할 때 사용.
+    """
+    from urllib.parse import urlparse
+    from .models import EndpointSpec
+
+    try:
+        scan_run = ScanRun.objects.get(run_id=run_id)
+    except ScanRun.DoesNotExist:
+        return Response({"error": "scan run not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    host = urlparse(scan_run.target_url or "").hostname
+    if not host:
+        return Response({"host": "", "specs": []})
+
+    specs = EndpointSpec.objects.filter(target_host=host).order_by("-last_seen_at")[:200]
+    return Response({
+        "host": host,
+        "count": len(specs),
+        "specs": [
+            {
+                "spec_id": str(s.spec_id),
+                "method": s.method,
+                "endpoint": s.endpoint,
+                "params_schema": s.params_schema,
+                "headers_required": s.headers_required,
+                "auth_required": s.auth_required,
+                "response_shape": s.response_shape,
+                "suspected_vuln_types": s.suspected_vuln_types or [],
+                "sink_hints": s.sink_hints or [],
+                "times_seen": s.times_seen,
+                "notes": s.notes,
+                "last_seen_at": s.last_seen_at.isoformat() if s.last_seen_at else None,
+            }
+            for s in specs
+        ],
+    })

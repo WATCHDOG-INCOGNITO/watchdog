@@ -879,7 +879,7 @@ function CanvasNode({ node, x, y, selected, onSelect }) {
   );
 }
 
-function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findings = [], onClose }) {
+function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findings = [], endpointSpecs = [], onClose }) {
   if (!node) return null;
 
   const meta = NODE_TYPE_META[node.node_type] || NODE_TYPE_META.clue;
@@ -931,6 +931,15 @@ function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findi
       return rep === epNorm;
     }).slice(0, 20);
   }, [requests, node.endpoint, epNorm]);
+
+  // EndpointSpec — host KB 자산. 같은 endpoint 의 명세 (params/sinks/auth 등).
+  const linkedSpecs = useMemo(() => {
+    if (!node.endpoint || node.node_type === "target") return [];
+    return endpointSpecs.filter((s) => {
+      const sep = (s.endpoint || "").split("?")[0].replace(/\/+$/, "") || "/";
+      return sep === epNorm;
+    });
+  }, [endpointSpecs, node.endpoint, node.node_type, epNorm]);
 
   return (
     <div className="node-panel" onClick={(e) => e.stopPropagation()}>
@@ -995,6 +1004,44 @@ function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findi
                 </div>
               );
             })}
+          </div>
+        </div>
+      ) : null}
+
+      {linkedSpecs.length > 0 ? (
+        <div className="node-panel-section">
+          <div className="mini-title">📋 API 명세 ({linkedSpecs.length})</div>
+          <div className="node-children-list">
+            {linkedSpecs.map((s) => (
+              <div key={s.spec_id} className="node-child-row" style={{ flexDirection: "column", alignItems: "stretch", gap: 4 }}>
+                <div>
+                  <strong>{s.method}</strong> {s.endpoint}
+                  {s.auth_required ? <span style={{ marginLeft: 6, opacity: 0.7 }}>🔒 auth</span> : null}
+                  <span style={{ marginLeft: 8, opacity: 0.6, fontSize: "0.85em" }}>seen {s.times_seen}× </span>
+                </div>
+                {s.suspected_vuln_types && s.suspected_vuln_types.length > 0 ? (
+                  <div style={{ fontSize: "0.85em" }}>
+                    <span style={{ opacity: 0.7 }}>의심 vuln: </span>
+                    {s.suspected_vuln_types.map((vt) => (
+                      <span key={vt} className="node-status-pill node-status-pending" style={{ marginRight: 4 }}>{vt}</span>
+                    ))}
+                  </div>
+                ) : null}
+                {s.sink_hints && s.sink_hints.length > 0 ? (
+                  <div style={{ fontSize: "0.85em", opacity: 0.8 }}>
+                    sink: {s.sink_hints.join(", ")}
+                  </div>
+                ) : null}
+                {s.params_schema && Object.keys(s.params_schema).length > 0 ? (
+                  <div style={{ fontSize: "0.8em", opacity: 0.7 }}>
+                    params: {Object.keys(s.params_schema).join(", ")}
+                  </div>
+                ) : null}
+                {s.notes ? (
+                  <div style={{ fontSize: "0.8em", opacity: 0.6, fontStyle: "italic" }}>{s.notes.slice(0, 200)}</div>
+                ) : null}
+              </div>
+            ))}
           </div>
         </div>
       ) : null}
@@ -1074,6 +1121,7 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
   const [requests, setRequests] = useState([]);
   const [candidates, setCandidates] = useState([]);
   const [findings, setFindings] = useState([]);
+  const [endpointSpecs, setEndpointSpecs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [selectedNodeId, setSelectedNodeId] = useState(null);
@@ -1087,17 +1135,20 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
   async function fetchTree() {
     setLoading(true);
     try {
-      // 4개 fetch 병렬 — 노드 detail panel 이 candidate/finding/request 도 보여주려면 다 필요.
-      const [treeData, reqData, candData, findData] = await Promise.all([
+      // 5개 fetch 병렬 — 노드 detail panel 이 candidate/finding/request/spec 도
+      // 보여주려면 다 필요. EndpointSpec 은 host KB 자산 (scan 외부에 누적됨).
+      const [treeData, reqData, candData, findData, specData] = await Promise.all([
         apiGet(`/api/scan-runs/${runId}/discovery-tree/`),
         apiGet(`/api/scan-runs/${runId}/request-catalog/?page_size=200`).catch(() => ({})),
         apiGet(`/api/candidates/list/?run_id=${runId}&page_size=200`).catch(() => ({})),
         apiGet(`/api/findings/?run_id=${runId}&page_size=200`).catch(() => ({})),
+        apiGet(`/api/scan-runs/${runId}/endpoint-specs/`).catch(() => ({})),
       ]);
       setNodes(Array.isArray(treeData) ? treeData : []);
       setRequests(normalizePaginatedList(reqData));
       setCandidates(normalizePaginatedList(candData));
       setFindings(normalizePaginatedList(findData));
+      setEndpointSpecs(Array.isArray(specData?.specs) ? specData.specs : []);
       setError("");
     } catch (e) {
       setError(e.message);
@@ -1310,6 +1361,7 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
               requests={requests}
               candidates={candidates}
               findings={findings}
+              endpointSpecs={endpointSpecs}
               onClose={() => setSelectedNodeId(null)}
             />
           ) : null}
