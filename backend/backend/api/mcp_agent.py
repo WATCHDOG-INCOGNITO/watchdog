@@ -1236,16 +1236,36 @@ A target (root) node: target_url, optional source_root.
    조회 가능.
 
    **CHECK ROOT CONTEXT — credentials_available**: 사용자가 로그인 정보를
-   제공했으면 root.context.credentials_available 에 type 표시. get_secrets()
-   로 실제 값 회상:
-     · type=form  → login_url + username + password (+ field names) 회상 →
-       http_session_request(POST login_url, form_json={username_field:USR,
-       password_field:PWD}, session_id="<scan-id>-auth") 로 로그인 →
-       이후 모든 worker 가 같은 session_id 로 보호 endpoint 접근
-     · type=bearer → bearer_token → 모든 요청에 Authorization: Bearer <T> 헤더
-     · type=cookie → cookies dict → 모든 요청에 Cookie 헤더 attach
-     · type=basic  → username/password → HTTP Basic Auth header
-   credentials 없으면 unauth 영역만 정찰. 있으면 protected endpoint 도 push.
+   제공했으면 root.context.credentials_available 에 personas 배열 표시
+   (label, type 의 list). get_secrets() 로 실제 값 회상:
+
+   각 persona 는 secrets 에 label prefix 로 저장:
+     auth_<label>_type, auth_<label>_username, auth_<label>_password,
+     auth_<label>_login_url, auth_<label>_bearer_token, auth_<label>_cookies, ...
+
+   처리:
+     · type=form  → login_url + user/pw 회상 →
+       http_session_request(POST login_url, form_json={...},
+       session_id="<scan-id>-auth-<label>") 로 로그인 → 이후 worker 가
+       label 별 session_id 로 protected endpoint 접근
+     · type=bearer → bearer_token → Authorization: Bearer <T> 헤더
+     · type=cookie → cookies → Cookie 헤더 attach
+     · type=basic  → user/pw → HTTP Basic Auth
+
+   여러 persona (admin / user1 / api 등) → IDOR cross-access, role 별
+   권한 차이, admin-only endpoint 접근 등 다양한 vector. 각 persona 별로
+   별도 session_id 사용해 cookie jar 분리.
+
+   ⚠ **login endpoint 자체도 attack 대상** — credentials 가 valid 라고 해서
+   login 페이지 vuln (sqli/auth_bypass/nosql injection/default cred brute)
+   을 skip 하지 말 것. 흐름:
+     1. login endpoint 식별 → push_discovery(node_type="vuln", vuln_type="sqli")
+        + push_discovery(node_type="vuln", vuln_type="auth_bypass") 등 시드
+     2. 그것과 별개로 valid credential 로 로그인 → protected area 정찰
+     3. 즉 credential 은 "정찰 보조" 이지 "공격 면제권" 아님.
+
+   credentials 없으면 unauth 영역만 정찰. 있으면 양 트랙 (login 자체 attack
+   + 인증 후 protected) 동시 진행.
 2. (white-box) list_source_tree → read_source / grep_source on routes/handlers.
 3. (black-box) browser_navigate + browser_extract_api_endpoints + browser_get_dom.
 4. update_target_profile with framework/server/WAF when identified.
@@ -2257,55 +2277,81 @@ def _persist_selfcheck(scan_run, result: dict) -> None:
     scan_run.save(update_fields=["config"])
 
 
-def _seed_credentials(scan_run, creds: dict) -> None:
-    """사용자 제공 credentials 를 ScanRun.config["_secrets"] 에 저장.
+def _seed_credentials(scan_run, cred_list: list) -> list:
+    """사용자 제공 credentials (여러 persona) 를 ScanRun.config["_secrets"] 에 저장.
 
-    store_secret 도구와 같은 storage layer (config["_secrets"] dict) 사용 →
-    LLM 의 get_secrets() 호출 시 그대로 회상.
+    각 credential 의 'label' 로 key prefix → multi-persona (admin/user1/api 등)
+    동시 보관. label 미지정 시 'user1', 'user2', ... 자동.
 
-    type:
-      form    — login_url + username + password (+ optional username_field/password_field)
-      bearer  — token (Authorization: Bearer ... 헤더로 attach)
-      cookie  — cookies dict
-      basic   — username + password (HTTP Basic Auth)
+    secret key 형식: auth_<label>_<field>
+      예) auth_admin_type, auth_admin_login_url, auth_admin_username,
+          auth_admin_password, auth_admin_username_field, ...
+
+    Returns: [{"label": "admin", "type": "form"}, ...]  — root context 노출용 요약
     """
     import json as _json
+    import re as _re
     from django.utils import timezone
-    ctype = (creds.get("type") or "").strip().lower()
-    if ctype not in ("form", "bearer", "cookie", "basic"):
-        logger.warning(f"[{scan_run.run_id}] unknown credential type: {ctype}")
-        return
 
     config = scan_run.config or {}
     secrets = dict(config.get("_secrets") or {})
     now = str(timezone.now())
+    used_labels = set()
+    personas = []
 
-    def _put(key: str, value, category: str = "credential") -> None:
-        secrets[key] = {
-            "value": value if isinstance(value, str) else _json.dumps(value, ensure_ascii=False),
-            "category": category,
-            "stored_at": now,
-            "source": "user_provided",
-        }
+    def _make_label(c: dict, idx: int) -> str:
+        lbl = (c.get("label") or "").strip()
+        if not lbl:
+            lbl = f"user{idx + 1}"
+        # secret key 안전화 — 영숫자/언더스코어만
+        lbl = _re.sub(r"[^a-zA-Z0-9_]", "_", lbl).strip("_") or f"user{idx + 1}"
+        # dedup
+        base = lbl
+        i = 2
+        while lbl in used_labels:
+            lbl = f"{base}_{i}"; i += 1
+        used_labels.add(lbl)
+        return lbl
 
-    _put("auth_type", ctype, category="config")
-    if ctype == "form":
-        if creds.get("login_url"): _put("login_url", creds["login_url"], category="config")
-        if creds.get("username"):  _put("username", creds["username"])
-        if creds.get("password"):  _put("password", creds["password"])
-        if creds.get("username_field"): _put("username_field", creds["username_field"], category="config")
-        if creds.get("password_field"): _put("password_field", creds["password_field"], category="config")
-    elif ctype == "bearer":
-        if creds.get("token"): _put("bearer_token", creds["token"])
-    elif ctype == "cookie":
-        if creds.get("cookies"): _put("cookies", creds["cookies"])
-    elif ctype == "basic":
-        if creds.get("username"): _put("username", creds["username"])
-        if creds.get("password"): _put("password", creds["password"])
+    for idx, creds in enumerate(cred_list):
+        ctype = (creds.get("type") or "").strip().lower()
+        if ctype not in ("form", "bearer", "cookie", "basic"):
+            logger.warning(f"[{scan_run.run_id}] unknown credential type: {ctype}, skip")
+            continue
+        label = _make_label(creds, idx)
+        prefix = f"auth_{label}_"
+
+        def _put(field: str, value, category: str = "credential") -> None:
+            secrets[prefix + field] = {
+                "value": value if isinstance(value, str) else _json.dumps(value, ensure_ascii=False),
+                "category": category,
+                "stored_at": now,
+                "source": "user_provided",
+                "persona_label": label,
+                "persona_type": ctype,
+            }
+
+        _put("type", ctype, category="config")
+        if ctype == "form":
+            if creds.get("login_url"): _put("login_url", creds["login_url"], category="config")
+            if creds.get("username"):  _put("username", creds["username"])
+            if creds.get("password"):  _put("password", creds["password"])
+            if creds.get("username_field"): _put("username_field", creds["username_field"], category="config")
+            if creds.get("password_field"): _put("password_field", creds["password_field"], category="config")
+        elif ctype == "bearer":
+            if creds.get("token"): _put("bearer_token", creds["token"])
+        elif ctype == "cookie":
+            if creds.get("cookies"): _put("cookies", creds["cookies"])
+        elif ctype == "basic":
+            if creds.get("username"): _put("username", creds["username"])
+            if creds.get("password"): _put("password", creds["password"])
+
+        personas.append({"label": label, "type": ctype})
 
     config["_secrets"] = secrets
     scan_run.config = config
     scan_run.save(update_fields=["config"])
+    return personas
 
 
 def _normalize_target_url(url: str) -> str:
@@ -2561,23 +2607,32 @@ async def _run_discovery_loop(
     if scan_config.get("source_root"):
         root_context["source_root"] = scan_config["source_root"]
 
-    # 사용자 제공 credentials 자동 처리 — store_secret 으로 박아 worker 가
-    # get_secrets 로 회상 + RouteMap prompt 에 hint 주입.
-    creds = scan_config.get("credentials") or {}
-    if isinstance(creds, dict) and creds.get("type"):
-        await sync_to_async(_seed_credentials)(scan_run, creds)
-        root_context["credentials_available"] = {
-            "type": creds.get("type"),
-            "note": (
-                "User-provided credentials are stored via get_secrets. "
-                "Login first (form: POST login_url with username/password fields, "
-                "or attach Authorization/Cookie headers for bearer/cookie/basic), "
-                "then explore protected endpoints with http_session_request."
-            ),
-        }
-        logger.info(
-            f"[{scan_run.run_id}] user credentials loaded: type={creds.get('type')}"
-        )
+    # 사용자 제공 credentials 자동 처리 — list 또는 single dict 둘 다 지원.
+    # _seed_credentials 가 ScanRun.config["_secrets"] 에 label prefix 로 박음.
+    raw_creds = scan_config.get("credentials")
+    cred_list = []
+    if isinstance(raw_creds, dict) and raw_creds.get("type"):
+        cred_list = [raw_creds]  # legacy single dict
+    elif isinstance(raw_creds, list):
+        cred_list = [c for c in raw_creds if isinstance(c, dict) and c.get("type")]
+
+    if cred_list:
+        personas = await sync_to_async(_seed_credentials)(scan_run, cred_list)
+        if personas:
+            root_context["credentials_available"] = {
+                "personas": personas,  # [{label, type}, ...]
+                "note": (
+                    "User-provided credentials stored via get_secrets() — keys are "
+                    "auth_<label>_<field>. For each persona: type=form → "
+                    "http_session_request login (session_id='<scan>-auth-<label>'); "
+                    "bearer/cookie/basic → attach headers. ⚠ login endpoint 자체도 "
+                    "attack 대상 (sqli/auth_bypass), credential 은 정찰 보조일 뿐."
+                ),
+            }
+            logger.info(
+                f"[{scan_run.run_id}] user credentials loaded: {len(personas)} persona(s) — "
+                + ", ".join(f"{p['label']}({p['type']})" for p in personas)
+            )
 
     resume_from = (scan_config.get("resume_from") or "").strip()
     prev_knowledge = await sync_to_async(_gather_previous_knowledge)(
