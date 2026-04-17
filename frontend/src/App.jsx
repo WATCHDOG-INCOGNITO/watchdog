@@ -1140,6 +1140,159 @@ function normalizeEndpointPath(p) {
   return segs.join("/") + (query ? `?${query}` : "");
 }
 
+// 모든 spec 을 path segment 단위로 N단계 트리로 빌드.
+// 각 node 에 (이 path 정확 매칭 specs[]) + (자식 segments) + descendant 통계.
+function buildPathTree(specs) {
+  const root = { name: "", fullPath: "", specs: [], children: new Map() };
+  for (const s of specs) {
+    const norm = normalizeEndpointPath(s.endpoint);
+    const segs = norm.split("/").filter(Boolean);
+    let node = root;
+    let acc = "";
+    for (const seg of segs) {
+      acc = acc + "/" + seg;
+      if (!node.children.has(seg)) {
+        node.children.set(seg, { name: seg, fullPath: acc, specs: [], children: new Map() });
+      }
+      node = node.children.get(seg);
+    }
+    node.specs.push({ ...s, _normPath: norm });
+  }
+  // descendant 통계 (vuln union, total seen, total spec count) 재귀 계산
+  function decorate(n) {
+    const vt = new Set();
+    let totalSpecs = n.specs.length;
+    let totalSeen = 0;
+    let anyAuth = false;
+    for (const sp of n.specs) {
+      for (const v of sp.suspected_vuln_types || []) vt.add(v);
+      totalSeen += sp.times_seen || 0;
+      if (sp.auth_required) anyAuth = true;
+    }
+    for (const child of n.children.values()) {
+      decorate(child);
+      for (const v of child._descUnion || []) vt.add(v);
+      totalSpecs += child._descSpecs;
+      totalSeen += child._descSeen;
+      if (child._descAuth) anyAuth = true;
+    }
+    n._descUnion = Array.from(vt).sort();
+    n._descSpecs = totalSpecs;
+    n._descSeen = totalSeen;
+    n._descAuth = anyAuth;
+    // 자식 정렬: spec 많은 순, 그 다음 이름 알파벳
+    n._sortedChildren = Array.from(n.children.values()).sort(
+      (a, b) => (b._descSpecs - a._descSpecs) || a.name.localeCompare(b.name),
+    );
+  }
+  decorate(root);
+  return root;
+}
+
+// path tree row — 재귀. depth 들여쓰기 + accordion 토글 + leaf spec click.
+function PathTreeRows({ node, depth, expanded, onToggle, selectedId, onSelectSpec }) {
+  // 루트 node 자체는 렌더 안 함 — children 부터.
+  if (depth < 0) {
+    return (
+      <>
+        {node._sortedChildren.map((c) => (
+          <PathTreeRows key={c.fullPath} node={c} depth={0}
+            expanded={expanded} onToggle={onToggle}
+            selectedId={selectedId} onSelectSpec={onSelectSpec} />
+        ))}
+      </>
+    );
+  }
+  const isOpen = expanded.has(node.fullPath);
+  const hasChildren = node._sortedChildren.length > 0;
+  const hasSpecs = node.specs.length > 0;
+  const hasMore = hasChildren || node.specs.length > 1;  // 토글 가치
+  const indent = depth * 16;
+  return (
+    <>
+      <tr
+        onClick={() => hasMore ? onToggle(node.fullPath) : (node.specs[0] && onSelectSpec(node.specs[0].spec_id))}
+        style={{
+          cursor: "pointer",
+          background: isOpen ? "#eef4fc" : (depth === 0 ? "#f7f9fc" : "#fff"),
+          borderBottom: "1px solid #e6ebf2",
+          color: "#1f2a3a",
+          fontWeight: depth === 0 ? 500 : 400,
+        }}
+      >
+        <td style={{ padding: "6px 12px" }}>
+          {hasSpecs ? (
+            <span style={{ display: "inline-flex", gap: 3 }}>
+              {Array.from(new Set(node.specs.map((s) => s.method))).map((m) => (
+                <span key={m} style={{ fontSize: "0.75em", padding: "1px 5px", border: "1px solid #c5cfdc", borderRadius: 3, background: "#fff" }}>{m}</span>
+              ))}
+            </span>
+          ) : <span style={{ opacity: 0.4 }}>—</span>}
+        </td>
+        <td style={{ padding: "6px 12px", paddingLeft: 12 + indent }}>
+          {hasMore ? (
+            <span style={{ marginRight: 6, opacity: 0.7, display: "inline-block", width: 12 }}>
+              {isOpen ? "▼" : "▶"}
+            </span>
+          ) : <span style={{ marginRight: 6, opacity: 0.3, display: "inline-block", width: 12 }}>·</span>}
+          <span>/{node.name}</span>
+          {node._descAuth ? <span style={{ marginLeft: 6, opacity: 0.65, fontSize: "0.85em" }}>🔒</span> : null}
+          {hasMore ? (
+            <span style={{ marginLeft: 8, opacity: 0.6, fontWeight: 400, fontSize: "0.82em" }}>
+              ({node._descSpecs} spec{node._descSpecs > 1 ? "s" : ""})
+            </span>
+          ) : null}
+        </td>
+        <td style={{ padding: "6px 12px" }}>
+          {(node._descUnion || []).slice(0, 6).map((vt) => (
+            <span key={vt} className="node-status-pill node-status-pending" style={{ marginRight: 3, fontSize: "0.78em" }}>{vt}</span>
+          ))}
+          {(node._descUnion || []).length > 6 ? <span style={{ opacity: 0.6, fontSize: "0.8em" }}>+{node._descUnion.length - 6}</span> : null}
+        </td>
+        <td style={{ padding: "6px 12px", textAlign: "right", opacity: 0.7 }}>{node._descSeen}×</td>
+      </tr>
+      {isOpen ? (
+        <>
+          {/* 이 path 에 정확히 매칭되는 spec 들 — leaf 처럼 표시 */}
+          {node.specs.length > 1 && node.specs.map((s) => (
+            <tr
+              key={s.spec_id}
+              onClick={(e) => { e.stopPropagation(); onSelectSpec(s.spec_id); }}
+              style={{
+                cursor: "pointer",
+                background: selectedId === s.spec_id ? "#dbe7fb" : "#fff",
+                borderBottom: "1px solid #f0f3f8",
+                color: "#1f2a3a",
+                fontSize: "0.92em",
+              }}
+            >
+              <td style={{ padding: "5px 12px" }}>
+                <span style={{ fontSize: "0.78em", padding: "1px 5px", border: "1px solid #c5cfdc", borderRadius: 3, background: "#fff" }}>{s.method}</span>
+              </td>
+              <td style={{ padding: "5px 12px", paddingLeft: 12 + indent + 24, opacity: 0.85 }}>
+                <span style={{ opacity: 0.5, marginRight: 4 }}>└ method</span>
+                {s.auth_required ? <span style={{ marginLeft: 6, opacity: 0.65 }}>🔒</span> : null}
+              </td>
+              <td style={{ padding: "5px 12px" }}>
+                {(s.suspected_vuln_types || []).map((vt) => (
+                  <span key={vt} className="node-status-pill node-status-pending" style={{ marginRight: 3, fontSize: "0.78em" }}>{vt}</span>
+                ))}
+              </td>
+              <td style={{ padding: "5px 12px", textAlign: "right", opacity: 0.7 }}>{s.times_seen}×</td>
+            </tr>
+          ))}
+          {/* 자식 path 재귀 */}
+          {node._sortedChildren.map((c) => (
+            <PathTreeRows key={c.fullPath} node={c} depth={depth + 1}
+              expanded={expanded} onToggle={onToggle}
+              selectedId={selectedId} onSelectSpec={onSelectSpec} />
+          ))}
+        </>
+      ) : null}
+    </>
+  );
+}
+
 function EndpointSpecModal({ runId, targetUrl, onClose }) {
   const [data, setData] = useState({ host: "", count: 0, specs: [] });
   const [loading, setLoading] = useState(true);
@@ -1181,53 +1334,9 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
     });
   }, [data, filter, vulnFilter]);
 
-  // (method, base_path) 로 그룹화 — REST 관습: collection `/api/Users` 와
-  // item `/api/Users/{id}` 는 같은 리소스의 두 면 → 한 그룹에 묶음.
-  // base_path = normalized path 의 마지막 segment 가 placeholder({id}/{uuid}/{hash})
-  // 면 그것을 제거. 그렇지 않으면 path 그대로 (collection 자체가 base).
-  const groups = useMemo(() => {
-    const map = new Map();
-    for (const s of filtered) {
-      const norm = normalizeEndpointPath(s.endpoint);
-      const segs = norm.split("/");
-      const last = segs[segs.length - 1];
-      const isPlaceholder = /^\{(id|uuid|hash)\}$/.test(last);
-      const basePath = isPlaceholder ? segs.slice(0, -1).join("/") : norm;
-      const key = `${s.method} ${basePath}`;
-      if (!map.has(key)) {
-        map.set(key, { key, method: s.method, basePath, members: [] });
-      }
-      map.get(key).members.push({ ...s, _normPath: norm, _isItem: isPlaceholder });
-    }
-    // 각 그룹 derive
-    const arr = Array.from(map.values()).map((g) => {
-      const vt = new Set();
-      const sinks = new Set();
-      let auth = false, seen = 0;
-      let collectionCount = 0, itemCount = 0;
-      for (const m of g.members) {
-        for (const v of m.suspected_vuln_types || []) vt.add(v);
-        for (const k of m.sink_hints || []) sinks.add(k);
-        if (m.auth_required) auth = true;
-        seen += m.times_seen || 0;
-        if (m._isItem) itemCount++;
-        else collectionCount++;
-      }
-      return {
-        ...g,
-        size: g.members.length,
-        union_vuln_types: Array.from(vt).sort(),
-        union_sinks: Array.from(sinks).sort(),
-        any_auth: auth,
-        total_seen: seen,
-        collection_count: collectionCount,
-        item_count: itemCount,
-      };
-    });
-    // 멤버가 많은 순, 그 다음 path 알파벳
-    arr.sort((a, b) => (b.size - a.size) || a.basePath.localeCompare(b.basePath));
-    return arr;
-  }, [filtered]);
+  // 모든 spec 을 path segment 단위 N단계 트리로 빌드.
+  // /api → /Users → {id} → /posts → {id} 식으로 무한 깊이 nest 가능.
+  const pathTree = useMemo(() => buildPathTree(filtered), [filtered]);
 
   const selected = useMemo(
     () => (data.specs || []).find((s) => s.spec_id === selectedId),
@@ -1241,6 +1350,20 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
       else next.add(key);
       return next;
     });
+  }
+
+  function expandAll() {
+    const all = new Set();
+    function walk(n) {
+      if (n.fullPath) all.add(n.fullPath);
+      for (const c of n._sortedChildren || []) walk(c);
+    }
+    walk(pathTree);
+    setExpandedGroups(all);
+  }
+
+  function collapseAll() {
+    setExpandedGroups(new Set());
   }
 
   const stopProp = (e) => e.stopPropagation();
@@ -1296,6 +1419,8 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
             ))}
           </select>
           <span style={{ opacity: 0.7, fontSize: "0.85em", color: "#5a6573" }}>{filtered.length} / {data.count}</span>
+          <button type="button" className="ghost-button" style={{ padding: "4px 10px", fontSize: "0.85em" }} onClick={expandAll}>전체 펼치기</button>
+          <button type="button" className="ghost-button" style={{ padding: "4px 10px", fontSize: "0.85em" }} onClick={collapseAll}>접기</button>
         </div>
 
         {error ? <div className="callout callout-error">{error}</div> : null}
@@ -1322,104 +1447,14 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
                 </tr>
               </thead>
               <tbody>
-                {groups.map((g) => {
-                  // 멤버 1개뿐 — 그룹 행 없이 바로 single row.
-                  if (g.size === 1) {
-                    const s = g.members[0];
-                    return (
-                      <tr
-                        key={s.spec_id}
-                        onClick={() => setSelectedId(s.spec_id)}
-                        style={{
-                          cursor: "pointer",
-                          background: selectedId === s.spec_id ? "#dbe7fb" : "#fff",
-                          borderBottom: "1px solid #eef2f7",
-                          color: "#1f2a3a",
-                        }}
-                      >
-                        <td style={{ padding: "8px 12px" }}><strong>{s.method}</strong></td>
-                        <td style={{ padding: "8px 12px" }}>
-                          {s.endpoint}
-                          {s.auth_required ? <span style={{ marginLeft: 6, opacity: 0.75 }}>🔒</span> : null}
-                        </td>
-                        <td style={{ padding: "8px 12px" }}>
-                          {(s.suspected_vuln_types || []).map((vt) => (
-                            <span key={vt} className="node-status-pill node-status-pending" style={{ marginRight: 3, fontSize: "0.8em" }}>{vt}</span>
-                          ))}
-                        </td>
-                        <td style={{ padding: "8px 12px", textAlign: "right", opacity: 0.75 }}>{s.times_seen}×</td>
-                      </tr>
-                    );
-                  }
-                  // 멤버 2개+ — 그룹 행(요약) + 펼침 시 멤버 행들 (collection / item 구분).
-                  const isOpen = expandedGroups.has(g.key);
-                  const headerLabel = (() => {
-                    const parts = [];
-                    if (g.collection_count) parts.push(`collection ×${g.collection_count}`);
-                    if (g.item_count) parts.push(`item ×${g.item_count}`);
-                    return parts.join(" + ");
-                  })();
-                  return (
-                    <Fragment key={g.key}>
-                      <tr
-                        onClick={() => toggleGroup(g.key)}
-                        style={{
-                          cursor: "pointer",
-                          background: isOpen ? "#eef4fc" : "#f7f9fc",
-                          borderBottom: "1px solid #d3dae4",
-                          color: "#1f2a3a",
-                          fontWeight: 500,
-                        }}
-                      >
-                        <td style={{ padding: "8px 12px" }}>
-                          <span style={{ marginRight: 6, opacity: 0.7 }}>{isOpen ? "▼" : "▶"}</span>
-                          <strong>{g.method}</strong>
-                        </td>
-                        <td style={{ padding: "8px 12px" }}>
-                          {g.basePath || "/"}
-                          {g.any_auth ? <span style={{ marginLeft: 6, opacity: 0.75 }}>🔒</span> : null}
-                          <span style={{ marginLeft: 8, opacity: 0.65, fontWeight: 400, fontSize: "0.85em" }}>
-                            ({headerLabel})
-                          </span>
-                        </td>
-                        <td style={{ padding: "8px 12px" }}>
-                          {g.union_vuln_types.map((vt) => (
-                            <span key={vt} className="node-status-pill node-status-pending" style={{ marginRight: 3, fontSize: "0.8em" }}>{vt}</span>
-                          ))}
-                        </td>
-                        <td style={{ padding: "8px 12px", textAlign: "right", opacity: 0.75 }}>{g.total_seen}×</td>
-                      </tr>
-                      {isOpen ? g.members.map((s) => (
-                        <tr
-                          key={s.spec_id}
-                          onClick={(e) => { e.stopPropagation(); setSelectedId(s.spec_id); }}
-                          style={{
-                            cursor: "pointer",
-                            background: selectedId === s.spec_id ? "#dbe7fb" : "#fff",
-                            borderBottom: "1px solid #eef2f7",
-                            color: "#1f2a3a",
-                          }}
-                        >
-                          <td style={{ padding: "6px 12px 6px 28px", opacity: 0.75 }}>{s.method}</td>
-                          <td style={{ padding: "6px 12px 6px 28px" }}>
-                            <span style={{ opacity: 0.6, marginRight: 4 }}>└</span>
-                            <span style={{ opacity: 0.6, fontSize: "0.85em", marginRight: 6 }}>
-                              {s._isItem ? "item" : "collection"}
-                            </span>
-                            {s.endpoint}
-                            {s.auth_required ? <span style={{ marginLeft: 6, opacity: 0.75 }}>🔒</span> : null}
-                          </td>
-                          <td style={{ padding: "6px 12px" }}>
-                            {(s.suspected_vuln_types || []).map((vt) => (
-                              <span key={vt} className="node-status-pill node-status-pending" style={{ marginRight: 3, fontSize: "0.8em" }}>{vt}</span>
-                            ))}
-                          </td>
-                          <td style={{ padding: "6px 12px", textAlign: "right", opacity: 0.75 }}>{s.times_seen}×</td>
-                        </tr>
-                      )) : null}
-                    </Fragment>
-                  );
-                })}
+                <PathTreeRows
+                  node={pathTree}
+                  depth={-1}
+                  expanded={expandedGroups}
+                  onToggle={toggleGroup}
+                  selectedId={selectedId}
+                  onSelectSpec={setSelectedId}
+                />
               </tbody>
             </table>
           </div>
