@@ -62,6 +62,18 @@ each persona:
 Push it as a child with suspected_vuln_types including `sqli` and
 `auth_bypass` — don't skip.
 
+### Session 획득 시 metadata 기록 (재획득 가능하도록)
+너가 직접 로그인하진 않지만, 다음 워커가 form-login 으로 session 을 얻을 때
+반드시 metadata 와 함께 저장하도록 note 를 남겨라:
+```
+store_secret(key="<label>_session", value=<cookie>, category="session",
+  obtained_via="form_login", auth_label="<label>",
+  chain_summary="POST <login_url> as <username>")
+```
+→ 만료 시 exploit sub-agent 가 `auth_<label>_*` 회상해서 자동 재로그인.
+공격으로 얻은 세션은 `obtained_via="attack"` + `source_vuln_node_id` 로
+저장하면 replay 가능.
+
 ## Output contract
 
 For EACH discovered endpoint push a child node:

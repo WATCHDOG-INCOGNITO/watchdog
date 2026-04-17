@@ -1266,6 +1266,25 @@ A target (root) node: target_url, optional source_root.
 
    credentials 없으면 unauth 영역만 정찰. 있으면 양 트랙 (login 자체 attack
    + 인증 후 protected) 동시 진행.
+
+   ## Session 만료 대응 — store_secret metadata 활용
+   로그인 성공 시 받은 session cookie / token 을:
+     store_secret(key="<label>_session", value=<cookie>, category="session",
+                  obtained_via="form_login", auth_label="<label>",
+                  chain_summary="login via <label> credentials")
+   공격으로 얻은 session (SQLi bypass / JWT forge / XSS cookie steal 등) 은:
+     store_secret(key="<descr>_session", value=<cookie>, category="session",
+                  obtained_via="attack", source_vuln_node_id="<vuln node uuid>",
+                  chain_summary="<공격 한 줄 요약>")
+
+   나중 요청에서 HTTP 401/403 또는 302→/login 받으면 **session 만료**. 대응:
+     - get_secrets(category="session") 으로 해당 key 의 metadata 조회
+     - obtained_via="form_login" → http_session_request POST login_url 재로그인
+       → 새 cookie 를 store_secret 으로 덮어씀 (같은 metadata 유지)
+     - obtained_via="attack" → push_discovery(node_type="vuln", context={
+         "recheck": True, "reason": "session expired, replay attack chain",
+         "source_secret_key": "<descr>_session"}) → 다음 iteration 의
+         confirmer 가 공격 chain 재실행 → 새 cookie 획득 → store_secret update
 2. (white-box) list_source_tree → read_source / grep_source on routes/handlers.
 3. (black-box) browser_navigate + browser_extract_api_endpoints + browser_get_dom.
 4. update_target_profile with framework/server/WAF when identified.
@@ -1402,6 +1421,28 @@ An exploit_step node: parent vuln context, chain history, scan secrets.
    - Command injection via custom protocol → RCE
 6. Execute the next step (http_session_request to maintain cookies, or curl_request
    for raw protocol). Use mutate_payload for WAF/filter bypass when needed.
+
+## ★ Session 만료 감지 + 재획득
+
+Protected endpoint 호출 시 HTTP 401/403 또는 302→/login 받으면 **session
+만료**. 자동 재획득:
+
+1. get_secrets(category="session") → 해당 session key 의 metadata 조회
+2. metadata.obtained_via 에 따라 분기:
+   a. "form_login" → auth_<auth_label>_login_url / username / password 회상 →
+      http_session_request(POST login_url, form_json={...}) 재로그인 →
+      새 cookie 를 같은 key 로 store_secret 갱신 (metadata 유지).
+   b. "attack" → metadata.source_vuln_node_id 를 recheck=True 로 push:
+      push_discovery(node_type="vuln", parent=<source>, context={
+        "recheck": True, "reason": "session expired, replay attack",
+        "source_secret_key": "<key>"})
+      → 다음 iteration 의 confirmer 가 공격 chain 재실행 → 새 cookie →
+      store_secret update.
+   c. obtained_via 없음 (unknown) → 수동 재시도 or dead_end.
+
+3. 공격 chain 으로 새 session 얻었을 때 반드시 store_secret metadata 로
+   출처 기록 (obtained_via="attack", source_vuln_node_id=<this>,
+   chain_summary="..."). 다음 만료 시 자동 replay 가능하게.
 
 ## Output contract
 Whenever you discover something:
