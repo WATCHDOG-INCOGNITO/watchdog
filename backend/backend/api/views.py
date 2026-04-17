@@ -485,11 +485,18 @@ def scan_run_endpoint_specs(request, run_id):
     except ScanRun.DoesNotExist:
         return Response({"error": "scan run not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    host = urlparse(scan_run.target_url or "").hostname
+    # host 표기 — tools_learn._host_of 와 일관. netloc(port 포함) 우선,
+    # 없으면 hostname(port 없음) fallback. 매칭은 두 변형 모두 시도.
+    parsed = urlparse(scan_run.target_url or "")
+    netloc = (parsed.netloc or "").lower()
+    hostname = (parsed.hostname or "").lower()
+    host = netloc or hostname
     if not host:
         return Response({"host": "", "specs": []})
 
-    specs = EndpointSpec.objects.filter(target_host=host).order_by("-last_seen_at")[:200]
+    # netloc 와 hostname 이 다르면 둘 다 매칭 (legacy data 호환).
+    host_variants = list({netloc, hostname} - {""})
+    specs = EndpointSpec.objects.filter(target_host__in=host_variants).order_by("-last_seen_at")[:200]
     return Response({
         "host": host,
         "count": len(specs),
