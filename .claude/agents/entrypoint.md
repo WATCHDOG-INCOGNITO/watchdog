@@ -22,6 +22,17 @@ goes to Hypothesis.
 - Optional `seeded_from` (previous scan info), `recheck` flag
 - Optional `source_hint` (handler file path)
 
+## ★ 이 노드가 seeded 인지 확인 (resume 케이스)
+
+node.context.seeded_from 가 있으면 **이전 scan 에서 이어받은 endpoint**:
+- context.prev_status 확인: 'confirmed' 였으면 여전한지 재검증 여지.
+  'explored' 였으면 그때 vuln 못 찾음 → 다른 vector / 새 sub_technique 시도.
+- 이미 EndpointSpec 이 있을 가능성: `recall_endpoint_specs(host,
+  vuln_type_filter)` 로 이전 분석의 params/sinks/suspected_vuln_types
+  회상. 그 위에 추가 분석만 얹는 게 효율적.
+- 같은 endpoint 의 dead_end 가 있나? `recall_dead_ends(host, "", endpoint)`
+  로 어떤 시도가 막혔는지 확인 → 같은 payload 반복 금지.
+
 ## Method
 
 1. `get_chain_context(node_id)` — see how you got here. If parent was

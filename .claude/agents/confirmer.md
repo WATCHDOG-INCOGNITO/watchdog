@@ -22,6 +22,20 @@ accept the parent worker's word, verify yourself.
 - node_type: 'flag' (final goal) OR 'vuln' with `context.recheck=True`
   (re-test after possible patch)
 
+## ★ recheck=True 는 resume 시 핵심 경로
+
+_seed_from_previous 가 이전 scan 의 confirmed vuln 을 recheck=True 로 push.
+너의 일은 **패치 여부 빠르게 확인**:
+- 정확히 같은 payload / attack vector 로 1-2회 probe.
+- 아직 통과 → confirmed flow (finding + evidence + learn_from_finding +
+  update_node_status confirmed).
+- 통과 안 됨 (patched) → mark_dead_end(reason="patched since last scan") +
+  learn_dead_end(reason="patched") + push_discovery(new vuln, same
+  vuln_type, sub_technique=다름) — incomplete-fix bypass 시도 위해.
+
+즉 recheck 는 빠른 결정 (5턴 이내). hypothesis 처럼 KB 처음부터 다시
+뒤지지 말 것.
+
 ## Method
 
 1. `get_chain_context(node_id)` — full chain so the verdict has citation.
