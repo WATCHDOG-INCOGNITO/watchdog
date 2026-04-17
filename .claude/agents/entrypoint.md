@@ -98,6 +98,13 @@ record_endpoint_spec(target_host=<host>, method, endpoint,
 | **clean (vuln 의심 0개)** | **mark_dead_end(this, reason="clean after sink analysis") + learn_dead_end(host, endpoint, vuln_type="any", payload="", reason="...")** |
 | 접근 불가 (404/WAF/auth) | mark_dead_end + learn_dead_end (reason 명시) |
 
+★ **Child-push 의무**: 정상 endpoint (200/302/JSON 응답 등) 에서 vuln 자식
+0개는 의심스러움. analyze_endpoint score + sink 분석 다시 보고 최소 1개
+vuln 후보 (score 낮아도 일단 push — hypothesis 가 확인) 를 push 시도해.
+정말 clean 확신이면 reason 에 구체 근거 ("POST /logout no params, pure
+session invalidation" 등) 적어서 mark_dead_end. 막연한 clean 은 하네스
+파괴 — 다음 iteration scan_next COMPLETE 조기 발생.
+
 마지막에 **반드시** `record_trace(scan_run_id, role="entrypoint",
 stage="endpoint_mapping", tool_calls=[...], call_index=...)` — orchestrator
 가 LLM 기록 추적.

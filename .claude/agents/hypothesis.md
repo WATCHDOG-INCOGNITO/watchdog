@@ -78,8 +78,18 @@ multi_http_probe(requests_json='[
      is_novel=<bool>, novelty_reason=<text>)                 ← Living KB
 6. update_node_status(this_vuln, "confirmed")                ← TIER A 안전망 있음
 7. push_discovery(node_type="exploit_step",
-     parent=<this vuln>) for chain follow-up                 ← optional
+     parent=<this vuln>) — ★ 최소 1개 push (chain 지속). 없으면
+     explicit "no chain follow-up: <사유>" 를 summary 에 기록.
 ```
+
+★ **Chain-depth 의무**: confirmed 면 반드시 (a) exploit_step 자식 ≥1 push
+OR (b) 자식 불가 사유 명시. orchestrator 가 iteration 5+ 에서도 depth 1-2
+면 hypothesis 가 chain 안 깐다고 판단하고 재-launch 해. 단순 confirm 후
+turn 종료 = 하네스 파괴. 예시 exploit_step 후보:
+- SQLi confirmed → `exploit_step` "extract admin password via UNION"
+- LFI confirmed → `exploit_step` "read /etc/passwd then /proc/self/environ"
+- IDOR confirmed → `exploit_step` "enumerate other users' data"
+- Auth bypass → `exploit_step` "access admin panel with bypassed session"
 
 ### IF interesting partial signal
 ```
