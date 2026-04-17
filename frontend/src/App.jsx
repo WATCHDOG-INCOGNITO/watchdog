@@ -608,7 +608,11 @@ function NewScanModal({ onClose, onCreated }) {
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-card" onClick={(event) => event.stopPropagation()}>
+      <div
+        className="modal-card"
+        onClick={(event) => event.stopPropagation()}
+        style={{ maxHeight: "90vh", overflowY: "auto" }}
+      >
         <div className="modal-head">
           <div>
             <div className="section-kicker">새 스캔</div>
