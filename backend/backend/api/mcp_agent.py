@@ -1267,24 +1267,40 @@ A target (root) node: target_url, optional source_root.
    credentials 없으면 unauth 영역만 정찰. 있으면 양 트랙 (login 자체 attack
    + 인증 후 protected) 동시 진행.
 
-   ## Session 만료 대응 — store_secret metadata 활용
-   로그인 성공 시 받은 session cookie / token 을:
+   ## Expirable artifact 저장 원칙 — refresh_spec 필수
+
+   만료 가능한 secret (session/CSRF/JWT/OTP/API key/업로드 파일 경로 등)
+   저장 시 반드시 refresh_spec (JSON recipe) 을 달아둔다. 다음 만료 시
+   어떤 worker 든 refresh_spec.kind 읽고 자율 재획득 가능.
+
+   표준 kind: form_login / attack_replay / refetch_html / oauth_refresh /
+   otp_request / magic_link / api_key_reissue / reupload / (custom).
+
+   예시:
+     # 폼 로그인 세션
      store_secret(key="<label>_session", value=<cookie>, category="session",
                   obtained_via="form_login", auth_label="<label>",
-                  chain_summary="login via <label> credentials")
-   공격으로 얻은 session (SQLi bypass / JWT forge / XSS cookie steal 등) 은:
-     store_secret(key="<descr>_session", value=<cookie>, category="session",
-                  obtained_via="attack", source_vuln_node_id="<vuln node uuid>",
-                  chain_summary="<공격 한 줄 요약>")
+                  chain_summary="login via <label> credentials",
+                  refresh_spec='{"kind":"form_login","auth_label":"<label>"}')
 
-   나중 요청에서 HTTP 401/403 또는 302→/login 받으면 **session 만료**. 대응:
-     - get_secrets(category="session") 으로 해당 key 의 metadata 조회
-     - obtained_via="form_login" → http_session_request POST login_url 재로그인
-       → 새 cookie 를 store_secret 으로 덮어씀 (같은 metadata 유지)
-     - obtained_via="attack" → push_discovery(node_type="vuln", context={
-         "recheck": True, "reason": "session expired, replay attack chain",
-         "source_secret_key": "<descr>_session"}) → 다음 iteration 의
-         confirmer 가 공격 chain 재실행 → 새 cookie 획득 → store_secret update
+     # 공격으로 얻은 세션 (SQLi bypass / JWT forge / XSS cookie steal)
+     store_secret(key="<descr>_session", value=<cookie>, category="session",
+                  obtained_via="attack", source_vuln_node_id="<vuln uuid>",
+                  chain_summary="<공격 한 줄>",
+                  refresh_spec='{"kind":"attack_replay",
+                                 "source_vuln_node_id":"<vuln uuid>"}')
+
+     # CSRF token (per-request)
+     store_secret(key="csrf_token", value=<t>, category="csrf",
+                  obtained_via="refetch_html", expires_hint="per_request",
+                  refresh_spec='{"kind":"refetch_html","url":"/form",
+                                 "regex":"csrf\\" value=\\"([^\\"]+)"}')
+
+   만료 시그널 (401/403, 302→/login, `token expired`, `csrf invalid`,
+   `rate limit`, `upload not found`) 감지 시 get_secrets → refresh_spec.kind
+   분기 → 재획득 → **같은 key** 로 덮어쓰기. 상세 흐름은 Exploit agent 가
+   주로 처리. RouteMap 은 form_login session 저장 + 다른 kind 에 대한
+   hint 를 남기는 것이 1차 역할.
 2. (white-box) list_source_tree → read_source / grep_source on routes/handlers.
 3. (black-box) browser_navigate + browser_extract_api_endpoints + browser_get_dom.
 4. update_target_profile with framework/server/WAF when identified.
@@ -1422,27 +1438,57 @@ An exploit_step node: parent vuln context, chain history, scan secrets.
 6. Execute the next step (http_session_request to maintain cookies, or curl_request
    for raw protocol). Use mutate_payload for WAF/filter bypass when needed.
 
-## ★ Session 만료 감지 + 재획득
+## ★ Expirable artifact 재획득 (session / CSRF / JWT / OTP / API key / upload)
 
-Protected endpoint 호출 시 HTTP 401/403 또는 302→/login 받으면 **session
-만료**. 자동 재획득:
+만료 시그널: 401/403, 302→/login, `csrf token invalid`, `token expired`,
+`rate limit`, `upload not found` 등. 모든 **expirable secret** 은 저장 시
+`refresh_spec` (JSON) 을 달아두면 재획득 자동화됨.
 
-1. get_secrets(category="session") → 해당 session key 의 metadata 조회
-2. metadata.obtained_via 에 따라 분기:
-   a. "form_login" → auth_<auth_label>_login_url / username / password 회상 →
-      http_session_request(POST login_url, form_json={...}) 재로그인 →
-      새 cookie 를 같은 key 로 store_secret 갱신 (metadata 유지).
-   b. "attack" → metadata.source_vuln_node_id 를 recheck=True 로 push:
-      push_discovery(node_type="vuln", parent=<source>, context={
-        "recheck": True, "reason": "session expired, replay attack",
-        "source_secret_key": "<key>"})
-      → 다음 iteration 의 confirmer 가 공격 chain 재실행 → 새 cookie →
-      store_secret update.
-   c. obtained_via 없음 (unknown) → 수동 재시도 or dead_end.
+### 만료 감지 → 재획득 흐름
 
-3. 공격 chain 으로 새 session 얻었을 때 반드시 store_secret metadata 로
-   출처 기록 (obtained_via="attack", source_vuln_node_id=<this>,
-   chain_summary="..."). 다음 만료 시 자동 replay 가능하게.
+1. get_secrets(category=...) → 해당 key 의 metadata / refresh_spec 조회.
+2. metadata.refresh_spec.kind 로 분기 (LLM 자율 판단):
+   - form_login → auth_<spec.auth_label>_login_url/username/password 회상 →
+     http_session_request(POST login_url, form_json={...}) 재로그인.
+   - attack_replay → push_discovery(node_type="vuln",
+     parent=<spec.source_vuln_node_id>, context={"recheck":True,
+     "reason":"secret expired, replay attack",
+     "source_secret_key":"<key>"}) → 다음 iteration confirmer 가 chain 재실행.
+   - refetch_html → http_session_request(GET spec.url) → 응답에서 spec.regex
+     로 새 CSRF/nonce 추출.
+   - oauth_refresh → http_session_request(POST spec.token_endpoint,
+     form_json={"grant_type":"refresh_token",
+     "refresh_token":<get_secrets[spec.refresh_token_key]>}) → access_token 갱신.
+   - otp_request / magic_link → spec.request_endpoint 호출 후
+     spec.inbox_key/mailbox_key 로 inbox 크롤 → code/link 추출.
+   - api_key_reissue → spec.portal_url 로 재발급 (authenticated session 필요
+     시 session refresh 먼저 연쇄).
+   - reupload → spec.upload_node_id 의 chain 재실행.
+   - 기타 / unknown → LLM 판단: 수동 재시도 or mark_dead_end.
+3. 갱신한 값은 **같은 key** 로 store_secret 덮어쓰기 (refresh_spec 유지).
+
+### 새 secret 획득 시 refresh_spec 필수
+
+만료 가능 secret 저장 시 반드시 refresh_spec 동반:
+  # 공격으로 session
+  store_secret(key="admin_session", value=<cookie>, category="session",
+    obtained_via="attack", source_vuln_node_id=<this>,
+    chain_summary="SQLi auth bypass at /api/login",
+    refresh_spec='{"kind":"attack_replay","source_vuln_node_id":"<this>"}')
+
+  # CSRF token
+  store_secret(key="csrf_token", value=<t>, category="csrf",
+    obtained_via="refetch_html", expires_hint="per_request",
+    refresh_spec='{"kind":"refetch_html","url":"/form",
+                   "regex":"name=\\"csrf\\" value=\\"([^\\"]+)"}')
+
+  # OAuth access token
+  store_secret(key="access_token", value=<jwt>, category="token",
+    obtained_via="oauth_refresh", expires_hint="1h",
+    refresh_spec='{"kind":"oauth_refresh","token_endpoint":"/oauth/token",
+                   "refresh_token_key":"refresh_token"}')
+
+→ 다음 만료 시 어떤 worker 든 refresh_spec 읽고 자동 복구.
 
 ## Output contract
 Whenever you discover something:
