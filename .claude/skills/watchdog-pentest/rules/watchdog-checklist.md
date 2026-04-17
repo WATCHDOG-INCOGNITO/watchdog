@@ -1,0 +1,138 @@
+---
+description: Watchdog 행동별 필수 호출 체크리스트. 각 행동 수행 전에 이 체크리스트를 확인하여 도구 호출을 빠뜨리지 않는다.
+globs:
+alwaysApply: false
+---
+
+# Watchdog Checklist — 행동별 호출 가이드
+
+매 행동 수행 전에 아래 체크리스트를 확인한다.
+
+**범례**:
+- ✅ **Mandatory** — 데이터 기록 규율(TIER A). 빠지면 다음 스캔이 학습 못 함. 반드시.
+- 🧠 **Judgement** — 공격 전략. LLM 판단으로 skip 가능. 권장은 함.
+- 🛡️ **Safety-net** — 진단 신호(TIER B). 통과 안 해도 진행 가능. 무시한 경고는 selfcheck로 누적.
+
+---
+
+## 1. 엔드포인트 발견 시
+
+HTML 파싱, JS 분석, 소스코드 리뷰 등으로 새 경로를 발견했을 때:
+
+| # | 도구 | 설명 | 필수 |
+|---|------|------|------|
+| 1 | `push_discovery(node_type="endpoint", endpoint="/path", summary="...", context_json={...})` | 노드 큐에 등록 | ✅ |
+| 2 | `analyze_endpoint(endpoint="/path", method="GET", params={})` | 취약점 유형 분석 | ✅ |
+| 3 | `create_candidate_manual(endpoint, vuln_type, hypothesis)` | 분석 결과에 따라 후보 등록 | ☑️ 분석 결과 있으면 |
+| 4 | `add_scan_note(topic="endpoint", content="...")` | 특이사항 메모 | 선택 |
+| 5 | `record_trace(tool_calls=["push_discovery","analyze_endpoint",...])` | 사용한 도구 기록 | ✅ |
+
+**등록 없이 다음 단계로 넘어가지 말 것.**
+
+---
+
+## 2. 페이로드 전송 시
+
+SQLi, LDAP injection, XSS, SSRF 등 모든 payload 시도:
+
+| # | 도구 | 설명 | 분류 |
+|---|------|------|------|
+| 1 | `search_knowledge(vuln_type)` | KB에서 패턴 조회 (해당 vuln_type 첫 시도 시) | 🧠 권장 |
+| 2 | `recall_dead_ends(target_host, vuln_type, endpoint)` | 이전 실패 확인 | 🧠 권장 |
+| 3 | `http_request(...)` / `http_session_request(...)` | 실제 payload 전송 | ✅ |
+| 4 | `oracle_*(...)` | 결과 검증 (해당 oracle 있을 때) | 🧠 사용 가능 시 |
+| 5 | `record_pattern_use(pattern_id, succeeded=true/false)` | **성공이든 실패든 반드시 기록** | ✅ |
+| 6 | `record_trace(tool_calls=["search_knowledge","http_request","record_pattern_use",...])` | 사용한 도구 기록 | ✅ |
+
+> 🧠 KB 조회/dead_end 회상은 권장이지 강제 아님 — 소스코드를 충분히 분석해 자체
+> 가설이 명확하면 skip해도 OK. 단, 같은 vuln_type 첫 시도 시 KB hit 1회로
+> dead_end 회피율 크게 상승.
+
+---
+
+## 3. 취약점 확인 시
+
+payload가 성공하여 취약점이 확인되었을 때:
+
+| # | 도구 | 설명 | 필수 |
+|---|------|------|------|
+| 1 | `create_finding(scan_run_id, node_id, title, vuln_type, severity, summary)` | Finding DB 등록 → finding_id | ✅ |
+| 2 | `save_evidence(finding_id, kind="request", content="payload + 응답")` | 증거 첨부 | ✅ |
+| 3 | `confirm_finding(cand_id, severity, title, summary)` | Candidate → confirmed | ✅ |
+| 4 | `learn_from_finding(finding_id, target_host, payload_used, is_novel)` | KB에 학습 | ✅ |
+| 5 | `record_pattern_use(succeeded=true)` | 패턴 성공 기록 | ✅ |
+| 6 | `update_node_status(node_id, "confirmed")` | 노드 상태 변경 | ✅ |
+| 7 | `store_secret(key, value, category)` | 추출된 credential 저장 | ☑️ 해당 시 |
+| 8 | `push_discovery(node_type="exploit_step")` | 다음 단계 큐 등록 | ☑️ 체이닝 시 |
+| 9 | `record_trace(tool_calls=["create_finding","save_evidence","confirm_finding",...])` | 기록 | ✅ |
+
+**하나라도 빠지면 안 됨.**
+
+---
+
+## 4. 자격증명 발견 시
+
+비밀번호, 토큰, 쿠키, API 키, 세션 시크릿 등:
+
+| # | 도구 | 설명 | 필수 |
+|---|------|------|------|
+| 1 | `store_secret(key, value, category)` | 즉시 저장 | ✅ |
+| 2 | `add_scan_note(topic="credential", content="발견 컨텍스트")` | 메모 | ✅ |
+| 3 | `record_trace(tool_calls=["store_secret","add_scan_note"])` | 기록 | ✅ |
+
+**발견 즉시 저장. "나중에" 금지.**
+
+---
+
+## 5. 테스트 실패 / 막다른 길
+
+모든 시도가 실패했을 때:
+
+| # | 도구 | 설명 | 필수 |
+|---|------|------|------|
+| 1 | `record_pattern_use(succeeded=false)` | 실패 기록 | ✅ |
+| 2 | `mark_dead_end(node_id, reason)` | 노드 상태 변경 | ✅ |
+| 3 | `learn_dead_end(target_host, endpoint, vuln_type, payload_used, reason)` | KB에 실패 학습 | ✅ |
+| 4 | `record_trace(tool_calls=["record_pattern_use","mark_dead_end","learn_dead_end"])` | 기록 | ✅ |
+
+---
+
+## 6. 노드 완료 전 진단 (Node Validate) — 🛡️ Safety-net
+
+노드 finalize 전에 권장 (강제 아님):
+```
+validate_node(node_id)
+  → passed=true   → 그대로 finalize
+  → passed=false  → warnings를 보고 판단:
+                    (a) 진짜 빠진 작업이면 마저 수행
+                    (b) 환경 제약(WAF/404/SPA로 child 0개)이면 mark_dead_end로 명시
+                    (c) 그냥 넘어가도 되면 무시 — 무시한 경고는 selfcheck로 누적
+```
+
+## 7. 스캔 완료 전 자가 진단 (Self-Check) — 🛡️ Safety-net
+
+`complete_scan` 호출 전에 권장 (강제 아님):
+```
+scan_selfcheck(scan_run_id)  →  errors/warnings 확인
+```
+
+`scan_selfcheck`가 자동으로 검사하는 항목:
+```
+□ pending 상태 노드 0개인가?
+□ exploring 상태로 멈춘 노드 0개인가?
+□ endpoint 노드가 충분한가? (3개 미만이면 경고)
+□ dead_end 노드가 존재하는가? (0개면 경고)
+□ confirmed 노드에 finding이 있는가?
+□ analyze_endpoint 호출이 있는가?
+□ record_trace가 1건 이상 있는가?
+□ learn_dead_end가 기록되었는가?
+□ open 상태 candidate가 0개인가?
+```
+
+처리 정책:
+- **errors**: 데이터 손실 위험성이 있는 신호. 진짜 위험하면 fix 후 재실행. 그 외는
+  보고서 'limitations' 섹션에 그대로 반영하고 complete_scan 가능.
+- **warnings**: 참고사항. 무시해도 되지만 보고서에 누적된다.
+
+> 🛡️ selfcheck는 강제 게이트가 아니다. 그러나 errors를 그대로 두고 complete_scan하면
+> 다음 스캔이 같은 결함을 학습하지 못한다. 판단은 LLM(=너).
