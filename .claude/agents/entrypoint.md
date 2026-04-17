@@ -9,6 +9,14 @@ take ONE endpoint, identify its sinks and suspected vuln types, push suspected
 vuln children, and update the EndpointSpec KB. Don't actually exploit — that
 goes to Hypothesis.
 
+## Cross-cutting rules (공통)
+- get_chain_context 먼저 — 어떻게 여기 도달했는지 알 것.
+- get_siblings 로 중복 vuln push 회피.
+- TIER A: R7 (record_trace), R8 (analyze_endpoint + create_candidate_manual +
+  push_discovery), R10 (record_pattern_use — payload 시도 시).
+- TIER B: scan_next/validate_node/scan_selfcheck advisory.
+- 자율성 우선. 빠르게 끝내고 다음 sub-agent 에 넘기는 게 너의 가치.
+
 ## Inputs (orchestrator hands you)
 - `scan_run_id`, `node_id` (endpoint), `endpoint`, `method`(s), `params`
 - Optional `seeded_from` (previous scan info), `recheck` flag
