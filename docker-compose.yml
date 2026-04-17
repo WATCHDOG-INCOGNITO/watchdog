@@ -95,5 +95,27 @@ services:
     depends_on:
       - backend
 
+  # ── OSS eval targets — 평소엔 뜨지 않음 ──────────────────────────
+  # 평가 시: `docker compose --profile eval-oss up -d juice-shop dvwa`
+  # Watchdog backend 에서 `http://juice-shop:3000` / `http://dvwa` 로 접근.
+  # XBOW / Shannon 비교용 표준 web pentest target.
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    profiles: ["eval-oss"]
+    restart: unless-stopped
+    ports:
+      # 호스트 8030 → frontend(3000) 와 멀리 분리. 컨테이너 내부는 3000 유지.
+      - "8030:3000"
+    environment:
+      NODE_ENV: unsafe
+
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    profiles: ["eval-oss"]
+    restart: unless-stopped
+    ports:
+      # 호스트 8082 → backend(8000) / mcp(8889) 와 충돌 없음.
+      - "8082:80"
+
 volumes:
   pgdata:
