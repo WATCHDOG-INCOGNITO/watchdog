@@ -1561,55 +1561,38 @@ async def _explorer_worker(
                 f"{node.node_id}: {e}", exc_info=True,
             )
 
-        # ── Orchestrator validation: check compliance before finalize ──
+        # ── Orchestrator validation: SOFT SIGNAL ONLY (자율성 우선 원칙) ──
+        # validator는 안전망(diagnostic)이지 강제(gate)가 아니다.
+        # 위반이 있어도 fix_phase로 LLM에 재작업을 강제하지 않는다 — 그렇게 하면
+        # 진짜 막힌 상황(404/WAF/SPA로 endpoint 부재 등)에서 가짜 노드를 만들도록
+        # 잘못된 인센티브를 준다. warnings는 selfcheck/replan 신호로만 활용.
         node.refresh_from_db()
         passed, violations = await sync_to_async(
             lambda: _validate_node_compliance(node)
         )()
-
         if not passed:
-            logger.warning(
+            logger.info(
                 f"[{scan_run.run_id}] explorer[{name}] node {node.node_id} "
-                f"FAILED validation: {violations}"
+                f"validator warnings (soft): {violations}"
             )
-            fix_msg = (
-                f"⚠️ ORCHESTRATOR VALIDATION FAILED for node {node.node_id}.\n"
-                f"You MUST fix these violations before this node can be finalized:\n\n"
-                + "\n".join(f"- {v}" for v in violations)
-                + "\n\nFix them NOW. Call the required tools listed above."
-            )
-            try:
-                await _run_role_phase(
-                    scan_run, anthropic, f"explorer:{name}:fix",
-                    EXPLORER_PROMPT, tools, tool_router, fix_msg, acc,
-                    max_turns=VALIDATION_BUDGET,
-                )
-            except Exception as e:
-                logger.error(
-                    f"[{scan_run.run_id}] explorer[{name}] fix phase error: {e}",
-                    exc_info=True,
-                )
-
-            # Re-validate after fix attempt (log only, don't loop forever)
-            node.refresh_from_db()
-            passed2, violations2 = await sync_to_async(
-                lambda: _validate_node_compliance(node)
-            )()
-            if not passed2:
-                logger.warning(
-                    f"[{scan_run.run_id}] explorer[{name}] node {node.node_id} "
-                    f"still has violations after fix: {violations2}"
-                )
-            else:
-                logger.info(
-                    f"[{scan_run.run_id}] explorer[{name}] node {node.node_id} "
-                    f"PASSED validation after fix"
-                )
+            await sync_to_async(_record_node_warnings)(node, violations)
 
         await sync_to_async(
             lambda: _mark_node_explored(node)
         )()
         last_activity_ref[0] = _t.time()
+
+
+def _record_node_warnings(node, violations: list[str]) -> None:
+    """node.context['validator_warnings']에 누적. selfcheck가 합산해서 신호로 활용."""
+    if not violations:
+        return
+    ctx = dict(node.context or {})
+    prev = list(ctx.get("validator_warnings") or [])
+    prev.extend(violations)
+    ctx["validator_warnings"] = prev[-20:]  # bound
+    node.context = ctx
+    node.save(update_fields=["context"])
 
 
 def _mark_node_explored(node):
@@ -1624,35 +1607,36 @@ def _mark_node_explored(node):
 # Orchestrator — Post-exploration compliance validation
 # ═══════════════════════════════════════════════════════
 
-VALIDATION_BUDGET = 6
-
+# `must_have_children`은 "권장(suggest)" 의미로만 남긴다.
+# 실제 노드 push 강제는 안 한다 — target이 진짜로 endpoint 0개일 수 있다(WAF/404/SPA).
+# 안전망 원칙: validator는 진단 신호만, 강제 액션은 없음.
 _NODE_REQUIREMENTS = {
     "target": {
-        "must_have_children": True,
+        "suggest_children": True,
         "min_children": 1,
         "check_analyze_endpoint": False,
         "check_record_pattern_use": False,
     },
     "endpoint": {
-        "must_have_children": False,
+        "suggest_children": False,
         "min_children": 0,
         "check_analyze_endpoint": True,
         "check_record_pattern_use": False,
     },
     "vuln": {
-        "must_have_children": False,
+        "suggest_children": False,
         "min_children": 0,
         "check_analyze_endpoint": False,
         "check_record_pattern_use": True,
     },
     "exploit_step": {
-        "must_have_children": False,
+        "suggest_children": False,
         "min_children": 0,
         "check_analyze_endpoint": False,
         "check_record_pattern_use": False,
     },
     "clue": {
-        "must_have_children": False,
+        "suggest_children": False,
         "min_children": 0,
         "check_analyze_endpoint": False,
         "check_record_pattern_use": False,
@@ -1661,9 +1645,10 @@ _NODE_REQUIREMENTS = {
 
 
 def _validate_node_compliance(node) -> tuple[bool, list[str]]:
-    """Check if a node's exploration meets mandatory rules.
+    """Soft diagnostic — node 탐색이 권장 규칙을 만족하는지 점검.
 
-    Returns (passed, list_of_violations).
+    Returns (passed, list_of_warnings).
+    경고 리스트는 강제 fix가 아니라 selfcheck/replan 신호로만 사용된다.
     Runs synchronously — call from sync context or wrap with sync_to_async.
     """
     from api.models import (
@@ -1678,12 +1663,13 @@ def _validate_node_compliance(node) -> tuple[bool, list[str]]:
     children = DiscoveryNode.objects.filter(scan_run=sr, parent=node)
     child_count = children.count()
 
-    # R3/R8: target must push endpoint children
-    if reqs.get("must_have_children") and child_count < reqs.get("min_children", 1):
+    # R3/R8 (suggestion only): target/parent에 자식이 없다는 사실 자체는 진짜 막힌
+    # 환경(WAF/404/SPA, dead_end로 마킹된 entry 등)일 수 있어 강제하지 않는다.
+    if reqs.get("suggest_children") and child_count < reqs.get("min_children", 1):
         violations.append(
-            f"R8: {ntype} node must push child discoveries. "
-            f"Found {child_count} children, need >= {reqs.get('min_children', 1)}. "
-            f"Call push_discovery for each discovered endpoint/vuln."
+            f"R8(suggest): {ntype} node has {child_count} children "
+            f"(suggested >= {reqs.get('min_children', 1)}). "
+            f"진짜 막혔으면 mark_dead_end로 명시."
         )
 
     # R8: endpoint should have analyze_endpoint
@@ -1694,9 +1680,15 @@ def _validate_node_compliance(node) -> tuple[bool, list[str]]:
             m = re.search(r'((?:GET|POST|PUT|DELETE|PATCH)\s+)?(/\S+)', node.summary)
             if m:
                 ep = m.group(2)
-        analyzed = RequestCatalog.objects.filter(
-            scan_run=sr, endpoint__icontains=ep[:40],
-        ).exists() if ep else False
+        analyzed = False
+        if ep:
+            ep_norm = ep.split("?", 1)[0].rstrip("/") or "/"
+            # 정확 매칭 + trailing-slash 변형. substring icontains는 false-positive
+            # (`/api`가 `/api/users/api`와 충돌) 위험이 있어 폐기.
+            variants = {ep, ep_norm, ep_norm + "/"}
+            analyzed = RequestCatalog.objects.filter(
+                scan_run=sr, endpoint__in=variants,
+            ).exists()
         if not analyzed and ep:
             violations.append(
                 f"R8: No analyze_endpoint found for endpoint '{ep}'. "
@@ -1810,6 +1802,40 @@ def _scan_selfcheck(scan_run) -> dict:
             **by_status,
         },
     }
+
+
+def _collect_node_warnings(scan_run) -> list[dict]:
+    """전 스캔의 노드별 validator_warnings 합산 → selfcheck 신호로 사용."""
+    from api.models import DiscoveryNode
+    out: list[dict] = []
+    qs = DiscoveryNode.objects.filter(scan_run=scan_run).only(
+        "node_id", "node_type", "endpoint", "context"
+    )
+    for n in qs:
+        ws = (n.context or {}).get("validator_warnings") or []
+        if not ws:
+            continue
+        out.append({
+            "node_id": str(n.node_id),
+            "node_type": n.node_type,
+            "endpoint": n.endpoint or "",
+            "warnings": ws[-5:],
+        })
+    return out
+
+
+def _persist_selfcheck(scan_run, result: dict) -> None:
+    """selfcheck 결과를 ScanRun.config['selfcheck']에 박아 API/UI/eval 에서 조회 가능."""
+    cfg = dict(scan_run.config or {})
+    cfg["selfcheck"] = {
+        "passed": bool(result.get("passed")),
+        "errors": list(result.get("errors") or []),
+        "warnings": list(result.get("warnings") or []),
+        "node_warnings": list(result.get("node_warnings") or []),
+        "stats": dict(result.get("stats") or {}),
+    }
+    scan_run.config = cfg
+    scan_run.save(update_fields=["config"])
 
 
 def _normalize_target_url(url: str) -> str:
@@ -2071,9 +2097,17 @@ async def _run_discovery_loop(
     await asyncio.gather(*workers, return_exceptions=True)
 
     # ── Orchestrator scan-level selfcheck ──
+    # validator warnings(노드별)도 합산해 같이 노출. 다음 단계(2주차 MLLA)에서
+    # 이 신호가 re-plan trigger 입력이 된다.
     selfcheck_result = await sync_to_async(
         lambda: _scan_selfcheck(scan_run)
     )()
+    node_warnings = await sync_to_async(_collect_node_warnings)(scan_run)
+    selfcheck_result["node_warnings"] = node_warnings
+
+    # ScanRun.config 에 박아서 API/UI/eval에서도 조회 가능
+    await sync_to_async(_persist_selfcheck)(scan_run, selfcheck_result)
+
     if selfcheck_result["errors"]:
         logger.warning(
             f"[{scan_run.run_id}] scan selfcheck FAILED: {selfcheck_result['errors']}"
@@ -2097,8 +2131,18 @@ async def _run_discovery_loop(
     chains = await sync_to_async(build_exploit_chains)(str(scan_run.run_id))
     chains_json = json.dumps(chains, ensure_ascii=False)[:3000] if chains else "[]"
 
+    # selfcheck 요약을 reporter 프롬프트에 포함 — 보고서가 데이터 결함을 인식
+    sc_summary = {
+        "errors": selfcheck_result.get("errors", []),
+        "warnings": selfcheck_result.get("warnings", []),
+        "node_warning_count": len(node_warnings),
+        "stats": selfcheck_result.get("stats", {}),
+    }
+    sc_json = json.dumps(sc_summary, ensure_ascii=False)[:2000]
     reporter_msg = (
         f"generate_report(run_id=\"{scan_run.run_id}\", format=\"json\") 만 호출.\n\n"
+        f"## Selfcheck (스캔 품질 진단 — 보고서 'limitations' 또는 'follow_up' 섹션 활용)\n"
+        f"```json\n{sc_json}\n```\n\n"
         f"## Exploit Chains (discovery tree에서 재구성)\n```json\n{chains_json}\n```"
     )
     await _run_role_phase(

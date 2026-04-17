@@ -4,9 +4,14 @@ globs:
 alwaysApply: false
 ---
 
-# Watchdog Checklist — 행동별 필수 호출
+# Watchdog Checklist — 행동별 호출 가이드
 
-매 행동 수행 전에 아래 체크리스트를 확인한다. ✅는 반드시, ☑️는 조건부 필수.
+매 행동 수행 전에 아래 체크리스트를 확인한다.
+
+**범례**:
+- ✅ **Mandatory** — 데이터 기록 규율(TIER A). 빠지면 다음 스캔이 학습 못 함. 반드시.
+- 🧠 **Judgement** — 공격 전략. LLM 판단으로 skip 가능. 권장은 함.
+- 🛡️ **Safety-net** — 진단 신호(TIER B). 통과 안 해도 진행 가능. 무시한 경고는 selfcheck로 누적.
 
 ---
 
@@ -30,14 +35,18 @@ HTML 파싱, JS 분석, 소스코드 리뷰 등으로 새 경로를 발견했을
 
 SQLi, LDAP injection, XSS, SSRF 등 모든 payload 시도:
 
-| # | 도구 | 설명 | 필수 |
+| # | 도구 | 설명 | 분류 |
 |---|------|------|------|
-| 1 | `search_knowledge(vuln_type)` | KB에서 패턴 조회 (해당 vuln_type 첫 시도 시) | ✅ |
-| 2 | `recall_dead_ends(target_host, vuln_type, endpoint)` | 이전 실패 확인 | ✅ |
+| 1 | `search_knowledge(vuln_type)` | KB에서 패턴 조회 (해당 vuln_type 첫 시도 시) | 🧠 권장 |
+| 2 | `recall_dead_ends(target_host, vuln_type, endpoint)` | 이전 실패 확인 | 🧠 권장 |
 | 3 | `http_request(...)` / `http_session_request(...)` | 실제 payload 전송 | ✅ |
-| 4 | `oracle_*(...)` | 결과 검증 (해당 oracle 있을 때) | ☑️ 사용 가능 시 |
+| 4 | `oracle_*(...)` | 결과 검증 (해당 oracle 있을 때) | 🧠 사용 가능 시 |
 | 5 | `record_pattern_use(pattern_id, succeeded=true/false)` | **성공이든 실패든 반드시 기록** | ✅ |
 | 6 | `record_trace(tool_calls=["search_knowledge","http_request","record_pattern_use",...])` | 사용한 도구 기록 | ✅ |
+
+> 🧠 KB 조회/dead_end 회상은 권장이지 강제 아님 — 소스코드를 충분히 분석해 자체
+> 가설이 명확하면 skip해도 OK. 단, 같은 vuln_type 첫 시도 시 KB hit 1회로
+> dead_end 회피율 크게 상승.
 
 ---
 
@@ -88,18 +97,23 @@ payload가 성공하여 취약점이 확인되었을 때:
 
 ---
 
-## 6. 노드 완료 전 검증 (Node Validate)
+## 6. 노드 완료 전 진단 (Node Validate) — 🛡️ Safety-net
 
-노드를 finalize하기 전에 반드시:
+노드 finalize 전에 권장 (강제 아님):
 ```
-validate_node(node_id)  →  passed=true여야 finalize 가능
+validate_node(node_id)
+  → passed=true   → 그대로 finalize
+  → passed=false  → warnings를 보고 판단:
+                    (a) 진짜 빠진 작업이면 마저 수행
+                    (b) 환경 제약(WAF/404/SPA로 child 0개)이면 mark_dead_end로 명시
+                    (c) 그냥 넘어가도 되면 무시 — 무시한 경고는 selfcheck로 누적
 ```
 
-## 7. 스캔 완료 전 자가 점검 (Self-Check)
+## 7. 스캔 완료 전 자가 진단 (Self-Check) — 🛡️ Safety-net
 
-`complete_scan` 호출 전에 반드시:
+`complete_scan` 호출 전에 권장 (강제 아님):
 ```
-scan_selfcheck(scan_run_id)  →  passed=true여야 complete_scan 가능
+scan_selfcheck(scan_run_id)  →  errors/warnings 확인
 ```
 
 `scan_selfcheck`가 자동으로 검사하는 항목:
@@ -115,5 +129,10 @@ scan_selfcheck(scan_run_id)  →  passed=true여야 complete_scan 가능
 □ open 상태 candidate가 0개인가?
 ```
 
-**errors가 1건이라도 있으면** 돌아가서 빠진 작업을 수행한 후 다시 `scan_selfcheck`를 실행한다.
-**warnings**는 참고사항이지만, 가능하면 해결한다.
+처리 정책:
+- **errors**: 데이터 손실 위험성이 있는 신호. 진짜 위험하면 fix 후 재실행. 그 외는
+  보고서 'limitations' 섹션에 그대로 반영하고 complete_scan 가능.
+- **warnings**: 참고사항. 무시해도 되지만 보고서에 누적된다.
+
+> 🛡️ selfcheck는 강제 게이트가 아니다. 그러나 errors를 그대로 두고 complete_scan하면
+> 다음 스캔이 같은 결함을 학습하지 못한다. 판단은 LLM(=너).

@@ -148,6 +148,17 @@ CLI 전용: create_scan, create_root, complete_scan, stop_scan, fail_scan, recor
 | `stop_scan` | 스캔 중단 → stopped |
 | `fail_scan` | 스캔 실패 → failed |
 
+## Orchestration — 🛡️ Safety-net (Soft Signal, CLI)
+
+| 도구 | 용도 |
+|------|------|
+| `scan_next` | 다음 노드 후보 N개 + recommend(=0) 반환. 0번이 BFS 정석이지만 LLM이 다른 후보 선택 가능. action="EXPLORE"\|"RESUME"\|"COMPLETE"\|"INIT_RECON" |
+| `validate_node` | 노드 finalize 전 진단. warnings/errors 반환 — 통과 안 해도 finalize 가능 |
+| `scan_selfcheck` | complete_scan 전 진단. 노드별 validator warnings 합산 + DB(`ScanRun.config["selfcheck"]`)에 저장. errors는 보고서 limitations로 노출 |
+
+> 이 3개는 **진단 신호**(advisory). 강제 게이트가 아니다. 무시한 경고는 누적되어
+> selfcheck/보고서에 노출된다. R11(advisory) 참조.
+
 ## Node Types
 
 | Type | 용도 |

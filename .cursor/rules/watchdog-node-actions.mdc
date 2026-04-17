@@ -23,23 +23,29 @@ alwaysApply: false
 ```
 WHILE true:
   1. scan_next(scan_run_id)                              [CLI]
-     → EXPLORE: 해당 노드 탐색 시작
-     → RESUME:  미완료 노드 마저 진행
+     → EXPLORE: candidates 배열 + recommend(=0)
+                · 0번이 BFS 정석 (depth 낮은 순)
+                · 다른 후보가 더 가치 있다고 판단(예: parent confirmed 후속,
+                  KB hit 많은 endpoint)하면 그것을 선택해도 OK
+     → RESUME:   exploring 상태로 멈춘 노드 마저 진행
      → COMPLETE: 큐 비었음 → STEP 2로 이동
 
-  2. update_node_status(node_id, "exploring")
+  2. update_node_status(선택한 node_id, "exploring")
   3. CONTEXT: get_chain_context + get_siblings + get_secrets + get_scan_notes
   4. EXPLORE: 아래 노드 타입별 절차 수행
 
-  5. validate_node(node_id)                              [CLI]
-     → passed=false → 빠진 작업 수행 → 다시 validate_node
+  5. validate_node(node_id)  ← 🛡️ 진단 신호 [CLI]
      → passed=true  → finalize
+     → passed=false → warnings 보고 판단:
+                       · 진짜 빠진 작업이면 마저 수행
+                       · 환경 제약(WAF/404/SPA로 child 0개)이면 mark_dead_end
+                       · 무시해도 되는 경고면 그대로 finalize (selfcheck로 누적)
 
   6. FINALIZE: update_node_status(explored/confirmed/dead_end) + record_trace
 ```
 
-> ⚠️ scan_next 없이 노드를 직접 골라서 탐색하지 말 것.
-> ⚠️ validate_node 통과 없이 finalize하지 말 것.
+> 🛡️ scan_next는 *후보 N개* 제공. LLM이 직접 선택. validate_node는 *진단*. 강제 게이트 아님.
+> 자율성 우선: 도구는 신호 제공, 결정은 LLM.
 
 ---
 
@@ -180,9 +186,10 @@ WHILE true:
 
 ### 정상 완료 (큐 비어있음):
 ```
-1. scan_selfcheck(scan_run_id)                            [CLI]
-   → passed=false → errors 목록의 빠진 작업 수행 → 다시 scan_selfcheck
-   → passed=true  → 아래 진행
+1. scan_selfcheck(scan_run_id)  ← 🛡️ 진단              [CLI]
+   → errors 검토:
+       · 데이터 손실 위험(예: confirmed인데 finding 0)이면 fix 후 재실행
+       · 환경 제약/판단 결과면 그대로 진행 (보고서 limitations로 노출됨)
 2. get_exploit_chains(scan_run_id)
 3. get_scan_summary(run_id)
 4. generate_report(scan_run_id)                          [MCP]
@@ -190,7 +197,8 @@ WHILE true:
 6. record_trace(stage="complete", tool_calls=[...])       [CLI]
 ```
 
-> ⚠️ scan_selfcheck 통과 없이 complete_scan 호출 금지.
+> 🛡️ scan_selfcheck는 진단 신호. 강제 게이트 아님. errors가 있어도
+> 보고서 'limitations' 섹션에 명시한 후 complete_scan 가능.
 
 ### 중단:
 ```

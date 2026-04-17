@@ -1056,10 +1056,14 @@ def cmd_scan_next(p):
         })
         return
 
-    # Pick next pending node (BFS: lowest depth first, then oldest)
-    pending = DiscoveryNode.objects.filter(
+    # 후보 여러 개를 보여주고 LLM이 직접 선택하게 한다 (자율성 우선).
+    # BFS 정석은 0번 후보(recommend); 그러나 LLM이 다른 후보가 더 가치있다고
+    # 판단하면 그쪽으로 가도 OK. 강제는 안전망에만.
+    pending_qs = DiscoveryNode.objects.filter(
         scan_run=sr, status="pending"
-    ).order_by("depth", "created_at").first()
+    ).order_by("depth", "created_at")
+    pending_list = list(pending_qs[:8])
+    pending = pending_list[0] if pending_list else None
 
     if not pending:
         total = DiscoveryNode.objects.filter(scan_run=sr).count()
@@ -1098,9 +1102,39 @@ def cmd_scan_next(p):
         scan_run=sr, parent=pending.parent, status="pending"
     ).count()
 
+    # 후보 N개 — 0번이 BFS 정석(recommend). LLM이 직접 보고 다른 걸 골라도 됨.
+    candidates = []
+    for idx, n in enumerate(pending_list):
+        parent_status = ""
+        if n.parent_id:
+            par = DiscoveryNode.objects.filter(node_id=n.parent_id).only("status").first()
+            parent_status = par.status if par else ""
+        reasons = [f"BFS rank {idx}", f"{n.node_type} @ depth={n.depth}"]
+        if parent_status == "dead_end":
+            reasons.append("(parent is dead_end — 가치 낮을 수 있음)")
+        elif parent_status == "confirmed":
+            reasons.append("(parent confirmed — chain 후속, 가치 높음)")
+        candidates.append({
+            "rank": idx,
+            "node_id": str(n.node_id),
+            "node_type": n.node_type,
+            "depth": n.depth,
+            "summary": (n.summary or "")[:160],
+            "endpoint": n.endpoint or "",
+            "parent_id": str(n.parent_id)[:8] if n.parent_id else None,
+            "parent_status": parent_status,
+            "reason": " · ".join(reasons),
+        })
+
     _json_out({
         "action": "EXPLORE",
-        "message": f"Pick node {str(pending.node_id)[:8]} and start exploring.",
+        "message": (
+            f"{len(candidates)}개 후보 — 0번이 BFS 추천. 다른 후보가 더 가치 있다고 "
+            f"판단하면 자유롭게 그것을 선택. 선택 후 update_node_status(exploring) 먼저."
+        ),
+        "candidates": candidates,
+        "recommend": 0,
+        # ── backward-compat: 0번 후보의 필드를 top-level에도 노출 ──
         "node_id": str(pending.node_id),
         "node_type": pending.node_type,
         "depth": pending.depth,
