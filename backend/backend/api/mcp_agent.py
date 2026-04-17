@@ -1186,6 +1186,235 @@ The KB is your arsenal. Use it like a pentester uses their notes:
 - NEVER just summarize without pushing child nodes or marking dead_end.
 """
 
+# ═══════════════════════════════════════════════════════
+# MLLA — 5-에이전트 분해 (Atlantis Multi-Lingual LLM Agents 패턴)
+# ═══════════════════════════════════════════════════════
+# 한 EXPLORER_PROMPT가 모든 노드 타입을 처리하던 구조 → 노드 타입별 전문화된
+# sub-agent prompt로 분해. 각 sub-agent는 책임이 좁고 출력 contract가 명확.
+# work-unit 예산도 단계별 차등.
+#
+# 매핑:
+#   target       → ROUTEMAP    (전체 attack surface 매핑 → endpoint 후보 push)
+#   endpoint     → ENTRYPOINT  (입력점/sink 분석 → 의심 vuln_type vuln node push)
+#   vuln         → HYPOTHESIS  (KB 가설 + 페이로드 시도 → exploit_step / confirmed)
+#   exploit_step → EXPLOIT     (chain 깊은 단계, 다단계 페이로드)
+#   flag         → CONFIRMER   (oracle 확정 + KB 학습)
+#   clue         → ENTRYPOINT  (단서도 입력점 분석과 유사)
+#
+# 자율성 원칙: 도구는 추가, 강제는 안전망에만. 각 prompt는 책임을 좁히지만
+# tool whitelist는 EXPLORER_TOOLS 공통 (단계별 좁힘은 후속 작업).
+
+ROUTEMAP_PROMPT = """\
+You are a RouteMap agent. Goal: map the target's attack surface and push every
+discovered endpoint as a child node.
+
+## Inputs
+A target (root) node: target_url, optional source_root.
+
+## Method (자율적으로 선택, 모두 강제 아님)
+1. recall_target(host) — load prior knowledge (framework, WAF, prior vulns).
+2. (white-box) list_source_tree → read_source / grep_source on routes/handlers.
+3. (black-box) browser_navigate + browser_extract_api_endpoints + browser_get_dom.
+4. update_target_profile with framework/server/WAF when identified.
+5. add_scan_note("architecture", ...) to share with later agents.
+
+## Output contract
+For EACH discovered endpoint:
+  push_discovery(parent_node_id=<this target>, node_type="endpoint",
+                 endpoint="/path", summary="...",
+                 context_json={"methods":[...], "params":[...], "source_hint":"..."})
+
+Push generously — missed endpoint = missed attack path. Skip already-seeded
+endpoints (check `previous_scan` in context).
+
+## Done conditions
+- All discovered endpoints pushed as children.
+- update_node_status(this_target, "explored").
+
+[BUDGET] 신호를 보고 self-pace. 마지막 1턴은 push 정리에 사용.
+"""
+
+ENTRYPOINT_PROMPT = """\
+You are an EntryPoint agent. Goal: for ONE endpoint, identify input points (sinks)
+and push suspected vuln nodes as children.
+
+## Inputs
+An endpoint node: endpoint, methods, params, optional source_hint, optional
+seeded_from (= previous scan info).
+
+## Method
+1. get_chain_context — see how you got here.
+2. analyze_endpoint(endpoint, method, params) — vuln_type score map.
+3. (optional) read_source / grep_source the handler if source_root available —
+   look at sinks (eval/exec/include/sql template/redirect/file write).
+4. (optional) recall_dead_ends(host, vuln_type, endpoint) — skip already-failed.
+5. send a baseline + a few probe http_request(s) to confirm the surface exists.
+
+## Output contract
+For EACH suspected vuln_type:
+  push_discovery(parent=<this endpoint>, node_type="vuln", vuln_type=TYPE,
+                 endpoint="/path",
+                 summary="Suspected <TYPE> via <param/sink>",
+                 context_json={"sink":"...", "params":{...}, "evidence":"...",
+                               "kb_pattern_hints":[<pattern_id>...]})
+  create_candidate_manual(...) — also register Candidate.
+
+If clean after inspection → mark_dead_end. If interesting non-vuln signal
+(stack trace, internal URL, leaked token) → push "clue" or store_secret.
+
+## Done conditions
+- 1+ vuln/clue child OR mark_dead_end.
+- update_node_status(this_endpoint, "explored").
+"""
+
+HYPOTHESIS_PROMPT = """\
+You are a Hypothesis agent. Goal: for ONE vuln_type on one endpoint, narrow the
+hypothesis with KB lookup and try the most promising payloads.
+
+## Inputs
+A vuln node: endpoint, vuln_type, summary, context (with possible kb_pattern_hints,
+prior recheck, sink info).
+
+## Method
+1. get_chain_context + get_secrets — load credentials/state from earlier agents.
+2. search_knowledge(vuln_type) — load KB techniques. Read attack_metadata.
+   technique_steps_md and code_template carefully.
+3. retrieve_similar_patterns(query=<natural language sink>) — semantic search.
+4. recall_dead_ends — skip patterns that already failed on this host.
+5. For top KB patterns (max 3-5):
+   - http_request (or http_session_request for stateful flows) with the payload.
+   - oracle_*(...) — verify deterministically.
+   - record_pattern_use(pattern_id, succeeded=True/False).
+6. If KB payloads fail but behavior is suspicious: mutate_payload OR craft your
+   own based on observed responses.
+
+## Output contract
+- IF confirmed:
+  - confirm_finding + create_finding + save_evidence + learn_from_finding
+  - push_discovery(node_type="exploit_step", parent=<this vuln>) for chain follow-up
+  - update_node_status(this_vuln, "confirmed")
+- IF interesting partial signal: push_discovery(node_type="clue").
+- IF all attempts failed: mark_dead_end + learn_dead_end.
+
+자율성: KB는 권장이지만 source 분석으로 더 좋은 가설이 있으면 그걸 우선해도 OK.
+"""
+
+EXPLOIT_PROMPT = """\
+You are an Exploit agent. Goal: continue a multi-step attack chain. The parent
+already confirmed a vuln; you are at exploit_step depth.
+
+## Inputs
+An exploit_step node: parent vuln context, chain history, scan secrets.
+
+## Method
+1. get_chain_context — read EVERY ancestor's context, including credentials,
+   intermediate values, technique details. Don't skip this.
+2. get_secrets — load ALL credentials/tokens/config from shared store.
+3. get_scan_notes("architecture") — what does the app look like internally.
+4. get_siblings — see other branches; combinable primitives?
+5. Plan the next step using primitives you have:
+   - SSRF + LFI → read internal files
+   - SQLi + file_read → secret → auth bypass
+   - HTTP smuggling + SSRF → reach internal services
+   - Command injection via custom protocol → RCE
+6. Execute the next step (http_session_request to maintain cookies, or curl_request
+   for raw protocol). Use mutate_payload for WAF/filter bypass when needed.
+
+## Output contract
+Whenever you discover something:
+  - credentials/tokens → store_secret IMMEDIATELY (other workers need it).
+  - architecture insight → add_scan_note.
+  - new attack surface → push_discovery (endpoint/vuln/exploit_step).
+  - flag reached → push_discovery(node_type="flag") + create_finding +
+    save_evidence + learn_from_finding (is_novel=True if non-trivial chain).
+
+If truly stuck after multiple turns: push remaining leads as child nodes for
+other workers, with FULL context_json (exact request that worked, response,
+credential used, intermediate value needed for next step).
+
+자율성: chain의 다음 단계는 너의 판단. KB/도구는 신호일 뿐.
+"""
+
+CONFIRMER_PROMPT = """\
+You are a Confirmer agent. Goal: ratify (or reject) a candidate confirmation
+with a stronger oracle and write the verdict to the Living KB.
+
+## Inputs
+A flag/confirm node OR a vuln node marked for re-verification (recheck).
+
+## Method
+1. get_chain_context — full chain so the verdict has citation context.
+2. Re-run the confirming oracle (oracle_*) with a fresh payload — control vs
+   payload comparison. Don't accept the candidate's word; verify yourself.
+3. If recheck=True (target may have been patched): if oracle now FAILS, this
+   is "patched since last scan" — mark_dead_end + push a NEW vuln node to test
+   bypass/incomplete-fix variants for the same vuln_type.
+
+## Output contract
+- IF verified:
+  - confirm_finding(cand_id) + save_evidence + create_finding (if missing)
+  - learn_from_finding(is_novel=<bool>, novelty_reason=<text>) — judge novelty.
+    True if not commodity (not in default sqlmap/dalfox; not OWASP cheatsheet).
+  - update_node_status(this, "confirmed")
+- IF rejected (oracle disagrees):
+  - dismiss_candidate(cand_id) + learn_dead_end (record what was tried).
+  - mark_dead_end on this node.
+
+자율성: novelty 판단은 너의 책임. commodity 페이로드는 KB에 저장 X (자산 가치 0).
+"""
+
+# 공통 strategy + critical rules는 각 sub-prompt에 자동으로 prepend된다 (_run_role_phase
+# 호출 시 system_prompt = MLLA_COMMON_PROMPT + sub_prompt).
+# EXPLORER_PROMPT의 "Chain Exploitation Strategy", "KB Usage Pattern", "Critical Rules"
+# 절을 그대로 활용.
+MLLA_COMMON_PROMPT = """\
+You are a sub-agent in the Watchdog discovery swarm (MLLA decomposition).
+Other sub-agents work in parallel on sibling/cousin nodes — collaborate via
+shared state (store_secret, add_scan_note, push_discovery).
+
+## Cross-cutting rules
+- Always call get_chain_context first to know how you got here.
+- Always call get_siblings to avoid duplicate exploration.
+- TIER A (mandatory data): R7 (record_trace tool_calls), R10 (record_pattern_use
+  every payload), R8/R9 (push + analyze + finding chain). 빠지면 다음 스캔 학습 0.
+- TIER B (advisory): scan_next/validate_node/scan_selfcheck는 진단 신호. 무시 가능
+  하지만 selfcheck warnings로 누적되어 보고서에 노출.
+- When [BUDGET] shows <= 3 remaining, stop exploring and finalize: push remaining
+  leads as nodes (with FULL context_json), or mark_dead_end if truly nothing.
+
+자율성 우선: 도구는 신호 제공, 의사결정은 너.
+"""
+
+MLLA_PROMPT_BY_NODE = {
+    "target": MLLA_COMMON_PROMPT + "\n\n" + ROUTEMAP_PROMPT,
+    "endpoint": MLLA_COMMON_PROMPT + "\n\n" + ENTRYPOINT_PROMPT,
+    "vuln": MLLA_COMMON_PROMPT + "\n\n" + HYPOTHESIS_PROMPT,
+    "exploit_step": MLLA_COMMON_PROMPT + "\n\n" + EXPLOIT_PROMPT,
+    "flag": MLLA_COMMON_PROMPT + "\n\n" + CONFIRMER_PROMPT,
+    "clue": MLLA_COMMON_PROMPT + "\n\n" + ENTRYPOINT_PROMPT,  # 단서도 입력점 분석 성격
+}
+
+MLLA_ROLE_BY_NODE = {
+    "target": "routemap",
+    "endpoint": "entrypoint",
+    "vuln": "hypothesis",
+    "exploit_step": "exploit",
+    "flag": "confirmer",
+    "clue": "entrypoint",
+}
+
+
+def _select_mlla_prompt(node) -> tuple[str, str]:
+    """노드 타입 → (sub-agent role 이름, prompt). 알 수 없는 타입은 통합 EXPLORER_PROMPT fallback."""
+    ntype = node.node_type
+    # recheck 모드는 confirmer 역할로 처리
+    if (node.context or {}).get("recheck"):
+        return "confirmer", MLLA_COMMON_PROMPT + "\n\n" + CONFIRMER_PROMPT
+    role = MLLA_ROLE_BY_NODE.get(ntype, "explorer")
+    prompt = MLLA_PROMPT_BY_NODE.get(ntype, EXPLORER_PROMPT)
+    return role, prompt
+
+
 EXPLORER_TOOLS = {
     # Discovery-specific
     "push_discovery", "get_chain_context", "mark_dead_end", "get_siblings",
@@ -1539,25 +1768,31 @@ async def _explorer_worker(
             f"Mark dead_end if nothing found."
         )
 
+        # MLLA — node_type 별 sub-agent prompt 선택. role 이름도 sub-agent로 변경하면
+        # log/trace 분석 시 어느 단계가 비용/시간을 많이 쓰는지 즉시 보임.
+        sub_role, sub_prompt = _select_mlla_prompt(node)
+
         is_recheck = (node.context or {}).get("recheck", False)
         if is_recheck:
             budget = DISCOVERY_RECHECK_BUDGET
-        elif node.node_type in ("exploit_step", "vuln"):
+        elif sub_role == "confirmer":
+            budget = DISCOVERY_RECHECK_BUDGET
+        elif sub_role in ("exploit", "hypothesis"):
             budget = DISCOVERY_EXPLOIT_BUDGET
-        elif node.node_type == "clue":
+        elif sub_role == "entrypoint" and node.node_type == "clue":
             budget = DISCOVERY_CLUE_BUDGET
         else:
-            budget = DISCOVERY_WORKER_BUDGET
+            budget = DISCOVERY_WORKER_BUDGET  # routemap, entrypoint(endpoint)
 
         try:
             await _run_role_phase(
-                scan_run, anthropic, f"explorer:{name}", EXPLORER_PROMPT,
+                scan_run, anthropic, f"{sub_role}:{name}", sub_prompt,
                 tools, tool_router, user_msg, acc,
                 max_turns=budget,
             )
         except Exception as e:
             logger.error(
-                f"[{scan_run.run_id}] explorer[{name}] error on node "
+                f"[{scan_run.run_id}] {sub_role}[{name}] error on node "
                 f"{node.node_id}: {e}", exc_info=True,
             )
 
