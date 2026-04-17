@@ -2016,9 +2016,16 @@ async def _explorer_worker(
             )
             await sync_to_async(_record_node_warnings)(node, violations)
 
-        await sync_to_async(
-            lambda: _mark_node_explored(node)
+        # _finalize_node: sub-agent 가 finalize 누락 시 안전망 —
+        # vuln/exploit_step 은 자동 dead_end + learn_dead_end, 그 외 explored.
+        final_status = await sync_to_async(
+            lambda: _finalize_node(node, scan_run)
         )()
+        if final_status == "dead_end":
+            logger.info(
+                f"[{scan_run.run_id}] explorer[{name}] node {node.node_id} "
+                f"auto-finalized as dead_end (sub-agent unfinalized safety-net)"
+            )
         last_activity_ref[0] = _t.time()
 
 
@@ -2035,11 +2042,69 @@ def _record_node_warnings(node, violations: list[str]) -> None:
 
 
 def _mark_node_explored(node):
-    """Mark node as explored if still in exploring state."""
+    """Legacy thin wrapper — 새 코드는 _finalize_node 사용."""
     from api.models import DiscoveryNode
     DiscoveryNode.objects.filter(
         node_id=node.node_id, status="exploring",
     ).update(status="explored", explored_at=timezone.now())
+
+
+def _finalize_node(node, scan_run) -> str:
+    """Sub-agent 종료 시 노드 status 전이 + 실패 누적 안전망.
+
+    LLM sub-agent 가 TIER A finalize 를 빠뜨리면 KB 학습 0 → 다음 scan 이
+    같은 시도 반복. 안전망:
+      - vuln / exploit_step 이 아직 exploring 이면 → dead_end + learn_dead_end
+        (payload_used="", reason="sub-agent unfinalized")
+      - 다른 타입 (target/endpoint/clue/flag) 은 기존 explored 전이
+
+    LLM 이 이미 confirmed / dead_end / explored 로 마무리했으면 skip.
+    자율성 원칙: 이건 강제 게이트가 아니라 데이터 손실 방지 안전망.
+
+    Returns: 최종 status 문자열 (explored / dead_end / 기존 confirmed / 기존 dead_end).
+    """
+    from urllib.parse import urlparse
+    from api.models import DiscoveryNode
+
+    node.refresh_from_db()
+    if node.status in ("confirmed", "dead_end", "explored"):
+        return node.status  # 이미 finalized
+
+    now = timezone.now()
+    ntype = node.node_type
+
+    if ntype in ("vuln", "exploit_step") and node.endpoint and node.vuln_type:
+        # 안전망: 자동 learn_dead_end + dead_end 전이
+        try:
+            parsed = urlparse(scan_run.target_url or "")
+            host = (parsed.netloc or parsed.hostname or "").lower()
+            if host:
+                from watchdog_mcp.tools_learn import _learn_dead_end
+                _learn_dead_end(
+                    target_host=host,
+                    endpoint=node.endpoint,
+                    vuln_type=node.vuln_type,
+                    pattern_id="",
+                    payload_used="",
+                    reason=f"sub-agent unfinalized — {ntype} node left exploring",
+                )
+                logger.info(
+                    f"[{scan_run.run_id}] _finalize_node safety-net: "
+                    f"auto learn_dead_end for {ntype} {node.endpoint} ({node.vuln_type})"
+                )
+        except Exception as e:
+            logger.warning(f"[{scan_run.run_id}] _finalize_node learn_dead_end failed: {e}")
+
+        updated = DiscoveryNode.objects.filter(
+            node_id=node.node_id, status="exploring",
+        ).update(status="dead_end", explored_at=now)
+        return "dead_end" if updated else node.status
+
+    # 다른 타입: 기존 explored 전이
+    updated = DiscoveryNode.objects.filter(
+        node_id=node.node_id, status="exploring",
+    ).update(status="explored", explored_at=now)
+    return "explored" if updated else node.status
 
 
 # ═══════════════════════════════════════════════════════
