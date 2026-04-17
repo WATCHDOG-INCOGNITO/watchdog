@@ -1181,28 +1181,37 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
     });
   }, [data, filter, vulnFilter]);
 
-  // (method, normalized_path) 로 그룹화 — `/api/login/1`, `/api/login/2` → `/api/login/{id}`.
-  // 그룹 내 1개뿐이면 single row 그대로, 2개+ 면 accordion (요약 행 + click 시 멤버 펼침).
+  // (method, base_path) 로 그룹화 — REST 관습: collection `/api/Users` 와
+  // item `/api/Users/{id}` 는 같은 리소스의 두 면 → 한 그룹에 묶음.
+  // base_path = normalized path 의 마지막 segment 가 placeholder({id}/{uuid}/{hash})
+  // 면 그것을 제거. 그렇지 않으면 path 그대로 (collection 자체가 base).
   const groups = useMemo(() => {
     const map = new Map();
     for (const s of filtered) {
       const norm = normalizeEndpointPath(s.endpoint);
-      const key = `${s.method} ${norm}`;
+      const segs = norm.split("/");
+      const last = segs[segs.length - 1];
+      const isPlaceholder = /^\{(id|uuid|hash)\}$/.test(last);
+      const basePath = isPlaceholder ? segs.slice(0, -1).join("/") : norm;
+      const key = `${s.method} ${basePath}`;
       if (!map.has(key)) {
-        map.set(key, { key, method: s.method, normPath: norm, members: [] });
+        map.set(key, { key, method: s.method, basePath, members: [] });
       }
-      map.get(key).members.push(s);
+      map.get(key).members.push({ ...s, _normPath: norm, _isItem: isPlaceholder });
     }
     // 각 그룹 derive
     const arr = Array.from(map.values()).map((g) => {
       const vt = new Set();
       const sinks = new Set();
       let auth = false, seen = 0;
+      let collectionCount = 0, itemCount = 0;
       for (const m of g.members) {
         for (const v of m.suspected_vuln_types || []) vt.add(v);
         for (const k of m.sink_hints || []) sinks.add(k);
         if (m.auth_required) auth = true;
         seen += m.times_seen || 0;
+        if (m._isItem) itemCount++;
+        else collectionCount++;
       }
       return {
         ...g,
@@ -1211,10 +1220,12 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
         union_sinks: Array.from(sinks).sort(),
         any_auth: auth,
         total_seen: seen,
+        collection_count: collectionCount,
+        item_count: itemCount,
       };
     });
     // 멤버가 많은 순, 그 다음 path 알파벳
-    arr.sort((a, b) => (b.size - a.size) || a.normPath.localeCompare(b.normPath));
+    arr.sort((a, b) => (b.size - a.size) || a.basePath.localeCompare(b.basePath));
     return arr;
   }, [filtered]);
 
@@ -1340,8 +1351,14 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
                       </tr>
                     );
                   }
-                  // 멤버 2개+ — 그룹 행(요약) + 펼침 시 멤버 행들.
+                  // 멤버 2개+ — 그룹 행(요약) + 펼침 시 멤버 행들 (collection / item 구분).
                   const isOpen = expandedGroups.has(g.key);
+                  const headerLabel = (() => {
+                    const parts = [];
+                    if (g.collection_count) parts.push(`collection ×${g.collection_count}`);
+                    if (g.item_count) parts.push(`item ×${g.item_count}`);
+                    return parts.join(" + ");
+                  })();
                   return (
                     <Fragment key={g.key}>
                       <tr
@@ -1359,10 +1376,10 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
                           <strong>{g.method}</strong>
                         </td>
                         <td style={{ padding: "8px 12px" }}>
-                          {g.normPath}
+                          {g.basePath || "/"}
                           {g.any_auth ? <span style={{ marginLeft: 6, opacity: 0.75 }}>🔒</span> : null}
                           <span style={{ marginLeft: 8, opacity: 0.65, fontWeight: 400, fontSize: "0.85em" }}>
-                            ({g.size} variants)
+                            ({headerLabel})
                           </span>
                         </td>
                         <td style={{ padding: "8px 12px" }}>
@@ -1386,6 +1403,9 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
                           <td style={{ padding: "6px 12px 6px 28px", opacity: 0.75 }}>{s.method}</td>
                           <td style={{ padding: "6px 12px 6px 28px" }}>
                             <span style={{ opacity: 0.6, marginRight: 4 }}>└</span>
+                            <span style={{ opacity: 0.6, fontSize: "0.85em", marginRight: 6 }}>
+                              {s._isItem ? "item" : "collection"}
+                            </span>
                             {s.endpoint}
                             {s.auth_required ? <span style={{ marginLeft: 6, opacity: 0.75 }}>🔒</span> : null}
                           </td>
