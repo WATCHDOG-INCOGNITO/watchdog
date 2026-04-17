@@ -77,6 +77,33 @@ def register(mcp):
                 "total_nodes": existing_count,
             })
 
+        # 안전망 — 같은 scan 에 (endpoint, vuln_type, node_type) 조합이 이미 있으면
+        # 새로 만들지 않고 기존 노드 반환. worker race 또는 LLM 의 중복 push 방지.
+        # endpoint 없는 clue/flag 등은 dedup 안 함 (의미가 다를 수 있음).
+        # trailing-slash 변형 허용.
+        if endpoint and node_type in ("endpoint", "vuln", "exploit_step"):
+            ep_norm = endpoint.split("?", 1)[0].rstrip("/") or "/"
+            ep_variants = [endpoint, ep_norm, ep_norm + "/"]
+            existing = (
+                DiscoveryNode.objects
+                .filter(scan_run_id=scan_run_id, node_type=node_type)
+                .filter(endpoint__in=ep_variants)
+                .filter(vuln_type=vuln_type or "")
+                .order_by("created_at")
+                .first()
+            )
+            if existing:
+                return json.dumps({
+                    "node_id": str(existing.node_id),
+                    "depth": existing.depth,
+                    "node_type": existing.node_type,
+                    "deduped": True,
+                    "deduped_reason": "same scan+endpoint+vuln_type+node_type already exists",
+                    "queue_pending": DiscoveryNode.objects.filter(
+                        scan_run_id=scan_run_id, status="pending",
+                    ).count(),
+                })
+
         node = DiscoveryNode.objects.create(
             scan_run_id=scan_run_id,
             parent=parent,

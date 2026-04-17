@@ -998,7 +998,7 @@ DISCOVERY_WORKER_BUDGET = int(os.environ.get("WATCHDOG_DISCOVERY_WORKER_BUDGET",
 DISCOVERY_EXPLOIT_BUDGET = int(os.environ.get("WATCHDOG_DISCOVERY_EXPLOIT_BUDGET", "22"))
 DISCOVERY_CLUE_BUDGET = int(os.environ.get("WATCHDOG_DISCOVERY_CLUE_BUDGET", "18"))
 DISCOVERY_RECHECK_BUDGET = int(os.environ.get("WATCHDOG_DISCOVERY_RECHECK_BUDGET", "5"))
-DISCOVERY_QUIESCENCE_S = int(os.environ.get("WATCHDOG_DISCOVERY_QUIESCENCE_S", "45"))
+DISCOVERY_QUIESCENCE_S = int(os.environ.get("WATCHDOG_DISCOVERY_QUIESCENCE_S", "120"))
 DISCOVERY_MAX_CALLS = int(os.environ.get("WATCHDOG_DISCOVERY_MAX_CALLS", "300"))
 DISCOVERY_MAX_COST_USD = Decimal(os.environ.get("WATCHDOG_DISCOVERY_MAX_COST_USD", "5.0"))
 
@@ -1934,6 +1934,9 @@ async def _explorer_worker(
         else:
             budget = DISCOVERY_WORKER_BUDGET  # routemap, entrypoint(endpoint)
 
+        # C: LLM call 직전에도 last_activity 갱신. _run_role_phase 가 길게 (수 분)
+        # 돌면 그 사이 quiescence 오판정 위험 — worker 가 "활동 중"임을 명시.
+        last_activity_ref[0] = _t.time()
         try:
             await _run_role_phase(
                 scan_run, anthropic, f"{sub_role}:{name}", sub_prompt,
@@ -1945,6 +1948,7 @@ async def _explorer_worker(
                 f"[{scan_run.run_id}] {sub_role}[{name}] error on node "
                 f"{node.node_id}: {e}", exc_info=True,
             )
+        last_activity_ref[0] = _t.time()  # LLM call 직후도 갱신
 
         # ── Orchestrator validation: SOFT SIGNAL ONLY (자율성 우선 원칙) ──
         # validator는 안전망(diagnostic)이지 강제(gate)가 아니다.
@@ -2481,7 +2485,20 @@ async def _run_discovery_loop(
         scan_run.target_url, str(scan_run.run_id), resume_from,
     )
     if prev_knowledge:
-        root_context["previous_scan"] = prev_knowledge
+        # B: root context 에는 요약만 박는다 — 매 worker user_msg 의 node.context json
+        # 800자에 prev 풀 데이터가 들어가 정작 노드 정보가 잘리는 문제 방지.
+        # 풀 데이터는 _seed_from_previous 가 트리에 노드로 직접 박으므로 worker 가
+        # get_chain_context / 노드 자체로 접근 가능.
+        root_context["previous_scan"] = {
+            "prev_run_id": prev_knowledge.get("prev_run_id", ""),
+            "summary": {
+                "endpoints": len(prev_knowledge.get("endpoints", [])),
+                "vulns_to_recheck": len(prev_knowledge.get("vulns", [])),
+                "dead_ends": len(prev_knowledge.get("dead_ends", [])),
+                "clues": len(prev_knowledge.get("clues", [])),
+            },
+            "note": "Full data already seeded as child nodes. Use get_siblings or browse tree.",
+        }
         logger.info(
             f"[{scan_run.run_id}] seeded with previous knowledge "
             f"(resume_from={resume_from or 'auto'}): "
