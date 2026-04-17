@@ -33,7 +33,7 @@ class ScanRun(models.Model):
 
     run_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     target_url = models.TextField()
-    mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.HYBRID_LITE)
+    mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.DISCOVERY)
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.QUEUED)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

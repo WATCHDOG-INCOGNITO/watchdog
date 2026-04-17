@@ -1,34 +1,147 @@
 {
-  "timestamp": "2026-04-13T08:16:39.283294+00:00",
-  "phase": "3-multiagent-baseline",
-  "git_rev": "afa1c73",
+  "timestamp": "2026-04-17T06:09:34.025118+00:00",
+  "phase": "oss-baseline-w6",
+  "git_rev": "edbcb91",
   "mcp": true,
-  "mean_f1": 0.0,
-  "mean_score": -0.0619,
+  "mean_f1": 0.1944,
+  "mean_score": -0.0312,
   "results": [
     {
-      "target_id": "wargame",
-      "target_url": "http://wargame:5000",
-      "run_id": "9075722e-f318-48b7-bc7c-2ace113f5ad5",
+      "target_id": "oss-juice-shop",
+      "target_url": "http://juice-shop:3000",
+      "run_id": "8a9359f0-0f01-443f-9ea1-98a94f9d1253",
       "status": "finished",
-      "duration_s": 217.8,
-      "llm_calls": 20,
-      "llm_tokens": 137044,
-      "llm_cost_usd": 0.4388,
-      "turns": 20,
-      "endpoints_crawled": 0,
-      "candidates": 0,
-      "findings": 0,
-      "tp": 0,
-      "fp": 0,
+      "duration_s": 332.7,
+      "llm_calls": 72,
+      "llm_tokens": 340305,
+      "llm_cost_usd": 1.2099,
+      "turns": 72,
+      "endpoints_crawled": 6,
+      "candidates": 14,
+      "findings": 3,
+      "tp": 1,
+      "fp": 3,
       "fn": 7,
-      "precision": 0.0,
-      "recall": 0.0,
-      "f1": 0.0,
-      "score": -0.0619,
+      "precision": 0.25,
+      "recall": 0.125,
+      "f1": 0.16666666666666666,
+      "score": -0.0378,
+      "flag_found": false,
+      "flag_value": "",
       "expected": [
         {
-          "endpoint": "/user",
+          "endpoint": "/rest/user/login",
+          "param": "email",
+          "vuln_type": "sqli",
+          "severity": "critical",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/rest/products/search",
+          "param": "q",
+          "vuln_type": "sqli",
+          "severity": "high",
+          "matched": true,
+          "matched_as": "candidate"
+        },
+        {
+          "endpoint": "/rest/products/search",
+          "param": "q",
+          "vuln_type": "xss",
+          "severity": "high",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/ftp/",
+          "param": "",
+          "vuln_type": "path_traversal",
+          "severity": "high",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/api/Feedbacks",
+          "param": "UserId",
+          "vuln_type": "idor",
+          "severity": "medium",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/rest/user/change-password",
+          "param": "",
+          "vuln_type": "csrf",
+          "severity": "medium",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/api/Users",
+          "param": "",
+          "vuln_type": "auth_bypass",
+          "severity": "high",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/redirect",
+          "param": "to",
+          "vuln_type": "open_redirect",
+          "severity": "low",
+          "matched": false,
+          "matched_as": ""
+        }
+      ],
+      "extra_findings": [
+        {
+          "endpoint": "/rest/user/authentication-details",
+          "vuln_type": "auth_bypass"
+        },
+        {
+          "endpoint": "/rest/admin/application-configuration",
+          "vuln_type": "information_disclosure"
+        },
+        {
+          "endpoint": "/rest/admin",
+          "vuln_type": "information_disclosure"
+        }
+      ]
+    },
+    {
+      "target_id": "oss-dvwa",
+      "target_url": "http://dvwa",
+      "run_id": "3cd8769f-0524-4d70-91af-bf1441599e85",
+      "status": "finished",
+      "duration_s": 362.4,
+      "llm_calls": 80,
+      "llm_tokens": 518251,
+      "llm_cost_usd": 1.739,
+      "turns": 80,
+      "endpoints_crawled": 3,
+      "candidates": 8,
+      "findings": 0,
+      "tp": 1,
+      "fp": 0,
+      "fn": 7,
+      "precision": 1.0,
+      "recall": 0.125,
+      "f1": 0.2222222222222222,
+      "score": -0.0247,
+      "flag_found": false,
+      "flag_value": "",
+      "expected": [
+        {
+          "endpoint": "/vulnerabilities/sqli/",
+          "param": "id",
+          "vuln_type": "sqli",
+          "severity": "high",
+          "matched": true,
+          "matched_as": "candidate"
+        },
+        {
+          "endpoint": "/vulnerabilities/sqli_blind/",
           "param": "id",
           "vuln_type": "sqli",
           "severity": "high",
@@ -36,50 +149,50 @@
           "matched_as": ""
         },
         {
-          "endpoint": "/posts",
-          "param": "user_id",
-          "vuln_type": "sqli",
-          "severity": "high",
-          "matched": false,
-          "matched_as": ""
-        },
-        {
-          "endpoint": "/login",
-          "param": "username",
-          "vuln_type": "sqli",
-          "severity": "high",
-          "matched": false,
-          "matched_as": ""
-        },
-        {
-          "endpoint": "/search",
-          "param": "q",
+          "endpoint": "/vulnerabilities/xss_r/",
+          "param": "name",
           "vuln_type": "xss",
-          "severity": "medium",
-          "matched": false,
-          "matched_as": ""
-        },
-        {
-          "endpoint": "/profile",
-          "param": "uid",
-          "vuln_type": "idor",
-          "severity": "medium",
-          "matched": false,
-          "matched_as": ""
-        },
-        {
-          "endpoint": "/fetch",
-          "param": "url",
-          "vuln_type": "ssrf",
           "severity": "high",
           "matched": false,
           "matched_as": ""
         },
         {
-          "endpoint": "/read",
-          "param": "file",
+          "endpoint": "/vulnerabilities/xss_s/",
+          "param": "txtName",
+          "vuln_type": "xss",
+          "severity": "high",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/vulnerabilities/exec/",
+          "param": "ip",
+          "vuln_type": "cmdi",
+          "severity": "critical",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/vulnerabilities/fi/",
+          "param": "page",
           "vuln_type": "lfi",
           "severity": "high",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/vulnerabilities/upload/",
+          "param": "uploaded",
+          "vuln_type": "file_upload",
+          "severity": "high",
+          "matched": false,
+          "matched_as": ""
+        },
+        {
+          "endpoint": "/vulnerabilities/csrf/",
+          "param": "",
+          "vuln_type": "csrf",
+          "severity": "medium",
           "matched": false,
           "matched_as": ""
         }

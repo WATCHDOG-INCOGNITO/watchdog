@@ -112,6 +112,7 @@ def register(mcp):
             params_dict = {}
 
         def _create():
+            from api.models import DiscoveryNode
             scan_run = ScanRun.objects.get(run_id=run_id)
             req = RequestCatalog.objects.create(
                 scan_run=scan_run,
@@ -123,6 +124,28 @@ def register(mcp):
             param_hits = analyze_params(params_dict)
             path_hits = analyze_path(endpoint)
             score = calculate_priority(param_hits, path_hits)
+
+            # 안전망 — 같은 scan에 endpoint(+vuln_type) 매칭되는 최근 vuln/endpoint 노드를
+            # features.discovery_node_id 로 자동 link. 그래야 confirm_finding 시
+            # 노드 status 가 자동 confirmed 로 전이 (storage_service line 80-84).
+            node_id = None
+            ep_norm = (endpoint or "").split("?", 1)[0].rstrip("/") or "/"
+            cand_qs = (
+                DiscoveryNode.objects
+                .filter(scan_run=scan_run)
+                .filter(node_type__in=["vuln", "endpoint"])
+                .filter(endpoint__in=[endpoint, ep_norm, ep_norm + "/"])
+            )
+            # vuln_type 일치 우선 (없으면 endpoint 매칭만)
+            preferred = cand_qs.filter(vuln_type=vuln_type).order_by("-created_at").first()
+            picked = preferred or cand_qs.order_by("-created_at").first()
+            if picked:
+                node_id = str(picked.node_id)
+
+            features = {"source": "llm_manual", "params": params_dict, "endpoint": endpoint}
+            if node_id:
+                features["discovery_node_id"] = node_id
+
             cand = Candidate.objects.create(
                 scan_run=scan_run,
                 request=req,
@@ -131,14 +154,14 @@ def register(mcp):
                 priority_score=max(score, 0.8),
                 detection_stage="llm_screen",
                 status="open",
-                features={"source": "llm_manual", "params": params_dict},
+                features=features,
             )
-            return str(cand.cand_id)
+            return str(cand.cand_id), node_id
 
         # thread_sensitive=True 가 async event loop 내 ORM 호출에서 안전.
         # 다른 도구들(record_pattern_use 등)이 우연히 통과하는 건 호출 빈도/타이밍 차이.
         try:
-            cand_id = await sync_to_async(_create, thread_sensitive=True)()
+            cand_id, node_id = await sync_to_async(_create, thread_sensitive=True)()
         except Exception as e:
             return json.dumps({"error": f"create_candidate_manual failed: {e}"})
         return json.dumps({
@@ -146,4 +169,5 @@ def register(mcp):
             "vuln_type": vuln_type,
             "endpoint": endpoint,
             "status": "open",
+            "linked_node_id": node_id,
         })
