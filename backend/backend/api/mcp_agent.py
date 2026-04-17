@@ -997,6 +997,12 @@ DISCOVERY_QUIESCENCE_S = int(os.environ.get("WATCHDOG_DISCOVERY_QUIESCENCE_S", "
 DISCOVERY_MAX_CALLS = int(os.environ.get("WATCHDOG_DISCOVERY_MAX_CALLS", "300"))
 DISCOVERY_MAX_COST_USD = Decimal(os.environ.get("WATCHDOG_DISCOVERY_MAX_COST_USD", "5.0"))
 
+# Pre-exploit critic (CodeMender 패턴) — exploit_step 노드 진행 전 1회 평가.
+# 단순 verdict + 전제/대안 — 비용 최소화 (2-3 turn).
+DISCOVERY_CRITIC_BUDGET = int(os.environ.get("WATCHDOG_DISCOVERY_CRITIC_BUDGET", "3"))
+# 환경변수로 전체 critic off 가능 (비용 부담 시).
+DISCOVERY_CRITIC_ENABLED = os.environ.get("WATCHDOG_DISCOVERY_CRITIC", "1") not in ("0", "false", "no")
+
 EXPLORER_PROMPT = """\
 You are an Explorer Worker in discovery mode.
 You receive a single DiscoveryNode (a clue or discovery from a prior step) and must:
@@ -1367,6 +1373,50 @@ A flag/confirm node OR a vuln node marked for re-verification (recheck).
 자율성: novelty 판단은 너의 책임. commodity 페이로드는 KB에 저장 X (자산 가치 0).
 """
 
+CRITIC_PROMPT = """\
+You are a pre-exploit Critic (CodeMender 패턴). Goal: BEFORE the Exploit agent
+spends turns trying payloads on this exploit_step, predict if the chain is
+likely to work.
+
+## Inputs
+The exploit_step node + ancestor chain context (parent vuln + grandparent
+endpoint + secrets + scan notes).
+
+## Method
+1. Read the chain — parent vuln_type, what was confirmed, what credentials/
+   tokens are available, what intermediate values exist.
+2. Identify hidden prerequisites that may be missing:
+   - Required credential not yet stolen?
+   - Required side-channel (OOB, timing) not feasible on this host?
+   - Required server config (open_basedir, disable_functions) not verified?
+   - Required protocol primitive (smuggling, deserialization sink) not present?
+3. Identify logic flaws in the chain:
+   - Assumption that fails on first request (e.g. expects file X but path is Y)
+   - Race condition that needs concurrent requests (chain step is single-threaded)
+   - Encoding mismatch (chain expects UTF-8, server returns latin-1)
+
+## Output contract — SINGLE JSON only, no other text
+```json
+{
+  "verdict": "go" | "soft_go" | "no_go",
+  "confidence": 0.0-1.0,
+  "reason": "한 줄 요약",
+  "missing_prereqs": ["필요한데 없는 전제 1", "..."],
+  "suggested_alternative": "no_go 면 다른 접근 방향 한 줄 (없으면 빈 문자열)"
+}
+```
+
+verdict 의미:
+- `go`     — chain 합리적, exploit 시도해라.
+- `soft_go` — 일부 우려 있으나 시도 가치 있음. exploit agent가 우려 보고 진행.
+- `no_go`  — chain에 명백한 결함. exploit 시도 비용 낭비.
+
+자율성: critic 의 verdict 는 advisory. exploit agent 는 너의 verdict 를 보고
+자기가 다시 판단할 자유가 있다 — 너의 일은 *신호 제공* 이지 *결정* 이 아니다.
+KB/도구 호출은 최소화. 빠르고 싸게 (~5초, ~$0.01) 끝내라.
+"""
+
+
 # 공통 strategy + critical rules는 각 sub-prompt에 자동으로 prepend된다 (_run_role_phase
 # 호출 시 system_prompt = MLLA_COMMON_PROMPT + sub_prompt).
 # EXPLORER_PROMPT의 "Chain Exploitation Strategy", "KB Usage Pattern", "Critical Rules"
@@ -1697,6 +1747,55 @@ async def _run_swarm(
     )
 
 
+async def _evaluate_chain_critic(
+    scan_run: ScanRun,
+    anthropic,
+    node,
+    acc: _Accumulator,
+) -> dict:
+    """exploit_step 노드 진행 전 critic LLM 1회 호출 — go/soft_go/no_go 판단.
+
+    advisory 신호 — 호출자(_explorer_worker)는 verdict를 EXPLOIT user_msg context로
+    그대로 전달하고, exploit agent가 무시 가능. 강제 abort 안 함.
+    오류 / 파싱 실패 시 abstain으로 fallback해 chain 진행 막지 않는다.
+    """
+    chain_summary = (
+        f"node_id: {node.node_id}\n"
+        f"node_type: {node.node_type}\n"
+        f"depth: {node.depth}\n"
+        f"endpoint: {node.endpoint or 'N/A'}\n"
+        f"vuln_type: {node.vuln_type or 'N/A'}\n"
+        f"summary: {node.summary}\n"
+        f"context: {json.dumps(node.context, ensure_ascii=False)[:1500]}"
+    )
+    user_msg = (
+        f"target_url: {scan_run.target_url}\n\n"
+        f"## Exploit step to be tried\n{chain_summary}\n\n"
+        f"평가 후 SINGLE JSON 한 개만 출력. 도구 호출은 최소 (필요 시 get_chain_context, "
+        f"get_secrets 만)."
+    )
+    try:
+        text, _ = await _run_role_phase(
+            scan_run, anthropic, "critic:pre-exploit", CRITIC_PROMPT,
+            tools=[], tool_router={},  # tool 호출 없이 평가만
+            initial_user_message=user_msg, acc=acc,
+            max_turns=DISCOVERY_CRITIC_BUDGET,
+        )
+    except Exception as e:
+        logger.warning(
+            f"[{scan_run.run_id}] critic error on node {node.node_id}: {e}"
+        )
+        return {"verdict": "abstain", "reason": f"critic call failed: {e}",
+                "missing_prereqs": [], "suggested_alternative": ""}
+
+    data = _extract_json_block(text) or {}
+    if "verdict" not in data:
+        data["verdict"] = "abstain"
+    if "reason" not in data:
+        data["reason"] = "critic returned no parseable verdict"
+    return data
+
+
 async def _explorer_worker(
     name: str,
     scan_run: ScanRun,
@@ -1776,6 +1875,28 @@ async def _explorer_worker(
         # MLLA — node_type 별 sub-agent prompt 선택. role 이름도 sub-agent로 변경하면
         # log/trace 분석 시 어느 단계가 비용/시간을 많이 쓰는지 즉시 보임.
         sub_role, sub_prompt = _select_mlla_prompt(node)
+
+        # Pre-exploit critic (CodeMender 패턴) — exploit_step 노드 진행 전 1회 평가.
+        # advisory: verdict 를 user_msg context에 주입; exploit agent 가 보고 판단.
+        # 강제 abort 안 함 (자율성 우선). flag 노드는 confirmer가 직접 oracle 검증하므로 critic 생략.
+        if (
+            DISCOVERY_CRITIC_ENABLED
+            and sub_role == "exploit"
+            and not (node.context or {}).get("recheck")
+        ):
+            critic_result = await _evaluate_chain_critic(scan_run, anthropic, node, acc)
+            verdict = critic_result.get("verdict", "abstain")
+            logger.info(
+                f"[{scan_run.run_id}] critic verdict={verdict} on node "
+                f"{node.node_id} reason={(critic_result.get('reason') or '')[:120]}"
+            )
+            user_msg += (
+                f"\n\n## Pre-Exploit Critic (advisory — 무시해도 OK, 단 [BUDGET] 신호처럼 활용)\n"
+                f"```json\n{json.dumps(critic_result, ensure_ascii=False)[:1500]}\n```\n"
+                f"verdict='no_go' 이면 비용 낭비 위험 — chain 결함을 먼저 점검 후 시도. "
+                f"verdict='soft_go' 이면 missing_prereqs 를 먼저 채울지 검토. "
+                f"verdict='go' 이면 그대로 진행."
+            )
 
         is_recheck = (node.context or {}).get("recheck", False)
         if is_recheck:
