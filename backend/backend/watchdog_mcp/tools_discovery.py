@@ -245,6 +245,11 @@ def register(mcp):
         key: str,
         value: str,
         category: str = "credential",
+        obtained_via: str = "",
+        source_vuln_node_id: str = "",
+        auth_label: str = "",
+        chain_summary: str = "",
+        expires_hint: str = "",
     ) -> str:
         """Store a discovered secret (credential, token, API key, session value) for
         cross-worker sharing. Other workers exploring different nodes can retrieve
@@ -252,9 +257,22 @@ def register(mcp):
 
         Args:
             scan_run_id: current scan run UUID
-            key: descriptive key (e.g. "admin_password", "jwt_token", "api_key")
+            key: descriptive key (e.g. "admin_password", "jwt_token", "api_session")
             value: the secret value
             category: credential | token | api_key | session | config | other
+            obtained_via: 획득 방법 — "form_login" | "attack" | "source_leak" |
+                          "user_provided" | "" (unknown). session 만료 시 재획득
+                          흐름 분기:
+                            form_login → auth_<label>_* 로 재로그인
+                            attack → source_vuln_node_id 를 recheck=True 로 push
+                                     → confirmer 가 공격 chain 재실행
+            source_vuln_node_id: obtained_via=attack 일 때, 이 session 을 얻어낸
+                                 vuln 노드 UUID. 만료 시 그 노드 replay.
+            auth_label: obtained_via=form_login 일 때, 사용한 persona label
+                        (auth_<label>_login_url/username/password 와 매칭).
+            chain_summary: 공격 chain 한 줄 요약 (예: "SQLi at /rest/user/login
+                           via admin@x.com'--"). replay 시 참고용.
+            expires_hint: 만료 추정 (예: "1h", "30m", "until_logout"). null 가능.
 
         Returns:
             JSON with confirmation and total secrets count.
@@ -264,15 +282,28 @@ def register(mcp):
             run = ScanRun.objects.select_for_update().get(run_id=scan_run_id)
             config = run.config or {}
             secrets = config.get("_secrets", {})
-            secrets[key] = {
+            entry = {
                 "value": value,
                 "category": category,
                 "stored_at": str(timezone.now()),
             }
+            # 재획득용 metadata (session 만료 대응)
+            if obtained_via:
+                entry["obtained_via"] = obtained_via
+            if source_vuln_node_id:
+                entry["source_vuln_node_id"] = source_vuln_node_id
+            if auth_label:
+                entry["auth_label"] = auth_label
+            if chain_summary:
+                entry["chain_summary"] = chain_summary[:500]
+            if expires_hint:
+                entry["expires_hint"] = expires_hint
+            secrets[key] = entry
             config["_secrets"] = secrets
             run.config = config
             run.save(update_fields=["config"])
-        return json.dumps({"stored": key, "total_secrets": len(secrets)})
+        return json.dumps({"stored": key, "total_secrets": len(secrets),
+                           "obtained_via": obtained_via or None})
 
     @mcp.tool()
     def get_secrets(scan_run_id: str, category: str = "") -> str:
