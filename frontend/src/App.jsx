@@ -879,7 +879,7 @@ function CanvasNode({ node, x, y, selected, onSelect }) {
   );
 }
 
-function NodeDetailPanel({ node, allNodes, onClose }) {
+function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findings = [], onClose }) {
   if (!node) return null;
 
   const meta = NODE_TYPE_META[node.node_type] || NODE_TYPE_META.clue;
@@ -903,6 +903,34 @@ function NodeDetailPanel({ node, allNodes, onClose }) {
 
   const ctx = node.context || {};
   const contextEntries = Object.entries(ctx).filter(([k]) => k !== "raw");
+
+  // ── 노드 ↔ candidate / finding / request 매칭 ──
+  // 우선 features.discovery_node_id 직매칭, 없으면 endpoint+vuln_type 매칭
+  const nodeId = node.node_id;
+  const epNorm = (node.endpoint || "").split("?")[0].replace(/\/+$/, "") || "/";
+
+  const linkedCandidates = useMemo(() => {
+    return candidates.filter((c) => {
+      const feat = c.features || {};
+      if (feat.discovery_node_id === nodeId) return true;
+      const cep = (feat.endpoint || (c.request && c.request.endpoint) || "").split("?")[0].replace(/\/+$/, "") || "/";
+      return cep === epNorm && (!node.vuln_type || c.vuln_type === node.vuln_type);
+    });
+  }, [candidates, nodeId, epNorm, node.vuln_type]);
+
+  const linkedCandIds = new Set(linkedCandidates.map((c) => c.cand_id));
+  const linkedFindings = useMemo(
+    () => findings.filter((f) => linkedCandIds.has(f.candidate)),
+    [findings, linkedCandidates],
+  );
+
+  const linkedRequests = useMemo(() => {
+    if (!node.endpoint) return [];
+    return requests.filter((r) => {
+      const rep = (r.endpoint || "").split("?")[0].replace(/\/+$/, "") || "/";
+      return rep === epNorm;
+    }).slice(0, 20);
+  }, [requests, node.endpoint, epNorm]);
 
   return (
     <div className="node-panel" onClick={(e) => e.stopPropagation()}>
@@ -970,6 +998,66 @@ function NodeDetailPanel({ node, allNodes, onClose }) {
           </div>
         </div>
       ) : null}
+
+      {linkedFindings.length > 0 ? (
+        <div className="node-panel-section">
+          <div className="mini-title">취약점 ({linkedFindings.length})</div>
+          <div className="node-children-list">
+            {linkedFindings.map((f) => (
+              <div key={f.finding_id} className="node-child-row">
+                <span className="node-icon">⚠</span>
+                <span className="node-child-summary">
+                  <strong>[{(f.severity || "?").toUpperCase()}]</strong> {f.title || "(제목 없음)"}
+                  {f.summary ? <div style={{ opacity: 0.7, fontSize: "0.85em", marginTop: 2 }}>{f.summary.slice(0, 200)}</div> : null}
+                </span>
+                <span className={`node-status-pill node-status-confirmed`}>{f.vuln_type}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {linkedCandidates.length > 0 ? (
+        <div className="node-panel-section">
+          <div className="mini-title">후보 ({linkedCandidates.length})</div>
+          <div className="node-children-list">
+            {linkedCandidates.slice(0, 10).map((c) => (
+              <div key={c.cand_id} className="node-child-row">
+                <span className="node-icon">◆</span>
+                <span className="node-child-summary">
+                  {c.vuln_type} — {(c.hypothesis || "").slice(0, 80)}
+                  {c.priority_score ? <span style={{ opacity: 0.6, marginLeft: 6 }}>p={Number(c.priority_score).toFixed(2)}</span> : null}
+                </span>
+                <span className={`node-status-pill node-status-${c.status === "confirmed" ? "confirmed" : c.status === "false_positive" || c.status === "dismissed" ? "dead_end" : "pending"}`}>
+                  {c.status}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {linkedRequests.length > 0 ? (
+        <div className="node-panel-section">
+          <div className="mini-title">관련 요청 ({linkedRequests.length})</div>
+          <div className="node-children-list">
+            {linkedRequests.slice(0, 10).map((r) => (
+              <div key={r.req_id || r.request_id} className="node-child-row">
+                <span className="node-icon">{r.method === "GET" ? "→" : r.method === "POST" ? "↑" : "·"}</span>
+                <span className="node-child-summary">
+                  <strong>{r.method}</strong> {r.endpoint}
+                  {r.params && Object.keys(r.params).length > 0 ? (
+                    <div style={{ opacity: 0.7, fontSize: "0.85em", marginTop: 2 }}>
+                      params: {Object.keys(r.params).join(", ").slice(0, 120)}
+                    </div>
+                  ) : null}
+                </span>
+                <span className="node-status-pill node-status-explored">{r.source || "?"}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -983,6 +1071,9 @@ function flattenTree(roots) {
 
 function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
   const [nodes, setNodes] = useState([]);
+  const [requests, setRequests] = useState([]);
+  const [candidates, setCandidates] = useState([]);
+  const [findings, setFindings] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [selectedNodeId, setSelectedNodeId] = useState(null);
@@ -996,8 +1087,17 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
   async function fetchTree() {
     setLoading(true);
     try {
-      const data = await apiGet(`/api/scan-runs/${runId}/discovery-tree/`);
-      setNodes(Array.isArray(data) ? data : []);
+      // 4개 fetch 병렬 — 노드 detail panel 이 candidate/finding/request 도 보여주려면 다 필요.
+      const [treeData, reqData, candData, findData] = await Promise.all([
+        apiGet(`/api/scan-runs/${runId}/discovery-tree/`),
+        apiGet(`/api/scan-runs/${runId}/request-catalog/?page_size=200`).catch(() => ({})),
+        apiGet(`/api/candidates/list/?run_id=${runId}&page_size=200`).catch(() => ({})),
+        apiGet(`/api/findings/?run_id=${runId}&page_size=200`).catch(() => ({})),
+      ]);
+      setNodes(Array.isArray(treeData) ? treeData : []);
+      setRequests(normalizePaginatedList(reqData));
+      setCandidates(normalizePaginatedList(candData));
+      setFindings(normalizePaginatedList(findData));
       setError("");
     } catch (e) {
       setError(e.message);
@@ -1175,6 +1275,9 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
             <NodeDetailPanel
               node={allNodes.find((n) => n.node_id === selectedNodeId)}
               allNodes={allNodes}
+              requests={requests}
+              candidates={candidates}
+              findings={findings}
               onClose={() => setSelectedNodeId(null)}
             />
           ) : null}
