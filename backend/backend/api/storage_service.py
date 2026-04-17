@@ -102,9 +102,11 @@ def confirm_candidate(cand_id, severity=None, title=None, summary=None,
 
         # 2c. EndpointSpec 안전망 — 확정된 vuln_type 을 그 endpoint 의 명세에
         # 자동 추가 (다음 scan 의 RouteMap/EntryPoint 가 즉시 활용).
+        # host 표기는 netloc 사용 (port 포함) — tools_learn._host_of 와 일관.
         try:
             target_url = candidate.scan_run.target_url or ""
-            host = _urlparse(target_url).hostname
+            parsed = _urlparse(target_url)
+            host = (parsed.netloc or parsed.hostname or "").lower()
             ep = (candidate.request.endpoint if candidate.request else "") or ""
             method = (candidate.request.method if candidate.request else "GET") or "GET"
             if host and ep:
