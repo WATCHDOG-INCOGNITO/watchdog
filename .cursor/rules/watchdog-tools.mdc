@@ -15,9 +15,20 @@ CLI 전용: create_scan, create_root, complete_scan, stop_scan, fail_scan, recor
 |------|------|
 | `search_knowledge` | 취약점 정의 + 검증된 페이로드 패턴 조회 |
 | `retrieve_similar_patterns` | 자연어 시맨틱 검색 (임베딩 기반) |
-| `retrieve_cve_variants` | CVE 변종 패턴 시드 조회 |
+| `retrieve_cve_variants` | CVE seed 패턴 (techniques/cve/*.md) + legacy VulnerabilityEntry 조회 |
+| `fetch_cve_details` | NVD API 단일 CVE 상세 (CVSS/CWE/CPE/references + PoC URL 자동 추출) |
+| `suggest_cves_for_framework` | NVD framework 키워드 검색 → CVSS 정렬 CVE 목록. just-in-time variant analysis |
 | `mutate_payload` | WAF 우회 변형 생성 |
 | `record_pattern_use` | 패턴 사용 결과 기록 (성공/실패) — **매 payload마다 호출** |
+| `check_payload_dedup` | 🛡️ SimHash 본질 중복 진단. 같은 payload 100번 시도 회피. payload+host+vuln_type → near_dead_ends/near_patterns + recommendation. **payload 시도 전 권장** |
+
+## API Spec KB (host endpoint 명세 — 정찰 단축 자산)
+
+| 도구 | 용도 |
+|------|------|
+| `record_endpoint_spec` | endpoint 분석 끝에 호출. params/headers/auth/response_shape/suspected_vuln_types/sink_hints/notes 누적. 같은 (host,method,endpoint) 면 union 갱신 |
+| `recall_endpoint_specs` | host 의 endpoint 명세 목록 (선택: vuln_type 필터). RouteMap 첫 단계 권장 |
+| `recall_target` | 그 host 의 모든 KB 자원 한 방에 (profile + learned_patterns + dead_ends + endpoint_specs) |
 
 ## Living KB (Host-Specific Memory)
 
@@ -57,8 +68,9 @@ CLI 전용: create_scan, create_root, complete_scan, stop_scan, fail_scan, recor
 
 | 도구 | 용도 |
 |------|------|
-| `http_request` | 단일 HTTP 요청 |
-| `http_session_request` | 세션 유지 요청 (쿠키 자동 관리) |
+| `http_request` | 단일 HTTP 요청 (stateless). 한 턴에 N개 부르면 backend 가 자동 병렬 (SAFE_PARALLEL) |
+| `multi_http_probe` | **N개 HTTP 한 턴에 동시 발사** (asyncio.gather + to_thread). baseline+payloads / KB top-N pattern 동시 시도 → 토큰/시간 N배 절감. requests_json: `[{url,method,headers,body},...]`. max_concurrent default 8 |
+| `http_session_request` | 세션 유지 요청 (쿠키 자동 관리). multi-step web flow / 로그인 chain 필수 |
 | `http_session_cookies` | 세션 쿠키 조회 |
 | `http_session_close` | 세션 종료 |
 | `curl_request` | raw curl 명령 |
