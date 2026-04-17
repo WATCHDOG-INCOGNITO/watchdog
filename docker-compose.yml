@@ -50,6 +50,9 @@ services:
       - ./codegate2024-final:/raw-sources/codegate2024-final:ro
       - ./codegate2025-final:/raw-sources/codegate2025-final:ro
       - ./codegate2026-pre:/raw-sources/codegate2026-pre:ro
+      # Living KB 영속화 — confirm된 learned 패턴이 즉시 host의 techniques/<vuln_type>/*.md
+      # 로 dump되어 git commit 가능. 컨테이너 재빌드/볼륨 초기화에도 살아남음.
+      - ./backend/backend/api/management/commands/techniques:/app/api/management/commands/techniques
     depends_on:
       db:
         condition: service_healthy
@@ -65,6 +68,9 @@ services:
       - "8889:8889"
     volumes:
       - ./secrets:/run/secrets:ro
+      # Living KB 영속화 — backend와 동일 경로에 bind. learn_from_finding이
+      # mcp 컨테이너에서 호출되어도 호스트의 같은 .md 파일에 기록.
+      - ./backend/backend/api/management/commands/techniques:/app/api/management/commands/techniques
     environment:
       DJANGO_SECRET_KEY: "change-this-in-production"
       DJANGO_DEBUG: "1"

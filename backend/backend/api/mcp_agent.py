@@ -456,6 +456,31 @@ EXTENDED_LIMIT_TOOLS = {
     "http_request", "curl_request", "http_session_request",
 }
 
+# 한 LLM 턴에서 동시에 호출돼도 안전한 read-only 도구.
+# 상태 변경(write/POST/세션 변형/scanner subprocess)은 전부 제외.
+# 자율성 원칙: 강제 직렬화는 안전망에만. 명백한 read-only는 묶어서 대기시간 ↓.
+SAFE_PARALLEL_TOOLS = {
+    # KB / 검색
+    "search_knowledge", "retrieve_similar_patterns", "retrieve_cve_variants",
+    # Living KB 회상 (read)
+    "recall_target", "recall_dead_ends",
+    # 후보/스캔 조회
+    "list_candidates", "get_scan_summary", "get_finding",
+    "get_chain_context", "get_exploit_chains",
+    "get_secrets", "get_scan_notes",
+    # 소스 read-only
+    "list_source_tree", "read_source", "grep_source",
+    # 분석 (해석만, 부수효과 없음)
+    "analyze_endpoint",
+    # 브라우저 read-only (현재 페이지 상태 조회)
+    "browser_get_dom", "browser_get_network_log", "browser_screenshot",
+    "browser_get_console", "browser_extract_api_endpoints",
+    # OOB read
+    "oob_get_hits",
+}
+# 동시 실행 상한 — read-only라도 백엔드/DB 부하는 줄여둔다.
+PARALLEL_TOOL_CONCURRENCY = int(os.environ.get("WATCHDOG_PARALLEL_TOOLS", "4"))
+
 
 def _truncate_tool_result(text: str, limit: int = TOOL_RESULT_MAX_CHARS) -> str:
     """LLM에 전달할 도구 결과를 cap. JSON 결과는 가능하면 양 끝(시작/끝) 보존 — 본문은 잘림.
@@ -473,48 +498,80 @@ def _truncate_tool_result(text: str, limit: int = TOOL_RESULT_MAX_CHARS) -> str:
     )
 
 
+async def _execute_single_tool(
+    scan_run: ScanRun,
+    tool_router: dict,
+    tb,
+) -> dict:
+    raise_if_stop_requested(scan_run)
+    tool_name = tb.name
+    tool_args = tb.input or {}
+    logger.info(
+        f"[{scan_run.run_id}] tool {tool_name}"
+        f"({json.dumps(tool_args, ensure_ascii=False)[:200]})"
+    )
+    try:
+        if tool_name in tool_router:
+            session, original = tool_router[tool_name]
+            result = await session.call_tool(original, tool_args)
+            if result.content:
+                text = "\n".join(
+                    c.text if hasattr(c, "text") else str(c)
+                    for c in result.content
+                )
+            else:
+                text = "(빈 결과)"
+            is_error = bool(getattr(result, "isError", False))
+        else:
+            text = f"도구 {tool_name} 차단 — 이 role 화이트리스트에 없음."
+            is_error = True
+    except Exception as e:
+        logger.error(f"[{scan_run.run_id}] tool error {tool_name}: {e}")
+        text = f"도구 오류: {e}"
+        is_error = True
+
+    limit = TOOL_RESULT_EXTENDED_CHARS if tool_name in EXTENDED_LIMIT_TOOLS else TOOL_RESULT_MAX_CHARS
+    return {
+        "type": "tool_result",
+        "tool_use_id": tb.id,
+        "content": _truncate_tool_result(text, limit),
+        "is_error": is_error,
+    }
+
+
 async def _execute_tool_calls(
     scan_run: ScanRun,
     tool_router: dict,
     tool_use_blocks: list,
 ) -> list[dict]:
-    tool_results: list[dict] = []
-    for tb in tool_use_blocks:
-        raise_if_stop_requested(scan_run)
-        tool_name = tb.name
-        tool_args = tb.input or {}
-        logger.info(
-            f"[{scan_run.run_id}] tool {tool_name}"
-            f"({json.dumps(tool_args, ensure_ascii=False)[:200]})"
-        )
-        try:
-            if tool_name in tool_router:
-                session, original = tool_router[tool_name]
-                result = await session.call_tool(original, tool_args)
-                if result.content:
-                    text = "\n".join(
-                        c.text if hasattr(c, "text") else str(c)
-                        for c in result.content
-                    )
-                else:
-                    text = "(빈 결과)"
-                is_error = bool(getattr(result, "isError", False))
-            else:
-                text = f"도구 {tool_name} 차단 — 이 role 화이트리스트에 없음."
-                is_error = True
-        except Exception as e:
-            logger.error(f"[{scan_run.run_id}] tool error {tool_name}: {e}")
-            text = f"도구 오류: {e}"
-            is_error = True
+    """LLM 한 턴의 tool_use 블록을 실행한다.
 
-        limit = TOOL_RESULT_EXTENDED_CHARS if tool_name in EXTENDED_LIMIT_TOOLS else TOOL_RESULT_MAX_CHARS
-        tool_results.append({
-            "type": "tool_result",
-            "tool_use_id": tb.id,
-            "content": _truncate_tool_result(text, limit),
-            "is_error": is_error,
-        })
-    return tool_results
+    - SAFE_PARALLEL_TOOLS에 속한 read-only 도구는 asyncio.gather로 동시 실행 (concurrency 상한 적용).
+    - 그 외(상태변경/스캐너 subprocess/세션 변형)는 호출 순서대로 직렬 실행.
+    - tool_result는 LLM에 돌려줄 때 tool_use_id로 매칭되므로 반환 순서는 무관.
+    """
+    if not tool_use_blocks:
+        return []
+
+    parallel_blocks = [tb for tb in tool_use_blocks if tb.name in SAFE_PARALLEL_TOOLS]
+    sequential_blocks = [tb for tb in tool_use_blocks if tb.name not in SAFE_PARALLEL_TOOLS]
+
+    results: list[dict] = []
+
+    if parallel_blocks:
+        sem = asyncio.Semaphore(max(1, PARALLEL_TOOL_CONCURRENCY))
+
+        async def _bounded(tb):
+            async with sem:
+                return await _execute_single_tool(scan_run, tool_router, tb)
+
+        gathered = await asyncio.gather(*[_bounded(tb) for tb in parallel_blocks])
+        results.extend(gathered)
+
+    for tb in sequential_blocks:
+        results.append(await _execute_single_tool(scan_run, tool_router, tb))
+
+    return results
 
 
 async def _run_role_phase(

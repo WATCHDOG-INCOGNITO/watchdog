@@ -109,7 +109,8 @@ def register(mcp):
         if not _tool_available("nuclei"):
             return json.dumps({"error": "nuclei not installed"})
 
-        cmd = ["nuclei", "-u", target_url, "-silent", "-nc"]
+        # -jsonl: 한 줄당 하나의 JSON finding. severity / template-id / matched-at 등 구조화 추출.
+        cmd = ["nuclei", "-u", target_url, "-silent", "-nc", "-jsonl"]
         if templates:
             cmd.extend(["-t", templates])
         if severity:
@@ -121,13 +122,37 @@ def register(mcp):
 
         result = _run_cmd(cmd, timeout=300)
         findings = []
-        for line in result["stdout"].strip().split("\n"):
-            if line.strip():
-                findings.append(line.strip())
+        severity_counts: dict[str, int] = {}
+        for line in result["stdout"].splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                # nuclei 구버전이거나 JSON 모드 미지원 시 raw line 보존
+                findings.append({"raw": line})
+                continue
+            info = obj.get("info") or {}
+            sev = (info.get("severity") or obj.get("severity") or "info").lower()
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+            findings.append({
+                "template_id": obj.get("template-id") or obj.get("templateID"),
+                "name": info.get("name"),
+                "severity": sev,
+                "matched_at": obj.get("matched-at") or obj.get("matched"),
+                "type": obj.get("type"),
+                "tags": info.get("tags"),
+                "description": info.get("description"),
+                "reference": info.get("reference"),
+                "extracted_results": obj.get("extracted-results"),
+                "curl_command": obj.get("curl-command"),
+            })
 
         return json.dumps({
             "command": " ".join(cmd),
             "findings_count": len(findings),
+            "severity_counts": severity_counts,
             "findings": findings[-50:],
             "errors": result["stderr"][-1000:] if result["stderr"] else "",
             "returncode": result["returncode"],

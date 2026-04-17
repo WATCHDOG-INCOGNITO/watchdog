@@ -347,19 +347,19 @@ def _retrieve_cve_variants(framework: str, endpoint_pattern: str, k: int) -> dic
 
 
 def _record_use(pattern_id: str, succeeded: bool, false_positive: bool) -> dict:
+    from django.db.models import F
     from api.models import PayloadPattern
 
-    try:
-        p = PayloadPattern.objects.get(pattern_id=pattern_id)
-    except PayloadPattern.DoesNotExist:
+    # F() 표현식으로 동시 스캔 시 손실 없이 atomic 증가.
+    updated = PayloadPattern.objects.filter(pattern_id=pattern_id).update(
+        times_used=F("times_used") + 1,
+        times_succeeded=F("times_succeeded") + (1 if succeeded else 0),
+        false_positive_count=F("false_positive_count") + (1 if false_positive else 0),
+    )
+    if not updated:
         return {"error": f"pattern {pattern_id} not found"}
 
-    p.times_used += 1
-    if succeeded:
-        p.times_succeeded += 1
-    if false_positive:
-        p.false_positive_count += 1
-    p.save(update_fields=["times_used", "times_succeeded", "false_positive_count"])
+    p = PayloadPattern.objects.get(pattern_id=pattern_id)
     return {
         "pattern_id": str(p.pattern_id),
         "times_used": p.times_used,

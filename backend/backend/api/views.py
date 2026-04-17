@@ -239,7 +239,8 @@ def list_findings(request):
     run_id = request.query_params.get("run_id")
     if not run_id:
         return Response({"error": "run_id query param is required"}, status=status.HTTP_400_BAD_REQUEST)
-    return _paginate(request, Finding.objects.filter(scan_run_id=run_id), FindingSerializer)
+    qs = Finding.objects.filter(scan_run_id=run_id).prefetch_related("evidence_links")
+    return _paginate(request, qs, FindingSerializer)
 
 @api_view(["GET"])
 def get_finding(request, finding_id):

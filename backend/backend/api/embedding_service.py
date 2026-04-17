@@ -6,12 +6,14 @@ Model is downloaded from HuggingFace Hub on first use and cached locally.
 from __future__ import annotations
 
 import logging
+from functools import lru_cache
 from typing import Iterable
 
 logger = logging.getLogger(__name__)
 
 EMBEDDING_MODEL = "all-mpnet-base-v2"
 EMBEDDING_DIM = 768
+QUERY_CACHE_SIZE = 256  # 같은 검색어 재사용 — KB recall 패턴상 hit율 높음.
 
 _model = None
 
@@ -55,16 +57,26 @@ def embed_documents(texts: Iterable[str]) -> list[list[float]] | None:
         return None
 
 
-def embed_query(text: str) -> list[float] | None:
-    """Embed a single query for search. Returns None on failure."""
+@lru_cache(maxsize=QUERY_CACHE_SIZE)
+def _embed_query_cached(text: str) -> tuple[float, ...] | None:
     model = _get_model()
     if model is None:
         return None
     try:
-        return model.encode(text or "", normalize_embeddings=True).tolist()
+        vec = model.encode(text, normalize_embeddings=True).tolist()
+        return tuple(vec)
     except Exception as e:
         logger.warning("embed_query failed: %s", e)
         return None
+
+
+def embed_query(text: str) -> list[float] | None:
+    """Embed a single query for search. Returns None on failure.
+
+    같은 query 문자열은 LRU 캐시로 재사용 (KB recall이 같은 키워드를 반복 호출하는 패턴).
+    """
+    cached = _embed_query_cached(text or "")
+    return list(cached) if cached is not None else None
 
 
 def pattern_text(p) -> str:

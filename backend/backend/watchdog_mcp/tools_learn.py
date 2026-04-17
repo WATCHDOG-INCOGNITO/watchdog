@@ -109,8 +109,12 @@ def _learn_from_finding(
         source="learned",
     ).first()
     if existing:
-        existing.times_succeeded += 1
-        existing.times_used += 1
+        from django.db.models import F
+        # 카운터는 F()로 atomic 증가 (동시 스캔 race 방지). attack_metadata는 일반 save.
+        PayloadPattern.objects.filter(pk=existing.pk).update(
+            times_succeeded=F("times_succeeded") + 1,
+            times_used=F("times_used") + 1,
+        )
         if oracle_signature:
             meta = existing.attack_metadata or {}
             sigs = set(meta.get("oracle_signatures") or [])
@@ -118,7 +122,8 @@ def _learn_from_finding(
             meta["oracle_signatures"] = sorted(sigs)
             meta["last_endpoint"] = endpoint
             existing.attack_metadata = meta
-        existing.save()
+            existing.save(update_fields=["attack_metadata"])
+        existing.refresh_from_db(fields=["times_succeeded", "times_used"])
         learned = existing
         created = False
     else:
@@ -152,22 +157,30 @@ def _learn_from_finding(
         )
         created = True
 
+    from django.db.models import F
     profile, _ = TargetProfile.objects.get_or_create(host=host)
-    profile.confirmed_findings_count += 1
-    if created:
-        profile.learned_patterns_count += 1
-    profile.last_scan_at = timezone.now()
-    profile.save()
+    TargetProfile.objects.filter(pk=profile.pk).update(
+        confirmed_findings_count=F("confirmed_findings_count") + 1,
+        learned_patterns_count=F("learned_patterns_count") + (1 if created else 0),
+        last_scan_at=timezone.now(),
+    )
+    profile.refresh_from_db()
 
     # Auto-embed so retrieve_similar finds this pattern immediately
     embedded = False
     if learned.embedding is None:
         embedded = _embed_learned_pattern(learned)
 
+    # Auto-export to techniques/<vuln_type>/<name>.md so the pattern survives
+    # docker rebuild / volume wipe (host bind mount + git commit).
+    # best-effort: 실패해도 DB는 살아 있으므로 다음 export_learned --write로 복구 가능.
+    md_exported = _export_learned_to_md(learned)
+
     return {
         "learned_pattern_id": str(learned.pattern_id),
         "created": created,
         "embedded": embedded,
+        "md_exported": md_exported,
         "host": host,
         "vuln_type": vuln_type,
         "endpoint": endpoint,
@@ -175,6 +188,59 @@ def _learn_from_finding(
         "profile_findings_count": profile.confirmed_findings_count,
         "profile_learned_count": profile.learned_patterns_count,
     }
+
+
+def _export_learned_to_md(pattern) -> bool:
+    """Dump a learned PayloadPattern to techniques/<vuln_type>/<name>.md.
+
+    Dedup 정책 (둘 중 하나라도 해당하면 write skip):
+      1. 이 pattern이 이미 export된 적 있고 (`exported_to_md=True`) 같은 경로에 파일 존재
+         → 같은 패턴 재confirm 시 disk/git noise 방지
+      2. 같은 clean_name으로 `source="technique"` 행이 이미 있음
+         → 검증되어 promote된 자산을 learned 버전이 덮어쓰지 못하게 보호
+
+    `export_learned.pattern_to_md` 재사용으로 포맷 일관성 유지.
+    """
+    try:
+        from datetime import date
+        from api.management.commands.export_learned import (
+            TECHNIQUES_DIR,
+            _clean_name,
+            pattern_to_md,
+        )
+        from api.models import PayloadPattern
+    except Exception:
+        return False
+
+    try:
+        meta = pattern.attack_metadata or {}
+
+        # (1) 이미 같은 패턴이 dump되어 있으면 no-op
+        if meta.get("exported_to_md"):
+            existing_rel = meta.get("exported_path") or ""
+            if existing_rel and (TECHNIQUES_DIR / existing_rel).exists():
+                return False
+
+        # (2) 같은 이름으로 검증된 technique이 이미 있으면 skip (덮어쓰기 방지)
+        clean_name = _clean_name(pattern.name, pattern.vuln_type, str(pattern.pattern_id))
+        if PayloadPattern.objects.filter(source="technique", name=clean_name).exists():
+            return False
+
+        filename, vuln_type, md_content = pattern_to_md(pattern)
+        if not vuln_type:
+            return False
+        target_dir = TECHNIQUES_DIR / vuln_type
+        target_dir.mkdir(parents=True, exist_ok=True)
+        (target_dir / filename).write_text(md_content, encoding="utf-8")
+
+        meta["exported_to_md"] = True
+        meta["exported_date"] = str(date.today())
+        meta["exported_path"] = f"{vuln_type}/{filename}"
+        pattern.attack_metadata = meta
+        pattern.save(update_fields=["attack_metadata"])
+        return True
+    except Exception:
+        return False
 
 
 def _embed_learned_pattern(pattern) -> bool:
