@@ -77,11 +77,27 @@ def confirm_candidate(cand_id, severity=None, title=None, summary=None,
         candidate.status = "confirmed"
         candidate.save(update_fields=["status"])
 
-        # 2b. Discovery node 연동: 연결된 노드가 있으면 confirmed로 승격
+        # 2b. Discovery node 연동: 연결된 노드가 있으면 confirmed로 승격.
+        # features.discovery_node_id 가 없으면 endpoint+vuln_type 매칭으로 fallback —
+        # create_candidate_manual 이 link 안 했던 candidate 도 자동으로 노드 상태 회복.
+        from api.models import DiscoveryNode
         disc_node_id = (candidate.features or {}).get("discovery_node_id")
         if disc_node_id:
-            from api.models import DiscoveryNode
             DiscoveryNode.objects.filter(node_id=disc_node_id).update(status="confirmed")
+        else:
+            ep = (candidate.request.endpoint if candidate.request else
+                  (candidate.features or {}).get("endpoint", "")) or ""
+            ep_norm = ep.split("?", 1)[0].rstrip("/") or "/"
+            qs = (
+                DiscoveryNode.objects
+                .filter(scan_run=candidate.scan_run, node_type="vuln")
+                .filter(endpoint__in=[ep, ep_norm, ep_norm + "/"])
+                .exclude(status="confirmed")
+            )
+            picked = qs.filter(vuln_type=candidate.vuln_type).order_by("-created_at").first()
+            picked = picked or qs.order_by("-created_at").first()
+            if picked:
+                DiscoveryNode.objects.filter(node_id=picked.node_id).update(status="confirmed")
 
         # 3. Evidence 생성 + 링크
         created_evidence = []
@@ -142,6 +158,31 @@ def dismiss_candidate(cand_id, reason="false_positive"):
 
     candidate.status = reason
     candidate.save(update_fields=["status"])
+
+    # 안전망 — 연결된 vuln 노드를 dead_end 로 자동 전이 (LLM 의 mark_dead_end 누락 보완).
+    # discovery_node_id 또는 endpoint+vuln_type fallback.
+    from api.models import DiscoveryNode
+    from django.utils import timezone
+    disc_node_id = (candidate.features or {}).get("discovery_node_id")
+    target_node = None
+    if disc_node_id:
+        target_node = DiscoveryNode.objects.filter(node_id=disc_node_id).first()
+    if not target_node:
+        ep = ((candidate.features or {}).get("endpoint") or "")
+        ep_norm = ep.split("?", 1)[0].rstrip("/") or "/"
+        if ep:
+            qs = (
+                DiscoveryNode.objects
+                .filter(scan_run=candidate.scan_run, node_type="vuln")
+                .filter(endpoint__in=[ep, ep_norm, ep_norm + "/"])
+                .exclude(status__in=["confirmed", "dead_end"])
+            )
+            target_node = (qs.filter(vuln_type=candidate.vuln_type).order_by("-created_at").first()
+                           or qs.order_by("-created_at").first())
+    if target_node:
+        DiscoveryNode.objects.filter(node_id=target_node.node_id).update(
+            status="dead_end", explored_at=timezone.now(),
+        )
 
     logger.info(f"Candidate {cand_id} dismissed ({reason})")
     return {"candidate_id": str(cand_id), "status": reason}

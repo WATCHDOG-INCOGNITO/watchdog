@@ -1310,15 +1310,27 @@ prior recheck, sink info).
 6. If KB payloads fail but behavior is suspicious: mutate_payload OR craft your
    own based on observed responses.
 
-## Output contract
-- IF confirmed:
-  - confirm_finding + create_finding + save_evidence + learn_from_finding
-  - push_discovery(node_type="exploit_step", parent=<this vuln>) for chain follow-up
-  - update_node_status(this_vuln, "confirmed")
-- IF interesting partial signal: push_discovery(node_type="clue").
-- IF all attempts failed: mark_dead_end + learn_dead_end.
+## Output contract — TIER A (mandatory data finalize)
+다음 도구 호출 누락 시 노드/KB 가 stuck/incomplete 상태로 끝남:
 
-자율성: KB는 권장이지만 source 분석으로 더 좋은 가설이 있으면 그걸 우선해도 OK.
+- IF confirmed:
+  1. confirm_finding(cand_id, severity, title, summary)  ← finding 생성
+  2. save_evidence(finding_id, kind, content)            ← TIER A, 증거 첨부
+  3. record_pattern_use(pattern_id, succeeded=True)      ← TIER A, KB 학습
+  4. learn_from_finding(finding_id, target_host, payload_used, is_novel)  ← Living KB
+  5. update_node_status(this_vuln, "confirmed")          ← TIER A, 노드 상태 전이
+  6. (optional) push_discovery(node_type="exploit_step") ← chain follow-up
+- IF interesting partial signal: push_discovery(node_type="clue") + update_node_status(explored).
+- IF all attempts failed:
+  1. record_pattern_use(succeeded=False)                 ← TIER A
+  2. learn_dead_end(target_host, endpoint, vuln_type, payload_used, reason)  ← TIER A
+  3. mark_dead_end(this_vuln, reason)                    ← 노드 상태 전이
+
+⚠️ 안전망: confirm_finding 호출 시 backend 가 candidate→endpoint+vuln_type 매칭으로
+연결된 vuln 노드를 자동으로 confirmed 전이. 그러나 save_evidence/
+record_pattern_use 누락은 자동 보완 불가 — 너가 명시 호출해야 KB 누적.
+
+자율성: KB 는 권장이지만 source 분석으로 더 좋은 가설이 있으면 그걸 우선해도 OK.
 """
 
 EXPLOIT_PROMPT = """\

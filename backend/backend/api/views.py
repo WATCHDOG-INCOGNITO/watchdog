@@ -79,7 +79,9 @@ def scan_runs(request):
 
     data = {
         "target_url": request.data.get("target_url", "http://example.com"),
-        "mode": request.data.get("mode", "hybrid-lite"),
+        # default discovery — MLLA / critic / multi_http_probe / SimHash dedup 흐름.
+        # frontend 트리 버튼 + worker swarm 활용. hybrid-lite 명시 시에만 그쪽 흐름.
+        "mode": request.data.get("mode", "discovery"),
         "request_budget_total": request.data.get("request_budget_total", 10),
         "config": request.data.get("config"),
     }
