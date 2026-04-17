@@ -90,6 +90,23 @@ update_node_status(this_vuln, "explored")
 매칭으로 vuln 노드를 자동 confirmed 전이. 그러나 save_evidence /
 record_pattern_use 누락은 자동 보완 불가. 명시 호출 필수.
 
+## ★ 끝나기 전 반드시 (finalize 3가지 중 하나, 모두 TIER A)
+
+**never leave node pending.** orchestrator 가 끝난 후 status 체크해서
+pending/exploring 이면 강제 mark_dead_end 하지만 그러면 KB 학습 0. 너가 직접:
+
+| 결과 | 필수 호출 (순서) |
+|------|------------------|
+| confirmed | 1.confirm_finding 2.save_evidence×N 3.record_pattern_use(True) 4.learn_from_finding 5.update_node_status(confirmed) |
+| partial clue | 1.push_discovery(clue) 2.update_node_status(this, "explored") |
+| **dead_end (all failed)** | **1.record_pattern_use(False)×매 payload 2.learn_dead_end(host,endpoint,vuln_type,payload_used,reason="<oracle false / no diff / blocked>") 3.mark_dead_end(this, reason)** |
+
+마지막에 `record_trace(scan_run_id, role="hypothesis", stage="vuln_test",
+tool_calls=[...], call_index=...)` — 실패든 성공이든.
+
+실패도 TIER A. record_pattern_use(False) + learn_dead_end 없으면 다음 scan
+이 같은 payload 반복. 자율성 무관 — 데이터 기록.
+
 ## Recheck mode (context.recheck=True)
 이 vuln 은 이전 scan 에서 성공했었음. 패치 여부 확인:
 1. 정확히 같은 attack vector 로 quick probe.

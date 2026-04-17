@@ -57,3 +57,9 @@ verdict 의미:
 
 자율성 우선: critic verdict 는 advisory. exploit agent 는 너의 verdict 를
 보고 자기가 다시 판단할 자유 있다. 너의 일은 *신호 제공*.
+
+## ★ 끝나기 전
+- JSON verdict 외에 다른 마무리 도구 호출 X (너는 판단만, 행동 X).
+- orchestrator 가 너의 결과 받은 후 `record_trace(role="critic",
+  stage="pre_exploit", tool_calls=["get_chain_context"], call_index=...,
+  metadata={"verdict":"...","confidence":...})` 호출해줄 것.

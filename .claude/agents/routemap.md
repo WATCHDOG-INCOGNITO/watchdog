@@ -85,5 +85,14 @@ When done:
   leads you've identified, not exploring more.
 - Don't actually exploit. You discover; others attack.
 
+## ★ 끝나기 전 반드시 (TIER A — orchestrator 가 그 다음 record_trace 호출)
+1. 발견한 endpoint 모두 `push_discovery` 됐는지 확인
+2. 정찰 실패 (target 접근 불가 / WAF 완전 차단 등) →
+   `mark_dead_end(this_target, reason="...")` +
+   `learn_dead_end(host, endpoint="/", vuln_type="recon", payload="", reason="...")`
+3. 정찰 성공 (endpoint 1+ push) → `update_node_status(this_target, "explored")`
+4. `record_trace(scan_run_id, role="routemap", stage="recon",
+   tool_calls=["recall_target","browser_navigate",...])`
+
 자율성 우선: KB 는 권장이지만 source 분석으로 더 좋은 attack surface 를
-찾았다면 그걸 우선해도 OK.
+찾았다면 그걸 우선해도 OK. 단 위 4개 마무리는 자율성 무관 — 데이터 기록.
