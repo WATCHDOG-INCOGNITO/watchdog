@@ -1174,14 +1174,26 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-shell" onClick={stopProp} style={{ maxWidth: 1200 }}>
-        <div className="modal-head">
-          <div className="modal-title">
-            📋 API 명세 (Endpoint Spec KB)
-            <span style={{ marginLeft: 12, opacity: 0.7, fontSize: "0.85em" }}>
+      <div
+        className="modal-card modal-card-wide"
+        onClick={stopProp}
+        style={{
+          maxWidth: 1200,
+          width: "min(1200px, 100%)",
+          padding: 0,
+          display: "flex",
+          flexDirection: "column",
+          maxHeight: "85vh",
+          overflow: "hidden",
+        }}
+      >
+        <div className="modal-head" style={{ padding: "16px 20px", borderBottom: "1px solid #e6ebf2" }}>
+          <div>
+            <h2 style={{ margin: 0 }}>📋 API 명세 (Endpoint Spec KB)</h2>
+            <div style={{ marginTop: 4, opacity: 0.7, fontSize: "0.85em" }}>
               host: <code>{data.host || "-"}</code> · {data.count} specs
               {targetUrl ? <span style={{ marginLeft: 8 }}>· target: <code>{targetUrl}</code></span> : null}
-            </span>
+            </div>
           </div>
           <div className="modal-actions">
             <button type="button" className="icon-button" title="새로고침" onClick={fetchSpecs}>↻</button>
@@ -1189,25 +1201,28 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
           </div>
         </div>
 
-        <div style={{ padding: "8px 14px", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <div style={{
+          padding: "10px 20px", display: "flex", gap: 8, alignItems: "center",
+          flexWrap: "wrap", background: "#f7f9fc", borderBottom: "1px solid #e6ebf2",
+        }}>
           <input
             type="text"
             placeholder="endpoint / sink / notes 검색…"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            style={{ flex: 1, minWidth: 200, padding: "6px 10px", border: "1px solid #ddd", borderRadius: 4 }}
+            style={{ flex: 1, minWidth: 200, padding: "7px 12px", border: "1px solid #ccd5e0", borderRadius: 4, background: "#fff" }}
           />
           <select
             value={vulnFilter}
             onChange={(e) => setVulnFilter(e.target.value)}
-            style={{ padding: "6px 10px", border: "1px solid #ddd", borderRadius: 4 }}
+            style={{ padding: "7px 10px", border: "1px solid #ccd5e0", borderRadius: 4, background: "#fff" }}
           >
             <option value="">all vuln_types</option>
             {allVulnTypes.map((vt) => (
               <option key={vt} value={vt}>{vt}</option>
             ))}
           </select>
-          <span style={{ opacity: 0.6, fontSize: "0.85em" }}>{filtered.length} / {data.count}</span>
+          <span style={{ opacity: 0.7, fontSize: "0.85em", color: "#5a6573" }}>{filtered.length} / {data.count}</span>
         </div>
 
         {error ? <div className="callout callout-error">{error}</div> : null}
@@ -1222,15 +1237,15 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
           </div>
         ) : null}
 
-        <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
-          <div style={{ flex: 1, overflowY: "auto", borderRight: "1px solid #eee" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.9em" }}>
-              <thead style={{ position: "sticky", top: 0, background: "#fafafa" }}>
+        <div style={{ display: "flex", flex: 1, overflow: "hidden", background: "#fff" }}>
+          <div style={{ flex: 1, overflowY: "auto", borderRight: "1px solid #e6ebf2" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.9em", background: "#fff" }}>
+              <thead style={{ position: "sticky", top: 0, background: "#eef2f7", zIndex: 1 }}>
                 <tr>
-                  <th style={{ textAlign: "left", padding: "6px 10px", borderBottom: "1px solid #ddd", width: 60 }}>method</th>
-                  <th style={{ textAlign: "left", padding: "6px 10px", borderBottom: "1px solid #ddd" }}>endpoint</th>
-                  <th style={{ textAlign: "left", padding: "6px 10px", borderBottom: "1px solid #ddd" }}>의심 vuln</th>
-                  <th style={{ textAlign: "right", padding: "6px 10px", borderBottom: "1px solid #ddd", width: 60 }}>seen</th>
+                  <th style={{ textAlign: "left", padding: "8px 12px", borderBottom: "2px solid #d3dae4", width: 70, color: "#1f2a3a" }}>method</th>
+                  <th style={{ textAlign: "left", padding: "8px 12px", borderBottom: "2px solid #d3dae4", color: "#1f2a3a" }}>endpoint</th>
+                  <th style={{ textAlign: "left", padding: "8px 12px", borderBottom: "2px solid #d3dae4", color: "#1f2a3a" }}>의심 vuln</th>
+                  <th style={{ textAlign: "right", padding: "8px 12px", borderBottom: "2px solid #d3dae4", width: 70, color: "#1f2a3a" }}>seen</th>
                 </tr>
               </thead>
               <tbody>
@@ -1240,21 +1255,22 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
                     onClick={() => setSelectedId(s.spec_id)}
                     style={{
                       cursor: "pointer",
-                      background: selectedId === s.spec_id ? "#e8f0fe" : "transparent",
-                      borderBottom: "1px solid #f0f0f0",
+                      background: selectedId === s.spec_id ? "#dbe7fb" : "#fff",
+                      borderBottom: "1px solid #eef2f7",
+                      color: "#1f2a3a",
                     }}
                   >
-                    <td style={{ padding: "6px 10px" }}><strong>{s.method}</strong></td>
-                    <td style={{ padding: "6px 10px" }}>
+                    <td style={{ padding: "8px 12px" }}><strong>{s.method}</strong></td>
+                    <td style={{ padding: "8px 12px" }}>
                       {s.endpoint}
-                      {s.auth_required ? <span style={{ marginLeft: 6, opacity: 0.7 }}>🔒</span> : null}
+                      {s.auth_required ? <span style={{ marginLeft: 6, opacity: 0.75 }}>🔒</span> : null}
                     </td>
-                    <td style={{ padding: "6px 10px" }}>
+                    <td style={{ padding: "8px 12px" }}>
                       {(s.suspected_vuln_types || []).map((vt) => (
                         <span key={vt} className="node-status-pill node-status-pending" style={{ marginRight: 3, fontSize: "0.8em" }}>{vt}</span>
                       ))}
                     </td>
-                    <td style={{ padding: "6px 10px", textAlign: "right", opacity: 0.7 }}>{s.times_seen}×</td>
+                    <td style={{ padding: "8px 12px", textAlign: "right", opacity: 0.75 }}>{s.times_seen}×</td>
                   </tr>
                 ))}
               </tbody>
@@ -1262,7 +1278,7 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
           </div>
 
           {selected ? (
-            <div style={{ width: 420, padding: 14, overflowY: "auto" }}>
+            <div style={{ width: 440, padding: 18, overflowY: "auto", background: "#f7f9fc", color: "#1f2a3a" }}>
               <div style={{ marginBottom: 8 }}>
                 <strong style={{ fontSize: "1.1em" }}>{selected.method} {selected.endpoint}</strong>
                 {selected.auth_required ? <span style={{ marginLeft: 8 }}>🔒 auth</span> : null}
@@ -1318,7 +1334,7 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
               ) : null}
             </div>
           ) : (
-            <div style={{ width: 420, padding: 24, opacity: 0.5, fontSize: "0.9em" }}>
+            <div style={{ width: 440, padding: 24, fontSize: "0.9em", background: "#f7f9fc", color: "#5a6573" }}>
               ← 좌측 표에서 endpoint 를 선택하면 상세 명세 (params / sinks / response shape / notes) 가 보입니다.
             </div>
           )}
