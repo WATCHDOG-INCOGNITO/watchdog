@@ -669,6 +669,7 @@ function ResultsView({
   onOpenRunDetails,
   onOpenLlmTrace,
   onOpenDiscoveryTree,
+  onOpenApiSpecs,
   onStop,
   stopLoading,
 }) {
@@ -743,6 +744,14 @@ function ResultsView({
             actionLabel="트리 보기"
           />
         ) : null}
+        <StatCard
+          label="API 명세"
+          value="Spec"
+          helper="이 사이트의 누적 endpoint 명세 (host KB)"
+          tone="neutral"
+          onClick={onOpenApiSpecs}
+          actionLabel="명세 보기"
+        />
       </div>
 
       <SectionCard title="상태" kicker="실행 메모">
@@ -1116,6 +1125,210 @@ function flattenTree(roots) {
   return out;
 }
 
+function EndpointSpecModal({ runId, targetUrl, onClose }) {
+  const [data, setData] = useState({ host: "", count: 0, specs: [] });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [filter, setFilter] = useState("");
+  const [vulnFilter, setVulnFilter] = useState("");
+  const [selectedId, setSelectedId] = useState(null);
+
+  async function fetchSpecs() {
+    setLoading(true);
+    try {
+      const d = await apiGet(`/api/scan-runs/${runId}/endpoint-specs/`);
+      setData(d || { host: "", count: 0, specs: [] });
+      setError("");
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => { fetchSpecs(); }, [runId]);
+
+  const allVulnTypes = useMemo(() => {
+    const s = new Set();
+    for (const spec of data.specs || []) {
+      for (const vt of spec.suspected_vuln_types || []) s.add(vt);
+    }
+    return Array.from(s).sort();
+  }, [data]);
+
+  const filtered = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    return (data.specs || []).filter((s) => {
+      if (vulnFilter && !(s.suspected_vuln_types || []).includes(vulnFilter)) return false;
+      if (!q) return true;
+      const hay = `${s.method} ${s.endpoint} ${(s.suspected_vuln_types || []).join(" ")} ${(s.sink_hints || []).join(" ")} ${s.notes || ""}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }, [data, filter, vulnFilter]);
+
+  const selected = useMemo(
+    () => (data.specs || []).find((s) => s.spec_id === selectedId),
+    [data, selectedId],
+  );
+
+  const stopProp = (e) => e.stopPropagation();
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-shell" onClick={stopProp} style={{ maxWidth: 1200 }}>
+        <div className="modal-head">
+          <div className="modal-title">
+            📋 API 명세 (Endpoint Spec KB)
+            <span style={{ marginLeft: 12, opacity: 0.7, fontSize: "0.85em" }}>
+              host: <code>{data.host || "-"}</code> · {data.count} specs
+              {targetUrl ? <span style={{ marginLeft: 8 }}>· target: <code>{targetUrl}</code></span> : null}
+            </span>
+          </div>
+          <div className="modal-actions">
+            <button type="button" className="icon-button" title="새로고침" onClick={fetchSpecs}>↻</button>
+            <button type="button" className="ghost-button" onClick={onClose}>닫기</button>
+          </div>
+        </div>
+
+        <div style={{ padding: "8px 14px", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <input
+            type="text"
+            placeholder="endpoint / sink / notes 검색…"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            style={{ flex: 1, minWidth: 200, padding: "6px 10px", border: "1px solid #ddd", borderRadius: 4 }}
+          />
+          <select
+            value={vulnFilter}
+            onChange={(e) => setVulnFilter(e.target.value)}
+            style={{ padding: "6px 10px", border: "1px solid #ddd", borderRadius: 4 }}
+          >
+            <option value="">all vuln_types</option>
+            {allVulnTypes.map((vt) => (
+              <option key={vt} value={vt}>{vt}</option>
+            ))}
+          </select>
+          <span style={{ opacity: 0.6, fontSize: "0.85em" }}>{filtered.length} / {data.count}</span>
+        </div>
+
+        {error ? <div className="callout callout-error">{error}</div> : null}
+        {loading && !data.specs?.length ? <div className="callout callout-neutral">명세를 불러오는 중...</div> : null}
+
+        {!loading && data.count === 0 ? (
+          <div className="callout callout-neutral" style={{ margin: 14 }}>
+            이 host 에 누적된 endpoint 명세가 아직 없습니다. EntryPoint sub-agent 가
+            <code> record_endpoint_spec</code> 를 호출하거나, 취약점 confirm 시 안전망이
+            자동으로 명세를 만듭니다. discovery scan 을 한 번 더 돌리거나 같은 host
+            를 자동 resume 하면 누적이 시작됩니다.
+          </div>
+        ) : null}
+
+        <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+          <div style={{ flex: 1, overflowY: "auto", borderRight: "1px solid #eee" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.9em" }}>
+              <thead style={{ position: "sticky", top: 0, background: "#fafafa" }}>
+                <tr>
+                  <th style={{ textAlign: "left", padding: "6px 10px", borderBottom: "1px solid #ddd", width: 60 }}>method</th>
+                  <th style={{ textAlign: "left", padding: "6px 10px", borderBottom: "1px solid #ddd" }}>endpoint</th>
+                  <th style={{ textAlign: "left", padding: "6px 10px", borderBottom: "1px solid #ddd" }}>의심 vuln</th>
+                  <th style={{ textAlign: "right", padding: "6px 10px", borderBottom: "1px solid #ddd", width: 60 }}>seen</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((s) => (
+                  <tr
+                    key={s.spec_id}
+                    onClick={() => setSelectedId(s.spec_id)}
+                    style={{
+                      cursor: "pointer",
+                      background: selectedId === s.spec_id ? "#e8f0fe" : "transparent",
+                      borderBottom: "1px solid #f0f0f0",
+                    }}
+                  >
+                    <td style={{ padding: "6px 10px" }}><strong>{s.method}</strong></td>
+                    <td style={{ padding: "6px 10px" }}>
+                      {s.endpoint}
+                      {s.auth_required ? <span style={{ marginLeft: 6, opacity: 0.7 }}>🔒</span> : null}
+                    </td>
+                    <td style={{ padding: "6px 10px" }}>
+                      {(s.suspected_vuln_types || []).map((vt) => (
+                        <span key={vt} className="node-status-pill node-status-pending" style={{ marginRight: 3, fontSize: "0.8em" }}>{vt}</span>
+                      ))}
+                    </td>
+                    <td style={{ padding: "6px 10px", textAlign: "right", opacity: 0.7 }}>{s.times_seen}×</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {selected ? (
+            <div style={{ width: 420, padding: 14, overflowY: "auto" }}>
+              <div style={{ marginBottom: 8 }}>
+                <strong style={{ fontSize: "1.1em" }}>{selected.method} {selected.endpoint}</strong>
+                {selected.auth_required ? <span style={{ marginLeft: 8 }}>🔒 auth</span> : null}
+              </div>
+              <div style={{ opacity: 0.7, fontSize: "0.85em", marginBottom: 12 }}>
+                seen {selected.times_seen}×{selected.last_seen_at ? ` · last ${selected.last_seen_at.slice(0, 19).replace("T", " ")}` : ""}
+              </div>
+
+              {selected.suspected_vuln_types?.length ? (
+                <div className="node-panel-section">
+                  <div className="mini-title">의심 vuln_types</div>
+                  <div>
+                    {selected.suspected_vuln_types.map((vt) => (
+                      <span key={vt} className="node-status-pill node-status-pending" style={{ marginRight: 4 }}>{vt}</span>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {selected.sink_hints?.length ? (
+                <div className="node-panel-section">
+                  <div className="mini-title">Sink hints</div>
+                  <pre className="node-panel-context">{selected.sink_hints.join("\n")}</pre>
+                </div>
+              ) : null}
+
+              {selected.params_schema && Object.keys(selected.params_schema).length ? (
+                <div className="node-panel-section">
+                  <div className="mini-title">Params schema</div>
+                  <pre className="node-panel-context">{JSON.stringify(selected.params_schema, null, 2)}</pre>
+                </div>
+              ) : null}
+
+              {selected.headers_required?.length ? (
+                <div className="node-panel-section">
+                  <div className="mini-title">Headers required</div>
+                  <pre className="node-panel-context">{selected.headers_required.join("\n")}</pre>
+                </div>
+              ) : null}
+
+              {selected.response_shape && Object.keys(selected.response_shape).length ? (
+                <div className="node-panel-section">
+                  <div className="mini-title">Response shape</div>
+                  <pre className="node-panel-context">{JSON.stringify(selected.response_shape, null, 2)}</pre>
+                </div>
+              ) : null}
+
+              {selected.notes ? (
+                <div className="node-panel-section">
+                  <div className="mini-title">Notes</div>
+                  <div style={{ whiteSpace: "pre-wrap", fontSize: "0.9em", opacity: 0.85 }}>{selected.notes}</div>
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <div style={{ width: 420, padding: 24, opacity: 0.5, fontSize: "0.9em" }}>
+              ← 좌측 표에서 endpoint 를 선택하면 상세 명세 (params / sinks / response shape / notes) 가 보입니다.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
   const [nodes, setNodes] = useState([]);
   const [requests, setRequests] = useState([]);
@@ -1445,6 +1658,7 @@ export default function App() {
   const [showCandidatesModal, setShowCandidatesModal] = useState(false);
   const [showLlmTrace, setShowLlmTrace] = useState(false);
   const [showDiscoveryTree, setShowDiscoveryTree] = useState(false);
+  const [showApiSpecs, setShowApiSpecs] = useState(false);
 
   const [selectedFindingId, setSelectedFindingId] = useState(null);
   const [findingDetail, setFindingDetail] = useState(null);
@@ -1768,6 +1982,7 @@ export default function App() {
             onOpenRunDetails={() => setShowRunDetails(true)}
             onOpenLlmTrace={() => setShowLlmTrace(true)}
             onOpenDiscoveryTree={() => setShowDiscoveryTree(true)}
+            onOpenApiSpecs={() => setShowApiSpecs(true)}
             onStop={handleStopRun}
             stopLoading={stopLoading}
           />
@@ -1829,6 +2044,14 @@ export default function App() {
           runId={selectedRunId}
           scanStatus={currentScan?.status}
           onClose={() => setShowDiscoveryTree(false)}
+        />
+      ) : null}
+
+      {showApiSpecs && selectedRunId ? (
+        <EndpointSpecModal
+          runId={selectedRunId}
+          targetUrl={currentScan?.target_url}
+          onClose={() => setShowApiSpecs(false)}
         />
       ) : null}
     </div>
