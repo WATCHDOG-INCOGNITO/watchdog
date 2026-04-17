@@ -352,7 +352,8 @@ PLANNER_TOOLS = {
     "emit_hypotheses",
 }
 EXECUTOR_TOOLS = {
-    "http_request", "curl_request", "sqlmap_scan", "dalfox_scan", "nuclei_scan",
+    "http_request", "multi_http_probe", "curl_request",
+    "sqlmap_scan", "dalfox_scan", "nuclei_scan",
     "ffuf_scan", "nikto_scan", "wafw00f_scan", "whatweb_scan",
     "browser_navigate", "browser_get_dom", "browser_get_network_log",
     "browser_screenshot", "browser_extract_api_endpoints",
@@ -466,6 +467,10 @@ SAFE_PARALLEL_TOOLS = {
     # KB / 검색
     "search_knowledge", "retrieve_similar_patterns", "retrieve_cve_variants",
     "check_payload_dedup", "fetch_cve_details", "suggest_cves_for_framework",
+    # HTTP probe — stateless. http_session_request 는 cookie jar 공유로 직렬 유지.
+    # multi_http_probe 는 자체 내부 동시화. 단일 http_request 도 한 LLM 턴에 N개를
+    # 묶어 부르면 _execute_tool_calls 가 asyncio.gather 로 동시 발사.
+    "http_request", "multi_http_probe",
     # Living KB 회상 (read)
     "recall_target", "recall_dead_ends",
     # 후보/스캔 조회
@@ -988,7 +993,7 @@ VERIFIER_WORKER_TOOLS = VERIFIER_TOOLS
 # Discovery mode — 단서 축적형 트리 탐색
 # ─────────────────────────────────────────────────────────────
 
-DISCOVERY_WORKER_COUNT = int(os.environ.get("WATCHDOG_DISCOVERY_WORKERS", "3"))
+DISCOVERY_WORKER_COUNT = int(os.environ.get("WATCHDOG_DISCOVERY_WORKERS", "5"))
 DISCOVERY_WORKER_BUDGET = int(os.environ.get("WATCHDOG_DISCOVERY_WORKER_BUDGET", "14"))
 DISCOVERY_EXPLOIT_BUDGET = int(os.environ.get("WATCHDOG_DISCOVERY_EXPLOIT_BUDGET", "22"))
 DISCOVERY_CLUE_BUDGET = int(os.environ.get("WATCHDOG_DISCOVERY_CLUE_BUDGET", "18"))
@@ -1258,7 +1263,8 @@ seeded_from (= previous scan info).
 3. (optional) read_source / grep_source the handler if source_root available —
    look at sinks (eval/exec/include/sql template/redirect/file write).
 4. (optional) recall_dead_ends(host, vuln_type, endpoint) — skip already-failed.
-5. send a baseline + a few probe http_request(s) to confirm the surface exists.
+5. send a baseline + a few probe HTTP requests to confirm the surface exists.
+   **PREFER `multi_http_probe`** to send baseline + probes in 1 turn (병렬, 토큰 절감).
 
 ## Output contract
 For EACH suspected vuln_type:
@@ -1292,9 +1298,15 @@ prior recheck, sink info).
 3. retrieve_similar_patterns(query=<natural language sink>) — semantic search.
 4. recall_dead_ends — skip patterns that already failed on this host.
 5. For top KB patterns (max 3-5):
-   - http_request (or http_session_request for stateful flows) with the payload.
+   - **PREFER `multi_http_probe`** — baseline + N payloads 를 1턴에 동시 발사.
+     토큰/시간 ~N배 절감. stateless GET/POST 만. 예:
+     `multi_http_probe(requests_json='[{"url":"<base>","method":"GET"},
+       {"url":"<base>?id=1","method":"GET"},
+       {"url":"<base>?id=1' OR 1=1--","method":"GET"}]')`
+   - 단일 http_request 도 한 턴에 여러 개 부르면 자동 병렬 (SAFE_PARALLEL).
+   - stateful flow(login chain 등) 는 http_session_request 직렬.
    - oracle_*(...) — verify deterministically.
-   - record_pattern_use(pattern_id, succeeded=True/False).
+   - record_pattern_use(pattern_id, succeeded=True/False) — 매 payload 마다.
 6. If KB payloads fail but behavior is suspicious: mutate_payload OR craft your
    own based on observed responses.
 

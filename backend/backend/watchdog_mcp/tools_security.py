@@ -237,6 +237,110 @@ def register(mcp):
 
 
     @mcp.tool()
+    async def multi_http_probe(
+        requests_json: str,
+        max_concurrent: int = 8,
+        timeout_s: int = 15,
+    ) -> str:
+        """N개 HTTP 요청을 동시 발사 (Anthropic swarm parallel agents 패턴).
+
+        한 LLM tool call로 여러 probe를 동시에 — KB top-N 페이로드 / baseline+payload /
+        framework 다중 endpoint scan 등에 유용. 단일 http_request N번 호출 대비:
+          · 토큰 ~N배 절감 (도구 호출 메타가 1번)
+          · wall-clock ~N배 단축 (stateless GET/POST는 동시 처리)
+
+        ⚠️ stateless 요청만 — 같은 session 쿠키 공유는 http_session_request 직렬 사용.
+        대상 server rate limit 고려해 max_concurrent 조정.
+
+        Args:
+            requests_json: JSON 배열 — 각 항목 {url, method, headers (dict, opt),
+              body (str|null), follow_redirects (bool, opt)}.
+              예: '[{"url":"http://x/a","method":"GET"},
+                    {"url":"http://x/b?q=1","method":"GET"},
+                    {"url":"http://x/c","method":"POST","body":"{\\"k\\":1}"}]'
+            max_concurrent: 동시 발사 상한 (기본 8). 너무 크면 target 압박.
+            timeout_s: 각 요청 timeout (기본 15초).
+
+        Returns:
+            {results: [{idx, url, status_code, elapsed, content_length, body_preview,
+                        headers, error?}, ...], errors_count, total_elapsed}
+        """
+        import asyncio as _aio
+
+        try:
+            req_list = json.loads(requests_json) if requests_json else []
+        except json.JSONDecodeError as e:
+            return json.dumps({"error": f"requests_json parse failed: {e}"})
+        if not isinstance(req_list, list) or not req_list:
+            return json.dumps({"error": "requests_json must be non-empty JSON array"})
+
+        sem = _aio.Semaphore(max(1, int(max_concurrent)))
+
+        def _send_one(idx: int, item: dict) -> dict:
+            url = (item.get("url") or "").strip()
+            method = (item.get("method") or "GET").upper()
+            hdrs = item.get("headers") or {}
+            if not isinstance(hdrs, dict):
+                hdrs = {}
+            hdrs.setdefault("User-Agent", "WatchdogMCP/1.0")
+            body = item.get("body")
+            follow = item.get("follow_redirects", True)
+            if not url:
+                return {"idx": idx, "error": "url required"}
+            try:
+                t0 = time.time()
+                if method == "POST":
+                    if isinstance(body, (dict, list)):
+                        resp = requests.post(url, json=body, headers=hdrs,
+                                             timeout=timeout_s, allow_redirects=follow)
+                    else:
+                        resp = requests.post(url, data=body or "", headers=hdrs,
+                                             timeout=timeout_s, allow_redirects=follow)
+                elif method == "PUT":
+                    resp = requests.put(url, data=body or "", headers=hdrs,
+                                        timeout=timeout_s, allow_redirects=follow)
+                elif method == "DELETE":
+                    resp = requests.delete(url, headers=hdrs,
+                                           timeout=timeout_s, allow_redirects=follow)
+                elif method == "HEAD":
+                    resp = requests.head(url, headers=hdrs,
+                                         timeout=timeout_s, allow_redirects=follow)
+                else:  # GET / OPTIONS / others
+                    resp = requests.request(method, url, headers=hdrs,
+                                            timeout=timeout_s, allow_redirects=follow)
+                elapsed = round(time.time() - t0, 3)
+                return {
+                    "idx": idx,
+                    "url": resp.url,
+                    "status_code": resp.status_code,
+                    "elapsed": elapsed,
+                    "content_length": len(resp.text),
+                    "content_type": resp.headers.get("Content-Type", ""),
+                    "headers": dict(resp.headers),
+                    "body_preview": resp.text[:2000],
+                }
+            except requests.RequestException as e:
+                return {"idx": idx, "url": url, "error": str(e)}
+
+        async def _bounded(idx: int, item: dict) -> dict:
+            async with sem:
+                return await _aio.to_thread(_send_one, idx, item)
+
+        t0_all = time.time()
+        results = await _aio.gather(
+            *[_bounded(i, it if isinstance(it, dict) else {}) for i, it in enumerate(req_list)]
+        )
+        total_elapsed = round(time.time() - t0_all, 3)
+        errors_count = sum(1 for r in results if "error" in r)
+        return json.dumps({
+            "count": len(results),
+            "errors_count": errors_count,
+            "total_elapsed": total_elapsed,
+            "results": results,
+        })
+
+
+    @mcp.tool()
     def run_security_tool(command: str, timeout: int = 120) -> str:
         """보안 도구 명령을 직접 실행한다. 설치된 도구만 사용 가능.
         command: 실행할 명령 (예: "nmap -sV -p 80,443 target.com")
