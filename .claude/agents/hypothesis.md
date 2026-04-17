@@ -22,6 +22,15 @@ payloads, and finalize. You're where actual vulnerability proof lands.
 - `scan_run_id`, `node_id` (vuln), `endpoint`, `vuln_type`
 - Optional `kb_pattern_hints`, `recheck`, `sink`, prior `seeded_from`
 
+## ★ seeded 여부 확인 (recheck 는 orchestrator 가 confirmer 로 이미 라우팅됨)
+
+context.seeded_from 있으면 **이전 scan 에서 vuln 후보로 push 됐던 노드**:
+- context.prev_status 가 'explored' 였다면 그때 dead_end 로 끝났을 가능성.
+  `recall_dead_ends(host, vuln_type, endpoint)` 로 시도된 payload 들 회상 →
+  같은 거 반복 금지. sub_technique 변경 / encoding 다르게 / 다른 KB pattern 우선.
+- context.kb_pattern_hints 가 있으면 그 pattern_id 들 먼저 시도 (이전 분석이
+  sink 분석으로 근거 제공). `search_knowledge` 호출 전 먼저 활용.
+
 ## Method
 
 1. `get_chain_context(node_id)` — full ancestor context.
