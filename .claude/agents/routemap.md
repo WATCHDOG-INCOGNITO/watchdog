@@ -62,17 +62,36 @@ each persona:
 Push it as a child with suspected_vuln_types including `sqli` and
 `auth_bypass` — don't skip.
 
-### Session 획득 시 metadata 기록 (재획득 가능하도록)
-너가 직접 로그인하진 않지만, 다음 워커가 form-login 으로 session 을 얻을 때
-반드시 metadata 와 함께 저장하도록 note 를 남겨라:
+### Expirable secret 저장 시 refresh_spec 동반 (재획득 자동화)
+
+Session 외에도 CSRF / JWT / OTP / API key / 업로드 파일 등 만료 가능 artifact
+는 모두 `refresh_spec` (JSON recipe) 을 달아 저장한다. 표준 kind: form_login
+/ attack_replay / refetch_html / oauth_refresh / otp_request / magic_link /
+api_key_reissue / reupload / (custom).
+
+너는 직접 로그인/공격을 하진 않지만, 다음 워커가 저장할 때 쓰도록 auth note
+를 남기거나, CSRF-heavy 사이트면 "form page 에 csrf 있음, refetch_html kind
+로 저장 권장" 같은 observation 을 `add_scan_note` 로 남겨라.
+
+예시 (다음 워커가 사용):
 ```
+# 폼 로그인 세션
 store_secret(key="<label>_session", value=<cookie>, category="session",
   obtained_via="form_login", auth_label="<label>",
-  chain_summary="POST <login_url> as <username>")
+  refresh_spec='{"kind":"form_login","auth_label":"<label>"}')
+
+# 공격으로 얻은 세션
+store_secret(key="<descr>_session", value=<cookie>, category="session",
+  obtained_via="attack", source_vuln_node_id="<vuln uuid>",
+  refresh_spec='{"kind":"attack_replay","source_vuln_node_id":"<vuln uuid>"}')
+
+# CSRF token (per-request)
+store_secret(key="csrf_token", value=<t>, category="csrf",
+  obtained_via="refetch_html", expires_hint="per_request",
+  refresh_spec='{"kind":"refetch_html","url":"/form",
+                 "regex":"csrf\\" value=\\"([^\\"]+)"}')
 ```
-→ 만료 시 exploit sub-agent 가 `auth_<label>_*` 회상해서 자동 재로그인.
-공격으로 얻은 세션은 `obtained_via="attack"` + `source_vuln_node_id` 로
-저장하면 replay 가능.
+→ 만료 시 어떤 worker 든 refresh_spec 읽고 자동 복구.
 
 ## Output contract
 

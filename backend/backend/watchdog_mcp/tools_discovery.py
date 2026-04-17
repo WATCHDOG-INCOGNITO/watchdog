@@ -250,29 +250,58 @@ def register(mcp):
         auth_label: str = "",
         chain_summary: str = "",
         expires_hint: str = "",
+        refresh_spec: str = "",
     ) -> str:
-        """Store a discovered secret (credential, token, API key, session value) for
-        cross-worker sharing. Other workers exploring different nodes can retrieve
-        these via get_secrets.
+        """Store a discovered secret (credential, token, API key, session value,
+        CSRF token, OTP, uploaded file path, etc.) for cross-worker sharing.
+        Other workers exploring different nodes can retrieve these via
+        get_secrets. Expirable artifacts should include `refresh_spec` so any
+        worker hitting expiry can re-acquire them automatically.
 
         Args:
             scan_run_id: current scan run UUID
-            key: descriptive key (e.g. "admin_password", "jwt_token", "api_session")
+            key: descriptive key (e.g. "admin_password", "jwt_token",
+                 "api_session", "csrf_token", "uploaded_shell_path")
             value: the secret value
-            category: credential | token | api_key | session | config | other
-            obtained_via: 획득 방법 — "form_login" | "attack" | "source_leak" |
-                          "user_provided" | "" (unknown). session 만료 시 재획득
-                          흐름 분기:
-                            form_login → auth_<label>_* 로 재로그인
-                            attack → source_vuln_node_id 를 recheck=True 로 push
-                                     → confirmer 가 공격 chain 재실행
-            source_vuln_node_id: obtained_via=attack 일 때, 이 session 을 얻어낸
+            category: credential | token | api_key | session | csrf | otp |
+                      file_path | config | other
+            obtained_via: 획득 방법 short tag — "form_login" | "attack" |
+                          "source_leak" | "user_provided" | "refetch_html" |
+                          "oauth_refresh" | "otp_request" | "reupload" |
+                          "api_key_reissue" | "" (unknown). 만료 시 빠른 분기용.
+            source_vuln_node_id: obtained_via=attack 일 때, 이 secret 을 얻어낸
                                  vuln 노드 UUID. 만료 시 그 노드 replay.
             auth_label: obtained_via=form_login 일 때, 사용한 persona label
                         (auth_<label>_login_url/username/password 와 매칭).
-            chain_summary: 공격 chain 한 줄 요약 (예: "SQLi at /rest/user/login
-                           via admin@x.com'--"). replay 시 참고용.
-            expires_hint: 만료 추정 (예: "1h", "30m", "until_logout"). null 가능.
+            chain_summary: 획득 chain 한 줄 요약 (replay/디버그용).
+            expires_hint: 만료 추정 (예: "1h", "30m", "per_request",
+                          "until_logout"). null 가능.
+            refresh_spec: **JSON string** describing how to re-acquire this
+                          secret on expiry. 형식: {"kind":"<recipe>", ...params}.
+                          Sub-agent 가 만료 감지 시 이 spec 을 읽어 판단 후
+                          자율 재획득. 표준 recipe 예시:
+                            form_login:     {"kind":"form_login","auth_label":"admin"}
+                            attack_replay:  {"kind":"attack_replay",
+                                             "source_vuln_node_id":"<uuid>"}
+                            refetch_html:   {"kind":"refetch_html",
+                                             "url":"/dashboard",
+                                             "regex":"csrf_token\\s*=\\s*\"([^\"]+)"}
+                            oauth_refresh:  {"kind":"oauth_refresh",
+                                             "token_endpoint":"/oauth/token",
+                                             "refresh_token_key":"<secret_key>"}
+                            otp_request:    {"kind":"otp_request",
+                                             "request_endpoint":"/auth/otp",
+                                             "inbox_key":"<inbox_secret>"}
+                            magic_link:     {"kind":"magic_link",
+                                             "request_endpoint":"/auth/magic",
+                                             "mailbox_key":"<inbox_secret>"}
+                            api_key_reissue:{"kind":"api_key_reissue",
+                                             "portal_url":"/settings/api",
+                                             "method":"POST"}
+                            reupload:       {"kind":"reupload",
+                                             "upload_node_id":"<uuid>"}
+                          custom recipe 도 OK — 다른 worker 가 읽고 판단.
+                          Non-JSON 이면 raw string 으로 보존 (경고만).
 
         Returns:
             JSON with confirmation and total secrets count.
@@ -298,6 +327,12 @@ def register(mcp):
                 entry["chain_summary"] = chain_summary[:500]
             if expires_hint:
                 entry["expires_hint"] = expires_hint
+            if refresh_spec:
+                try:
+                    entry["refresh_spec"] = json.loads(refresh_spec)
+                except (json.JSONDecodeError, TypeError):
+                    entry["refresh_spec"] = {"kind": "raw",
+                                             "raw": refresh_spec[:500]}
             secrets[key] = entry
             config["_secrets"] = secrets
             run.config = config
