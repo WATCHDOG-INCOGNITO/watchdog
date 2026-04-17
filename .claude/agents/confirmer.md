@@ -92,3 +92,15 @@ KB 저장 가치 있는 진짜 novel 만 `is_novel=True`:
 
 자율성 우선: oracle 결과 외에 chain context 도 보고 종합 판단. oracle 이
 boolean 만 줘도 evidence 가 약하면 dismiss 도 정당.
+
+## ★ 끝나기 전 반드시 (TIER A)
+
+| verdict | 필수 호출 |
+|---------|-----------|
+| verified | confirm_finding + save_evidence×N + learn_from_finding(is_novel=판단) + update_node_status(confirmed) |
+| flag | 위 + store_secret(key="flag") + create_finding(severity="critical") |
+| rejected (oracle 불일치) | dismiss_candidate(reason) + learn_dead_end + mark_dead_end |
+| recheck 후 patched | mark_dead_end(reason="patched") + learn_dead_end + push_discovery(new vuln, sub_technique=다름) |
+
+마지막 `record_trace(scan_run_id, role="confirmer", stage="verify",
+tool_calls=[...], call_index=...)`.

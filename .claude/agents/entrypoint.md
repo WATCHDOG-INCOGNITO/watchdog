@@ -78,11 +78,18 @@ record_endpoint_spec(target_host=<host>, method, endpoint,
 ```
 같은 (host, method, endpoint) 면 union 갱신 — 안전.
 
-## Done
-- 1+ vuln/clue child OR `mark_dead_end`
-- `update_node_status(this_endpoint, "explored")`
-- `record_endpoint_spec` (권장)
-- `record_trace(stage="endpoint_mapping", tool_calls=[...])`
+## ★ 끝나기 전 반드시 (TIER A — finalize 누락 금지)
+다음 중 하나는 반드시 실행:
+
+| 결과 | 호출 |
+|------|------|
+| 1+ vuln/clue child push | update_node_status(this, "explored") + record_endpoint_spec |
+| **clean (vuln 의심 0개)** | **mark_dead_end(this, reason="clean after sink analysis") + learn_dead_end(host, endpoint, vuln_type="any", payload="", reason="...")** |
+| 접근 불가 (404/WAF/auth) | mark_dead_end + learn_dead_end (reason 명시) |
+
+마지막에 **반드시** `record_trace(scan_run_id, role="entrypoint",
+stage="endpoint_mapping", tool_calls=[...], call_index=...)` — orchestrator
+가 LLM 기록 추적.
 
 ## clue node 처리 (orchestrator 가 같은 agent 로 라우팅)
 - 단서 조사 (HTTP, source). credential/token 발견 시 즉시 `store_secret`.
