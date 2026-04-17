@@ -513,51 +513,69 @@ function NewScanModal({ onClose, onCreated }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
-  // 로그인 정보 (선택) — type/form 별 동적 입력
+  // 로그인 정보 (선택) — multi-persona dynamic list. 각 entry 가 별도 credential.
   const [showAuth, setShowAuth] = useState(false);
-  const [authType, setAuthType] = useState("form");
-  const [loginUrl, setLoginUrl] = useState("");
-  const [authUsername, setAuthUsername] = useState("");
-  const [authPassword, setAuthPassword] = useState("");
-  const [usernameField, setUsernameField] = useState("username");
-  const [passwordField, setPasswordField] = useState("password");
-  const [bearerToken, setBearerToken] = useState("");
-  const [cookiesText, setCookiesText] = useState("");
+  const [creds, setCreds] = useState([
+    { label: "admin", type: "form", login_url: "", username: "", password: "",
+      username_field: "username", password_field: "password",
+      token: "", cookies_text: "" },
+  ]);
 
-  function buildCredentials() {
-    if (!showAuth) return null;
-    const t = authType;
+  function updateCred(idx, patch) {
+    setCreds((prev) => prev.map((c, i) => (i === idx ? { ...c, ...patch } : c)));
+  }
+  function addCred() {
+    setCreds((prev) => [...prev, {
+      label: `user${prev.length + 1}`, type: "form",
+      login_url: "", username: "", password: "",
+      username_field: "username", password_field: "password",
+      token: "", cookies_text: "",
+    }]);
+  }
+  function removeCred(idx) {
+    setCreds((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  function buildOneCredential(c) {
+    const t = c.type;
+    const base = { label: c.label || undefined, type: t };
     if (t === "form") {
-      if (!authUsername || !authPassword) return null;
-      const c = { type: "form", username: authUsername, password: authPassword };
-      if (loginUrl.trim()) c.login_url = loginUrl.trim();
-      if (usernameField !== "username") c.username_field = usernameField;
-      if (passwordField !== "password") c.password_field = passwordField;
-      return c;
+      if (!c.username || !c.password) return null;
+      const out = { ...base, username: c.username, password: c.password };
+      if (c.login_url && c.login_url.trim()) out.login_url = c.login_url.trim();
+      if (c.username_field && c.username_field !== "username") out.username_field = c.username_field;
+      if (c.password_field && c.password_field !== "password") out.password_field = c.password_field;
+      return out;
     }
     if (t === "bearer") {
-      if (!bearerToken.trim()) return null;
-      return { type: "bearer", token: bearerToken.trim() };
+      if (!c.token || !c.token.trim()) return null;
+      return { ...base, token: c.token.trim() };
     }
     if (t === "cookie") {
-      if (!cookiesText.trim()) return null;
-      // "k=v; k2=v2" 형식 또는 JSON 둘 다 허용
-      const txt = cookiesText.trim();
-      try {
-        if (txt.startsWith("{")) return { type: "cookie", cookies: JSON.parse(txt) };
-      } catch { /* fall through */ }
+      const txt = (c.cookies_text || "").trim();
+      if (!txt) return null;
+      try { if (txt.startsWith("{")) return { ...base, cookies: JSON.parse(txt) }; }
+      catch { /* fall through */ }
       const cookies = {};
       for (const part of txt.split(";")) {
         const [k, ...rest] = part.trim().split("=");
         if (k && rest.length) cookies[k.trim()] = rest.join("=").trim();
       }
-      return Object.keys(cookies).length ? { type: "cookie", cookies } : null;
+      return Object.keys(cookies).length ? { ...base, cookies } : null;
     }
     if (t === "basic") {
-      if (!authUsername || !authPassword) return null;
-      return { type: "basic", username: authUsername, password: authPassword };
+      if (!c.username || !c.password) return null;
+      return { ...base, username: c.username, password: c.password };
     }
     return null;
+  }
+
+  function buildCredentials() {
+    if (!showAuth) return null;
+    const list = creds.map(buildOneCredential).filter(Boolean);
+    if (list.length === 0) return null;
+    if (list.length === 1) return list[0];  // legacy single dict 호환
+    return list;
   }
 
   async function handleSubmit() {
@@ -627,80 +645,106 @@ function NewScanModal({ onClose, onCreated }) {
             marginTop: 8, padding: 12, border: "1px solid #d3dae4",
             borderRadius: 6, background: "#f7f9fc",
           }}>
-            <label className="field">
-              <span>인증 방식</span>
-              <select value={authType} onChange={(e) => setAuthType(e.target.value)}>
-                <option value="form">Form login (POST username/password)</option>
-                <option value="bearer">Bearer token (Authorization 헤더)</option>
-                <option value="cookie">Cookie (이미 로그인된 세션)</option>
-                <option value="basic">HTTP Basic Auth</option>
-              </select>
-            </label>
+            <div style={{ marginBottom: 8, fontSize: "0.85em", opacity: 0.75 }}>
+              여러 persona (admin / user1 / api 등) 추가 가능. label 로 구분 →
+              IDOR cross-test, role 별 권한 차이 테스트.
+            </div>
 
-            {authType === "form" ? (
-              <>
-                <label className="field">
-                  <span>로그인 URL (선택 — 미지정 시 LLM 이 자동 탐색)</span>
-                  <input value={loginUrl} onChange={(e) => setLoginUrl(e.target.value)}
-                    placeholder="http://target/login or /api/auth/login" />
-                </label>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                  <label className="field">
-                    <span>username 필드명</span>
-                    <input value={usernameField} onChange={(e) => setUsernameField(e.target.value)}
-                      placeholder="email / username / id" />
+            {creds.map((c, idx) => (
+              <div key={idx} style={{
+                marginBottom: 10, padding: 10, border: "1px solid #c5cfdc",
+                borderRadius: 4, background: "#fff",
+              }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+                  <label className="field" style={{ flex: "0 0 140px", margin: 0 }}>
+                    <span style={{ fontSize: "0.8em" }}>label</span>
+                    <input value={c.label} onChange={(e) => updateCred(idx, { label: e.target.value })}
+                      placeholder="admin / user1 / api" />
                   </label>
-                  <label className="field">
-                    <span>password 필드명</span>
-                    <input value={passwordField} onChange={(e) => setPasswordField(e.target.value)}
-                      placeholder="password / pw" />
+                  <label className="field" style={{ flex: 1, margin: 0 }}>
+                    <span style={{ fontSize: "0.8em" }}>type</span>
+                    <select value={c.type} onChange={(e) => updateCred(idx, { type: e.target.value })}>
+                      <option value="form">Form login</option>
+                      <option value="bearer">Bearer token</option>
+                      <option value="cookie">Cookie</option>
+                      <option value="basic">HTTP Basic</option>
+                    </select>
                   </label>
+                  {creds.length > 1 ? (
+                    <button type="button" className="ghost-button danger-button"
+                      style={{ marginTop: 16, padding: "4px 10px" }}
+                      onClick={() => removeCred(idx)}>제거</button>
+                  ) : null}
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+
+                {c.type === "form" ? (
+                  <>
+                    <label className="field">
+                      <span>로그인 URL (선택)</span>
+                      <input value={c.login_url} onChange={(e) => updateCred(idx, { login_url: e.target.value })}
+                        placeholder="http://target/login or /api/auth/login" />
+                    </label>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                      <label className="field">
+                        <span>username 필드명</span>
+                        <input value={c.username_field} onChange={(e) => updateCred(idx, { username_field: e.target.value })} />
+                      </label>
+                      <label className="field">
+                        <span>password 필드명</span>
+                        <input value={c.password_field} onChange={(e) => updateCred(idx, { password_field: e.target.value })} />
+                      </label>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                      <label className="field">
+                        <span>username</span>
+                        <input value={c.username} onChange={(e) => updateCred(idx, { username: e.target.value })} />
+                      </label>
+                      <label className="field">
+                        <span>password</span>
+                        <input type="password" value={c.password} onChange={(e) => updateCred(idx, { password: e.target.value })} />
+                      </label>
+                    </div>
+                  </>
+                ) : null}
+
+                {c.type === "bearer" ? (
                   <label className="field">
-                    <span>username</span>
-                    <input value={authUsername} onChange={(e) => setAuthUsername(e.target.value)}
-                      placeholder="admin@example.com" />
+                    <span>Bearer token</span>
+                    <input type="password" value={c.token} onChange={(e) => updateCred(idx, { token: e.target.value })}
+                      placeholder="eyJhbGciOiJIUzI1NiIs..." />
                   </label>
+                ) : null}
+
+                {c.type === "cookie" ? (
                   <label className="field">
-                    <span>password</span>
-                    <input type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} />
+                    <span>Cookies (k=v; k2=v2 또는 JSON)</span>
+                    <input value={c.cookies_text} onChange={(e) => updateCred(idx, { cookies_text: e.target.value })}
+                      placeholder='session=abc; csrf=xyz   또는   {"session":"abc"}' />
                   </label>
-                </div>
-              </>
-            ) : null}
+                ) : null}
 
-            {authType === "bearer" ? (
-              <label className="field">
-                <span>Bearer token</span>
-                <input type="password" value={bearerToken} onChange={(e) => setBearerToken(e.target.value)}
-                  placeholder="eyJhbGciOiJIUzI1NiIs..." />
-              </label>
-            ) : null}
-
-            {authType === "cookie" ? (
-              <label className="field">
-                <span>Cookies (key=value; key2=value2 또는 JSON)</span>
-                <input value={cookiesText} onChange={(e) => setCookiesText(e.target.value)}
-                  placeholder='session=abc123; csrf=xyz   또는   {"session":"abc123"}' />
-              </label>
-            ) : null}
-
-            {authType === "basic" ? (
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                <label className="field">
-                  <span>username</span>
-                  <input value={authUsername} onChange={(e) => setAuthUsername(e.target.value)} />
-                </label>
-                <label className="field">
-                  <span>password</span>
-                  <input type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} />
-                </label>
+                {c.type === "basic" ? (
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <label className="field">
+                      <span>username</span>
+                      <input value={c.username} onChange={(e) => updateCred(idx, { username: e.target.value })} />
+                    </label>
+                    <label className="field">
+                      <span>password</span>
+                      <input type="password" value={c.password} onChange={(e) => updateCred(idx, { password: e.target.value })} />
+                    </label>
+                  </div>
+                ) : null}
               </div>
-            ) : null}
+            ))}
 
-            <div style={{ marginTop: 6, fontSize: "0.8em", opacity: 0.6 }}>
-              ⚠ 입력값은 ScanRun.config 평문 저장. 운영 환경에선 별도 secret store 권장.
+            <button type="button" className="ghost-button" onClick={addCred} style={{ width: "100%" }}>
+              + 다른 persona 추가
+            </button>
+
+            <div style={{ marginTop: 8, fontSize: "0.8em", opacity: 0.6 }}>
+              ⚠ 평문 저장 (ScanRun.config). 운영 환경엔 별도 secret store 권장.<br />
+              ℹ login endpoint 자체도 SQLi/auth_bypass 시도 대상 — credential 은 정찰 보조일 뿐 면제권 아님.
             </div>
           </div>
         ) : null}
