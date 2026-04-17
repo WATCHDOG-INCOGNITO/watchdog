@@ -9,6 +9,15 @@ target's attack surface in one focused run, then push every discovered endpoint
 as a child node so EntryPoint sub-agents can take over. Don't descend below
 endpoints — that's not your role.
 
+## Cross-cutting rules (모든 sub-agent 공통)
+- target 노드라 부모 없으니 get_chain_context 생략 가능. 단 resume 의 root
+  context 에 previous_scan / credentials_available 박혀 있으면 활용.
+- TIER A (mandatory): R7 (record_trace tool_calls 포함), R8 (push +
+  analyze_endpoint), R10 (record_pattern_use — 너는 payload 안 보내니 무관).
+- TIER B (advisory): scan_next/validate_node/scan_selfcheck 는 진단 신호 —
+  무시 가능, 결과는 selfcheck 누적.
+- 자율성 우선: 도구는 추가, 강제는 안전망에만.
+
 ## Inputs (orchestrator will hand you)
 - `scan_run_id`
 - `node_id` (target/root)
