@@ -345,8 +345,9 @@ PLANNER_TOOLS = {
     "analyze_endpoint", "search_knowledge", "retrieve_similar_patterns",
     "retrieve_cve_variants", "fetch_cve_details", "suggest_cves_for_framework",
     "list_candidates", "get_scan_summary",
-    # Living KB — host-specific 회상
+    # Living KB — host-specific 회상 + endpoint spec
     "recall_target", "recall_dead_ends", "update_target_profile",
+    "recall_endpoint_specs", "record_endpoint_spec",
     # Source code reading (white-box / glass-box CTF)
     "list_source_tree", "read_source", "grep_source",
     "emit_hypotheses",
@@ -362,8 +363,8 @@ EXECUTOR_TOOLS = {
     "auto_collect_evidence", "list_candidates",
     # SimHash dedup — payload 시도 전 본질 중복 진단
     "check_payload_dedup",
-    # Living KB — dead end 사전 조회로 무의미한 시도 회피
-    "recall_dead_ends",
+    # Living KB — dead end 사전 조회 + endpoint spec
+    "recall_dead_ends", "recall_endpoint_specs", "record_endpoint_spec",
     # Source reading — chain composition 시 코드 참고
     "read_source", "grep_source", "list_source_tree",
     # Stateful HTTP — multi-step web flow (login → write → report 등)
@@ -380,6 +381,7 @@ VERIFIER_TOOLS = {
     "oracle_lfi", "oracle_ssrf", "oracle_response_diff",
     # Living KB — confirm/dismiss 결과를 누적 자산으로 저장
     "learn_from_finding", "learn_dead_end", "update_target_profile",
+    "record_endpoint_spec",
     # Source reading — false positive 판정 시 코드 검증
     "read_source", "grep_source", "list_source_tree",
     # OOB — XSS bot 등 비동기 결과 확증 (oracle 보다 강한 증거)
@@ -472,7 +474,7 @@ SAFE_PARALLEL_TOOLS = {
     # 묶어 부르면 _execute_tool_calls 가 asyncio.gather 로 동시 발사.
     "http_request", "multi_http_probe",
     # Living KB 회상 (read)
-    "recall_target", "recall_dead_ends",
+    "recall_target", "recall_dead_ends", "recall_endpoint_specs",
     # 후보/스캔 조회
     "list_candidates", "get_scan_summary", "get_finding",
     "get_chain_context", "get_exploit_chains",
@@ -1228,6 +1230,10 @@ A target (root) node: target_url, optional source_root.
 
 ## Method (자율적으로 선택, 모두 강제 아님)
 1. recall_target(host) — load prior knowledge (framework, WAF, prior vulns).
+   반환의 endpoint_specs 가 비어있지 않으면 이미 이 host endpoint 명세 KB 있음
+   → 그 endpoint 들은 push_discovery 로 바로 시드 (정찰 단계 최소화). 추가
+   recall_endpoint_specs(host) 로 더 자세한 정보 (params/sinks/suspected_vuln_types)
+   조회 가능.
 2. (white-box) list_source_tree → read_source / grep_source on routes/handlers.
 3. (black-box) browser_navigate + browser_extract_api_endpoints + browser_get_dom.
 4. update_target_profile with framework/server/WAF when identified.
@@ -1278,9 +1284,20 @@ For EACH suspected vuln_type:
 If clean after inspection → mark_dead_end. If interesting non-vuln signal
 (stack trace, internal URL, leaked token) → push "clue" or store_secret.
 
+## API spec KB (record_endpoint_spec — 다음 scan 비용 절감 자산)
+endpoint 분석 끝에 권장 호출:
+  record_endpoint_spec(target_host="<host>", method="POST", endpoint="/path",
+    params_schema='{"email":{"type":"str","in":"body","required":true}}',
+    auth_required=true,
+    suspected_vuln_types='["sqli","auth_bypass"]',
+    sink_hints='["bcrypt_compare","raw_sql_query"]',
+    notes="...")
+같은 host 재방문 시 RouteMap 이 이걸 recall 해 정찰을 단축. 누적 자산.
+
 ## Done conditions
 - 1+ vuln/clue child OR mark_dead_end.
 - update_node_status(this_endpoint, "explored").
+- (권장) record_endpoint_spec — 명세 KB 누적.
 """
 
 HYPOTHESIS_PROMPT = """\
@@ -1525,6 +1542,7 @@ EXPLORER_TOOLS = {
     # Living KB
     "recall_target", "recall_dead_ends", "learn_from_finding",
     "learn_dead_end", "update_target_profile",
+    "record_endpoint_spec", "recall_endpoint_specs",
     # OOB
     "oob_register_token", "oob_get_hits", "oob_wait_for_hit", "oob_clear_hits",
 }
