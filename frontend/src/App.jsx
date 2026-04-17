@@ -1143,6 +1143,27 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
     ].filter((s) => s.count > 0);
   }, [stats]);
 
+  // 이전 scan 이어받기 정보 — root 노드의 context.previous_scan + 트리 안 [seeded]/[re-verify]/
+  // [prev dead_end]/[prev clue|exploit_step] prefix 카운트.
+  const resumeInfo = useMemo(() => {
+    const root = nodes.find((n) => n.depth === 0);
+    const prev = root?.context?.previous_scan;
+    if (!prev) return null;
+    let endpoints = 0, vulns = 0, dead = 0, clues = 0;
+    for (const n of nodes) {
+      const s = n.summary || "";
+      if (s.startsWith("[seeded]")) endpoints++;
+      else if (s.startsWith("[re-verify]")) vulns++;
+      else if (s.startsWith("[prev dead_end]")) dead++;
+      else if (s.startsWith("[prev clue]") || s.startsWith("[prev exploit_step]")) clues++;
+    }
+    return {
+      prev_run_id: prev.prev_run_id || "",
+      endpoints, vulns, dead, clues,
+      total: endpoints + vulns + dead + clues,
+    };
+  }, [nodes]);
+
   const handleWheel = useCallback((e) => {
     e.preventDefault();
     const vp = vpRef.current;
@@ -1237,6 +1258,17 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
           <span>대기 <strong>{stats.pending}</strong></span>
           <span>최대 깊이 <strong>{stats.maxDepth}</strong></span>
         </div>
+
+        {resumeInfo && resumeInfo.total > 0 ? (
+          <div className="callout callout-neutral" style={{ marginTop: 8, padding: "6px 10px", fontSize: "0.9em" }}>
+            ↻ 이전 scan 이어받음 (<code>{resumeInfo.prev_run_id.slice(0, 8) || "?"}</code>)
+            — endpoint <strong>{resumeInfo.endpoints}</strong>
+            · 재검증 vuln <strong>{resumeInfo.vulns}</strong>
+            · prev dead_end <strong>{resumeInfo.dead}</strong>
+            · clue/exploit <strong>{resumeInfo.clues}</strong>
+            <span style={{ opacity: 0.6, marginLeft: 6 }}>(cold-start 회피 + 패치 검증)</span>
+          </div>
+        ) : null}
 
         {stats.total > 0 ? (
           <div className="discovery-bar">
