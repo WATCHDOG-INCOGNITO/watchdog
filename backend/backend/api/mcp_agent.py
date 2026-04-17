@@ -343,7 +343,8 @@ PLANNER_TOOLS = {
     "browser_navigate", "browser_extract_api_endpoints", "browser_get_dom",
     "browser_get_network_log", "browser_screenshot", "browser_get_console",
     "analyze_endpoint", "search_knowledge", "retrieve_similar_patterns",
-    "retrieve_cve_variants", "list_candidates", "get_scan_summary",
+    "retrieve_cve_variants", "fetch_cve_details", "suggest_cves_for_framework",
+    "list_candidates", "get_scan_summary",
     # Living KB — host-specific 회상
     "recall_target", "recall_dead_ends", "update_target_profile",
     # Source code reading (white-box / glass-box CTF)
@@ -358,6 +359,8 @@ EXECUTOR_TOOLS = {
     "search_knowledge", "retrieve_similar_patterns", "record_pattern_use",
     "mutate_payload", "create_candidate_manual", "save_evidence",
     "auto_collect_evidence", "list_candidates",
+    # SimHash dedup — payload 시도 전 본질 중복 진단
+    "check_payload_dedup",
     # Living KB — dead end 사전 조회로 무의미한 시도 회피
     "recall_dead_ends",
     # Source reading — chain composition 시 코드 참고
@@ -462,6 +465,7 @@ EXTENDED_LIMIT_TOOLS = {
 SAFE_PARALLEL_TOOLS = {
     # KB / 검색
     "search_knowledge", "retrieve_similar_patterns", "retrieve_cve_variants",
+    "check_payload_dedup", "fetch_cve_details", "suggest_cves_for_framework",
     # Living KB 회상 (read)
     "recall_target", "recall_dead_ends",
     # 후보/스캔 조회
@@ -1436,7 +1440,8 @@ EXPLORER_TOOLS = {
     "list_source_tree", "read_source", "grep_source",
     # KB
     "search_knowledge", "retrieve_similar_patterns", "retrieve_cve_variants",
-    "record_pattern_use", "mutate_payload",
+    "fetch_cve_details", "suggest_cves_for_framework",
+    "record_pattern_use", "mutate_payload", "check_payload_dedup",
     # Oracles
     "oracle_xss", "oracle_sqli_boolean", "oracle_sqli_time",
     "oracle_lfi", "oracle_ssrf", "oracle_response_diff",

@@ -97,6 +97,188 @@ def _commodity_check_local(payload: str, vuln_type: str, max_matches: int = 5) -
 # NVD CVE search
 # ─────────────────────────────────────────────────────────────
 
+def _nvd_request(params: dict, timeout: int = 10) -> tuple[int, dict | str]:
+    """NVD API 공통 호출 — apiKey 헤더 자동 추가."""
+    headers = {}
+    nvd_key = os.environ.get("NVD_API_KEY", "").strip()
+    if nvd_key:
+        headers["apiKey"] = nvd_key
+    try:
+        r = requests.get(NVD_API, params=params, headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            return r.status_code, f"NVD HTTP {r.status_code}: {r.text[:200]}"
+        return 200, r.json()
+    except Exception as e:
+        return 0, f"NVD query failed: {e}"
+
+
+def _extract_poc_urls(refs: list[dict]) -> list[dict]:
+    """NVD references 에서 PoC/exploit 가능성 높은 URL만 골라낸다."""
+    out = []
+    poc_hosts = ("github.com", "exploit-db.com", "packetstormsecurity",
+                 "huntr.dev", "huntress.com", "rapid7.com", "synacktiv",
+                 "snyk.io", "sansec.io", "horizon3.ai", "praetorian.com")
+    poc_tags = {"exploit", "patch", "third party advisory", "vendor advisory",
+                "technical description"}
+    for ref in refs:
+        url = (ref.get("url") or "").strip()
+        tags = {t.lower() for t in (ref.get("tags") or [])}
+        if not url:
+            continue
+        host_match = any(h in url.lower() for h in poc_hosts)
+        tag_match = bool(tags & poc_tags)
+        if host_match or tag_match:
+            out.append({
+                "url": url,
+                "source": (ref.get("source") or "")[:80],
+                "tags": sorted(tags),
+            })
+    return out[:10]
+
+
+def _fetch_cve_details(cve_id: str) -> dict:
+    """NVD에서 단일 CVE 상세 + references + PoC 후보 URL 반환.
+
+    LLM이 후속으로 references URL(GitHub PoC, security blog 등)을 따라가서 trigger
+    코드 분석 → variant 생성 가능. 시드 큐레이션 없이 just-in-time 활용.
+    """
+    cid = (cve_id or "").strip().upper()
+    if not cid.startswith("CVE-"):
+        return {"error": "cve_id must start with CVE- (e.g. CVE-2024-34102)"}
+
+    status, body = _nvd_request({"cveId": cid})
+    if status != 200:
+        return {"error": body if isinstance(body, str) else "NVD lookup failed"}
+
+    items = body.get("vulnerabilities", [])
+    if not items:
+        return {"cve_id": cid, "found": False}
+
+    cve = items[0].get("cve", {})
+    descs = cve.get("descriptions", [])
+    desc_en = next((d.get("value", "") for d in descs if d.get("lang") == "en"), "")
+    metrics = cve.get("metrics", {}) or {}
+    cvss31 = (metrics.get("cvssMetricV31") or [{}])[0].get("cvssData", {})
+    cvss30 = (metrics.get("cvssMetricV30") or [{}])[0].get("cvssData", {})
+    cvss = cvss31 or cvss30 or {}
+    weaknesses = []
+    for w in cve.get("weaknesses", []):
+        for d in w.get("description", []):
+            v = d.get("value")
+            if v:
+                weaknesses.append(v)
+    refs = cve.get("references", []) or []
+    poc_refs = _extract_poc_urls(refs)
+    configs = cve.get("configurations", [])
+    affected = []
+    for cfg in configs:
+        for node in cfg.get("nodes", []) or []:
+            for cm in node.get("cpeMatch", []) or []:
+                cpe = cm.get("criteria")
+                if cpe:
+                    affected.append(cpe)
+    return {
+        "cve_id": cid,
+        "found": True,
+        "published": cve.get("published"),
+        "last_modified": cve.get("lastModified"),
+        "vuln_status": cve.get("vulnStatus"),
+        "description": desc_en[:1500],
+        "cvss_score": cvss.get("baseScore"),
+        "cvss_severity": cvss.get("baseSeverity"),
+        "cvss_vector": cvss.get("vectorString"),
+        "weaknesses": weaknesses[:10],
+        "affected_cpes": affected[:30],
+        "all_references": [
+            {"url": r.get("url"), "source": r.get("source"), "tags": r.get("tags") or []}
+            for r in refs[:30]
+        ],
+        "poc_candidate_refs": poc_refs,
+        "hint": (
+            "poc_candidate_refs 의 URL을 http_request로 GET 해 trigger 코드 또는 "
+            "exploit description 분석 → variant 작성에 활용."
+        ),
+    }
+
+
+def _suggest_cves_for_framework(
+    framework: str,
+    year_min: int = 0,
+    cvss_min: float = 0.0,
+    cwe_id: str = "",
+    limit: int = 10,
+) -> dict:
+    """NVD keyword search로 framework 적용 가능 CVE 목록을 CVSS 정렬 반환.
+
+    시드 큐레이션 부담 없이 즉시 framework-specific CVE 후보를 받는다.
+    각 항목은 cve_id + 설명 + CVSS + 주요 references — LLM이 fetch_cve_details
+    로 더 깊이 보거나 그대로 가설로 활용.
+    """
+    fw = (framework or "").strip()
+    if not fw:
+        return {"error": "framework is required"}
+
+    params = {
+        "keywordSearch": fw[:200],
+        "resultsPerPage": min(max(limit * 3, 10), 50),  # 필터링 여유
+    }
+    if cwe_id:
+        params["cweId"] = cwe_id
+
+    status, body = _nvd_request(params)
+    if status != 200:
+        return {"error": body if isinstance(body, str) else "NVD lookup failed"}
+
+    items = body.get("vulnerabilities", []) or []
+    candidates = []
+    for it in items:
+        cve = it.get("cve", {}) or {}
+        cid = cve.get("id") or ""
+        published = cve.get("published") or ""
+        try:
+            year = int(published[:4]) if published else 0
+        except ValueError:
+            year = 0
+        if year_min and year and year < year_min:
+            continue
+        descs = cve.get("descriptions", []) or []
+        desc_en = next((d.get("value", "") for d in descs if d.get("lang") == "en"), "")
+        metrics = cve.get("metrics", {}) or {}
+        cvss31 = (metrics.get("cvssMetricV31") or [{}])[0].get("cvssData", {})
+        cvss30 = (metrics.get("cvssMetricV30") or [{}])[0].get("cvssData", {})
+        cvss = cvss31 or cvss30 or {}
+        score = cvss.get("baseScore") or 0.0
+        if cvss_min and score < cvss_min:
+            continue
+        refs = cve.get("references", []) or []
+        candidates.append({
+            "cve_id": cid,
+            "published": published,
+            "year": year,
+            "description": desc_en[:300],
+            "cvss_score": score,
+            "cvss_severity": cvss.get("baseSeverity"),
+            "ref_count": len(refs),
+            "poc_candidate_refs": _extract_poc_urls(refs)[:5],
+        })
+
+    # CVSS score 내림차순 + 최신 우선
+    candidates.sort(key=lambda c: (-(c["cvss_score"] or 0.0), -(c["year"] or 0)))
+    return {
+        "query": {
+            "framework": fw, "year_min": year_min, "cvss_min": cvss_min,
+            "cwe_id": cwe_id, "limit": limit,
+        },
+        "total_results": body.get("totalResults", 0),
+        "filtered_count": len(candidates),
+        "candidates": candidates[:limit],
+        "hint": (
+            "각 candidate의 poc_candidate_refs 또는 fetch_cve_details(cve_id) 로 "
+            "심화 분석. 검증된 핵심 CVE는 techniques/cve/*.md 로 큐레이션 권장."
+        ),
+    }
+
+
 def _commodity_check_cve(keywords: str, cwe_id: str = "", limit: int = 5) -> dict:
     """NVD REST API에서 keywords로 CVE 검색.
     keywords는 페이로드 fragment, vuln 클래스명, 특이 함수명 등.
@@ -230,6 +412,52 @@ def register(mcp):
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"error": f"commodity_check_cve failed: {e}"})
+
+    @mcp.tool()
+    async def fetch_cve_details(cve_id: str) -> str:
+        """단일 CVE의 NVD 상세 — description / CVSS / weaknesses / affected CPE / references / PoC 후보 URL.
+
+        시드 큐레이션 없이 just-in-time variant analysis 가능.
+        poc_candidate_refs 의 URL을 http_request 로 가져와 trigger 코드 분석 → 자체 변종 작성.
+
+        Args:
+            cve_id: 예 "CVE-2024-34102"
+        """
+        from asgiref.sync import sync_to_async
+        try:
+            result = await sync_to_async(_fetch_cve_details, thread_sensitive=True)(cve_id=cve_id)
+            return json.dumps(result, ensure_ascii=False, default=str)
+        except Exception as e:
+            return json.dumps({"error": f"fetch_cve_details failed: {e}"})
+
+    @mcp.tool()
+    async def suggest_cves_for_framework(
+        framework: str,
+        year_min: int = 0,
+        cvss_min: float = 0.0,
+        cwe_id: str = "",
+        limit: int = 10,
+    ) -> str:
+        """framework 키워드 → NVD에서 매칭되는 CVE 목록 (CVSS 정렬).
+
+        framework: 예 "magento", "spring boot", "wordpress", "laravel"
+        year_min: 이 연도 이후 CVE만 (예 2022)
+        cvss_min: 이 CVSS 이상만 (예 7.0)
+        cwe_id: 선택 (예 "CWE-89")
+
+        반환 항목 각각: cve_id + 설명 + CVSS + poc_candidate_refs.
+        깊이 분석은 fetch_cve_details(cve_id) 추가 호출.
+        """
+        from asgiref.sync import sync_to_async
+        try:
+            result = await sync_to_async(_suggest_cves_for_framework, thread_sensitive=True)(
+                framework=framework, year_min=int(year_min) if year_min else 0,
+                cvss_min=float(cvss_min) if cvss_min else 0.0,
+                cwe_id=cwe_id or "", limit=int(limit) if limit else 10,
+            )
+            return json.dumps(result, ensure_ascii=False, default=str)
+        except Exception as e:
+            return json.dumps({"error": f"suggest_cves_for_framework failed: {e}"})
 
     @mcp.tool()
     async def commodity_check_web(query: str) -> str:

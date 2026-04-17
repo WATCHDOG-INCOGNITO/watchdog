@@ -373,6 +373,10 @@ class PayloadPattern(models.Model):
     # 학습 메타: 사용된 endpoint, oracle 결과, 응답 fingerprint 등
     attack_metadata = models.JSONField(null=True, blank=True)
 
+    # SimHash dedup (XBOW pattern) — request_template 또는 attack_metadata.payload 의 64-bit fingerprint.
+    # 같은 본질의 변종 페이로드를 100번 시도하는 낭비를 줄인다. NULL = 미계산(legacy).
+    simhash = models.BigIntegerField(null=True, blank=True, db_index=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -444,6 +448,8 @@ class DeadEnd(models.Model):
     payload_used = models.TextField(null=True, blank=True)
     reason = models.TextField(null=True, blank=True)  # "oracle returned false", "no diff" 등
     times_seen = models.IntegerField(default=1)
+    # SimHash dedup — payload_used 의 64-bit fingerprint. 새 시도가 본질적으로 같은지 즉시 비교.
+    simhash = models.BigIntegerField(null=True, blank=True, db_index=True)
     last_seen_at = models.DateTimeField(auto_now=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

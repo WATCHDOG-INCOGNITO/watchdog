@@ -73,23 +73,34 @@ def _parse_md(filepath: Path) -> dict | None:
     examples = _parse_examples(examples_raw)
     tags = front.get("tags", [])
 
+    # source: 기본 "technique". CVE 시드(`techniques/cve/*.md`)는 frontmatter에
+    # `source: cve` + `cve_id`/`frameworks`/`trigger_request` 등 추가 필드.
+    src = front.get("source", "technique")
+    metadata = {
+        "kind": "cve_seed" if src == "cve" else "exploit_technique",
+        "name": title,
+        "applies_when": applies_when,
+        "prerequisites": prerequisites,
+        "technique_steps_md": steps_md,
+        "code_template": code_template,
+        "examples": examples,
+        "tags": tags,
+    }
+    # CVE 전용 메타 — frontmatter에서 직접 흡수 (있으면)
+    for cve_field in ("cve_id", "frameworks", "trigger_request", "code_snippet",
+                      "references", "affected_versions", "cwe"):
+        if cve_field in front:
+            metadata[cve_field] = front[cve_field]
+
     return {
         "name": name,
         "vuln_type": vuln_type,
         "sub_technique": front.get("sub_technique"),
         "category": front.get("category", "exploitation"),
         "safety_level": front.get("safety_level", "safe"),
+        "source": src,
         "tags": tags,
-        "attack_metadata": {
-            "kind": "exploit_technique",
-            "name": title,
-            "applies_when": applies_when,
-            "prerequisites": prerequisites,
-            "technique_steps_md": steps_md,
-            "code_template": code_template,
-            "examples": examples,
-            "tags": tags,
-        },
+        "attack_metadata": metadata,
     }
 
 
@@ -224,7 +235,8 @@ class Command(BaseCommand):
             return
 
         if opts.get("reset"):
-            deleted = PayloadPattern.objects.filter(source="technique").delete()
+            # technique 과 cve 시드 둘 다 reset (learned 패턴은 그대로).
+            deleted = PayloadPattern.objects.filter(source__in=["technique", "cve"]).delete()
             self.stdout.write(self.style.WARNING(f"reset: deleted {deleted}"))
 
         vuln_by_type: dict[str, VulnerabilityEntry] = {
@@ -235,16 +247,20 @@ class Command(BaseCommand):
         updated_cnt = 0
         for t in techniques:
             vuln = vuln_by_type.get(t["vuln_type"])
+            t_source = t.get("source", "technique")
             obj, created = PayloadPattern.objects.update_or_create(
                 name=t["name"],
-                source="technique",
+                source=t_source,
                 defaults={
                     "vulnerability": vuln,
                     "vuln_type": t["vuln_type"],
                     "sub_technique": t.get("sub_technique"),
                     "category": t.get("category", "exploitation"),
                     "safety_level": t.get("safety_level", "safe"),
-                    "request_template": "",
+                    "request_template": (
+                        (t["attack_metadata"].get("trigger_request") or "")
+                        if t_source == "cve" else ""
+                    ),
                     "matcher": None,
                     "safety_notes": t["attack_metadata"].get("applies_when", "")[:500],
                     "tags": t.get("tags", []),
@@ -267,7 +283,7 @@ class Command(BaseCommand):
 
         if embeddings_available():
             from api.embedding_service import pattern_text
-            targets = list(PayloadPattern.objects.filter(source="technique"))
+            targets = list(PayloadPattern.objects.filter(source__in=["technique", "cve"]))
             texts = []
             for p in targets:
                 meta = p.attack_metadata or {}

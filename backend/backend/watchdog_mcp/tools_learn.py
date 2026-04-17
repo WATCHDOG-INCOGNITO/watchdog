@@ -108,6 +108,10 @@ def _learn_from_finding(
         request_template=template_value,
         source="learned",
     ).first()
+    # SimHash 사전 계산 — 새 row 생성 시 같이 저장. 의존성 없음.
+    from api.dedup import simhash as _simhash
+    payload_simhash = _simhash(template_value or "")
+
     if existing:
         from django.db.models import F
         # 카운터는 F()로 atomic 증가 (동시 스캔 race 방지). attack_metadata는 일반 save.
@@ -153,6 +157,7 @@ def _learn_from_finding(
             tags=(["learned", "novel", vuln_type, host]),
             times_used=1,
             times_succeeded=1,
+            simhash=payload_simhash,
             is_active=True,
         )
         created = True
@@ -289,18 +294,30 @@ def _learn_dead_end(
         return {"error": "target_host, endpoint, vuln_type 필수"}
 
     pid = pattern_id or None
+    from api.dedup import simhash as _simhash
+    payload_simhash = _simhash(payload_used or "")
     obj, created = DeadEnd.objects.get_or_create(
         target_host=host,
         endpoint=endpoint,
         vuln_type=vuln_type,
         pattern_id=pid,
-        defaults={"payload_used": payload_used, "reason": reason},
+        defaults={
+            "payload_used": payload_used,
+            "reason": reason,
+            "simhash": payload_simhash,
+        },
     )
     if not created:
-        obj.times_seen += 1
-        if reason:
-            obj.reason = reason
-        obj.save()
+        from django.db.models import F
+        DeadEnd.objects.filter(pk=obj.pk).update(times_seen=F("times_seen") + 1)
+        if reason or (obj.simhash is None and payload_simhash):
+            updates = {}
+            if reason:
+                updates["reason"] = reason
+            if obj.simhash is None and payload_simhash:
+                updates["simhash"] = payload_simhash
+            DeadEnd.objects.filter(pk=obj.pk).update(**updates)
+        obj.refresh_from_db()
 
     # profile counter
     profile, _ = TargetProfile.objects.get_or_create(host=host)

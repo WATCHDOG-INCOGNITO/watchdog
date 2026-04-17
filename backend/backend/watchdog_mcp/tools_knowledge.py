@@ -303,31 +303,69 @@ def _mutate_payload(seed_pattern_id: str, mutation_type: str, hint: str) -> dict
 
 
 def _retrieve_cve_variants(framework: str, endpoint_pattern: str, k: int) -> dict:
-    """과거 CVE의 취약 패턴을 시드로 반환 (Naptime variant analysis 패턴).
+    """CVE 시드 기반 variant analysis (Naptime 패턴).
 
-    현재는 skeleton — Knowledge DB의 vulnerability_entries 에서 framework/endpoint 키워드로
-    매칭되는 항목을 반환. 후속 작업에서 실제 CVE feed 와 코드 스니펫을 큐레이션 예정.
+    두 자원에서 동시에 검색:
+      1. PayloadPattern(source="cve") — `techniques/cve/<cve_id>.md` 에서 적재된 CVE 시드.
+         attack_metadata에 cve_id, frameworks, trigger_request, code_snippet 포함.
+      2. VulnerabilityEntry — OWASP/CWE 카탈로그 (legacy fallback).
+
+    LLM은 같은 framework / endpoint pattern 의 과거 CVE를 받아 variant 작성에 활용.
     """
     from django.db.models import Q
 
-    from api.models import VulnerabilityEntry
+    from api.models import PayloadPattern, VulnerabilityEntry
 
-    qs = VulnerabilityEntry.objects.all()
-    if framework:
-        qs = qs.filter(
-            Q(description__icontains=framework)
-            | Q(tags__icontains=framework)
-            | Q(affected_components__icontains=framework)
+    framework_norm = (framework or "").strip().lower()
+    endpoint_norm = (endpoint_pattern or "").strip()
+
+    # 1) CVE PayloadPattern (techniques/cve/*.md 에서 적재된 시드)
+    cve_qs = PayloadPattern.objects.filter(source="cve", is_active=True)
+    if framework_norm:
+        cve_qs = cve_qs.filter(
+            Q(name__icontains=framework_norm)
+            | Q(tags__icontains=framework_norm)
+            | Q(attack_metadata__icontains=framework_norm)
         )
-    if endpoint_pattern:
-        qs = qs.filter(
-            Q(description__icontains=endpoint_pattern)
-            | Q(evidence_points__icontains=endpoint_pattern)
+    if endpoint_norm:
+        cve_qs = cve_qs.filter(
+            Q(request_template__icontains=endpoint_norm)
+            | Q(attack_metadata__icontains=endpoint_norm)
         )
 
-    items = []
-    for v in qs[:k]:
-        items.append({
+    cve_items = []
+    for p in cve_qs[:k]:
+        meta = p.attack_metadata or {}
+        cve_items.append({
+            "pattern_id": str(p.pattern_id),
+            "cve_id": meta.get("cve_id"),
+            "name": p.name,
+            "vuln_type": p.vuln_type,
+            "frameworks": meta.get("frameworks") or [],
+            "applies_when": meta.get("applies_when", ""),
+            "trigger_request": meta.get("trigger_request"),
+            "code_snippet": (meta.get("code_snippet") or "")[:1500],
+            "technique_steps_md": (meta.get("technique_steps_md") or "")[:1500],
+            "references": meta.get("references") or [],
+            "tags": p.tags,
+        })
+
+    # 2) VulnerabilityEntry (legacy 카탈로그)
+    vuln_qs = VulnerabilityEntry.objects.all()
+    if framework_norm:
+        vuln_qs = vuln_qs.filter(
+            Q(description__icontains=framework_norm)
+            | Q(tags__icontains=framework_norm)
+            | Q(affected_components__icontains=framework_norm)
+        )
+    if endpoint_norm:
+        vuln_qs = vuln_qs.filter(
+            Q(description__icontains=endpoint_norm)
+            | Q(evidence_points__icontains=endpoint_norm)
+        )
+    vuln_items = []
+    for v in vuln_qs[:k]:
+        vuln_items.append({
             "vuln_id": str(v.vuln_id),
             "title": v.title,
             "vuln_type": v.vuln_type,
@@ -337,12 +375,122 @@ def _retrieve_cve_variants(framework: str, endpoint_pattern: str, k: int) -> dic
             "false_positive_hints": v.false_positive_hints,
             "tags": v.tags,
         })
+
+    note = (
+        f"cve seeds: {len(cve_items)} (techniques/cve/*.md 에서 적재). "
+        f"vulnerability catalog: {len(vuln_items)}."
+    )
+    if not cve_items:
+        note += (
+            " CVE 시드를 추가하려면 backend/backend/api/management/commands/techniques/cve/<cve_id>.md "
+            "양식 (frontmatter: source=cve, attack_metadata.cve_id/frameworks/trigger_request/"
+            "code_snippet) 으로 작성 후 seed_techniques --reset 실행."
+        )
     return {
         "query": {"framework": framework, "endpoint_pattern": endpoint_pattern, "k": k},
-        "variants": items,
-        "note": (
-            "skeleton 구현. 실제 CVE 코드 스니펫/트리거 request 시드는 후속 작업에서 추가 예정."
-        ),
+        "cve_seeds": cve_items,
+        "variants": vuln_items,  # backward-compat: 기존 호출자가 'variants' 참조
+        "note": note,
+    }
+
+
+def _check_payload_dedup(
+    payload: str,
+    target_host: str,
+    vuln_type: str,
+    threshold: int,
+    limit: int,
+) -> dict:
+    """SimHash 기반 — 이 payload가 본질적으로 같은 시도가 이미 있는지 조회.
+
+    XBOW SimHash 패턴: 같은 본질의 페이로드를 변형만 바꿔 100번 시도하는 낭비를 줄인다.
+    LLM이 자율 호출 (강제 아님). 결과를 보고 "그래도 시도할지" LLM이 판단.
+    """
+    from urllib.parse import urlparse
+
+    from api.dedup import simhash, hamming
+    from api.models import DeadEnd, PayloadPattern
+
+    if not payload:
+        return {"error": "payload is required"}
+
+    fp = simhash(payload)
+
+    host = ""
+    if target_host:
+        s = target_host.strip()
+        host = urlparse(s).netloc.lower() if "://" in s else s.lower()
+
+    # 후보군 — host 우선, vuln_type 매칭. 너무 큰 결과 회피 위해 LIMIT.
+    de_qs = DeadEnd.objects.exclude(simhash__isnull=True)
+    if host:
+        de_qs = de_qs.filter(target_host=host)
+    if vuln_type:
+        de_qs = de_qs.filter(vuln_type=vuln_type)
+    de_pool = list(de_qs.only("dead_end_id", "endpoint", "vuln_type", "payload_used", "simhash", "times_seen")[:500])
+
+    pp_qs = PayloadPattern.objects.exclude(simhash__isnull=True).filter(is_active=True)
+    if vuln_type:
+        pp_qs = pp_qs.filter(vuln_type=vuln_type)
+    if host:
+        # learned for this host OR seed/technique (host=null)
+        from django.db.models import Q
+        pp_qs = pp_qs.filter(Q(target_host=host) | Q(target_host__isnull=True))
+    pp_pool = list(pp_qs.only("pattern_id", "name", "source", "simhash", "times_used", "times_succeeded")[:500])
+
+    near_dead_ends = []
+    for d in de_pool:
+        dist = hamming(fp, d.simhash)
+        if dist <= threshold:
+            near_dead_ends.append({
+                "dead_end_id": str(d.dead_end_id),
+                "endpoint": d.endpoint,
+                "vuln_type": d.vuln_type,
+                "payload_preview": (d.payload_used or "")[:200],
+                "times_seen": d.times_seen,
+                "hamming_distance": dist,
+            })
+    near_dead_ends.sort(key=lambda x: x["hamming_distance"])
+    near_dead_ends = near_dead_ends[:limit]
+
+    near_patterns = []
+    for p in pp_pool:
+        dist = hamming(fp, p.simhash)
+        if dist <= threshold:
+            near_patterns.append({
+                "pattern_id": str(p.pattern_id),
+                "name": p.name,
+                "source": p.source,
+                "times_used": p.times_used,
+                "times_succeeded": p.times_succeeded,
+                "hamming_distance": dist,
+            })
+    near_patterns.sort(key=lambda x: x["hamming_distance"])
+    near_patterns = near_patterns[:limit]
+
+    if near_dead_ends:
+        recommendation = (
+            "본질이 동일한 시도가 이미 dead_end로 기록됨. 다른 sink/encoding/sub-technique 으로 "
+            "변경 권장 — 단, 변경한 vector가 정말 다르면 시도해도 OK (자율 판단)."
+        )
+    elif near_patterns and any(p["times_succeeded"] > 0 for p in near_patterns):
+        recommendation = (
+            "유사한 패턴이 이전에 성공한 적 있음 (learned/technique). "
+            "이 payload 그대로 시도하거나 record_pattern_use로 통계만 갱신해도 좋다."
+        )
+    else:
+        recommendation = (
+            "유사한 시도/패턴 없음 (novel). 그대로 시도하라."
+        )
+
+    return {
+        "payload_simhash": fp,
+        "host": host,
+        "vuln_type": vuln_type,
+        "threshold": threshold,
+        "near_dead_ends": near_dead_ends,
+        "near_patterns": near_patterns,
+        "recommendation": recommendation,
     }
 
 
@@ -484,6 +632,47 @@ def register(mcp):
             return json.dumps(result, ensure_ascii=False, default=str)
         except Exception as e:
             return json.dumps({"error": f"retrieve_cve_variants failed: {e}"})
+
+    @mcp.tool()
+    async def check_payload_dedup(
+        payload: str,
+        target_host: str = "",
+        vuln_type: str = "",
+        threshold: int = 8,
+        limit: int = 5,
+    ) -> str:
+        """SimHash로 payload 가 본질적으로 같은 시도와 겹치는지 진단 (XBOW 패턴).
+
+        🛡️ Advisory — 강제 게이트 아님. 결과를 보고 LLM이 판단.
+        같은 본질의 변형(`1' OR '1'='1` ↔ `1' OR '2'='2`)을 100번 시도하는 낭비를 줄인다.
+
+        Args:
+            payload: 시도하려는 payload 문자열 (HTTP body, query string, header value 등)
+            target_host: 대상 host (있으면 그 host의 dead_end/learned 우선 매칭)
+            vuln_type: vuln_type 필터 (있으면 같은 카테고리만 비교)
+            threshold: Hamming distance 임계값 (기본 8 / 64-bit) — 작을수록 strict
+            limit: 반환 후보 개수 (기본 5)
+
+        Returns:
+            {payload_simhash, near_dead_ends[], near_patterns[], recommendation}.
+            near_dead_ends: 본질 동일한 과거 실패 시도 → 다른 vector 권장
+            near_patterns: 유사한 KB/learned pattern → 그대로 시도/통계 갱신
+            recommendation: 텍스트 권고 (하지만 LLM이 무시 가능)
+
+        예) `check_payload_dedup("' OR 1=1 --", "wargame:5000", "sqli")` →
+            과거 dead_end에 `' OR '1'='1` 있으면 본질 동일로 매칭, 다른 sub-technique 권장.
+        """
+        try:
+            result = await sync_to_async(_check_payload_dedup, thread_sensitive=False)(
+                payload=payload,
+                target_host=target_host,
+                vuln_type=vuln_type,
+                threshold=int(threshold) if threshold else 8,
+                limit=int(limit) if limit else 5,
+            )
+            return json.dumps(result, ensure_ascii=False, default=str)
+        except Exception as e:
+            return json.dumps({"error": f"check_payload_dedup failed: {e}"})
 
     @mcp.tool()
     async def record_pattern_use(
