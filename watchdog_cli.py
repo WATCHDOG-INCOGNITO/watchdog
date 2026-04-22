@@ -181,12 +181,27 @@ def cmd_grep_source(p):
 # ═══════════════════════════════════════════════════════
 
 def cmd_push_discovery(p):
+    """Create DiscoveryNode with MCP-equivalent semantics: normalize + dedup +
+    merge_context + depth/node-count guards. CLI 와 MCP 도구 가 동일하게
+    동작하도록 watchdog_mcp.tools_discovery 의 helper 를 재사용."""
+    from watchdog_mcp.tools_discovery import (
+        _normalize_ep,
+        _merge_context,
+        DISCOVERY_MAX_DEPTH,
+        DISCOVERY_MAX_NODES,
+    )
+
     ctx = p.get("context", p.get("context_json", {}))
     if isinstance(ctx, str):
         try:
             ctx = json.loads(ctx)
         except Exception:
             ctx = {"raw": ctx}
+
+    scan_run_id = p["scan_run_id"]
+    ntype = p.get("node_type", "clue")
+    vuln_type = p.get("vuln_type", "") or ""
+    raw_ep = p.get("endpoint", "")
 
     parent = None
     depth = 0
@@ -199,13 +214,74 @@ def cmd_push_discovery(p):
             _json_out({"error": f"parent {parent_id} not found"})
             return
 
+    if depth > DISCOVERY_MAX_DEPTH:
+        _json_out({
+            "error": f"max depth {DISCOVERY_MAX_DEPTH} reached",
+            "depth": depth,
+        })
+        return
+
+    existing_count = DiscoveryNode.objects.filter(scan_run_id=scan_run_id).count()
+    if existing_count >= DISCOVERY_MAX_NODES:
+        _json_out({
+            "error": f"max nodes {DISCOVERY_MAX_NODES} reached",
+            "total_nodes": existing_count,
+        })
+        return
+
+    target_url = ""
+    try:
+        sr = ScanRun.objects.get(run_id=scan_run_id)
+        target_url = sr.target_url or ""
+    except Exception:
+        pass
+
+    # Dedup: same (scan, normalized_endpoint variants, vuln_type, node_type)
+    # Mirrors MCP push_discovery logic so CLI and MCP converge.
+    if raw_ep and ntype in ("endpoint", "vuln", "exploit_step"):
+        ep_norm = _normalize_ep(raw_ep, target_url)
+        ep_variants = set()
+        for v in (raw_ep, ep_norm, ep_norm.rstrip("/"), ep_norm + "/"):
+            ep_variants.add(v)
+            ep_variants.add(v.lower())
+        if "?" not in ep_norm:
+            path_only = ep_norm.split("?", 1)[0]
+            ep_variants.add(path_only)
+            ep_variants.add(path_only + "/")
+            ep_variants.add(path_only.lower())
+        ep_variants.discard("")
+
+        existing = (
+            DiscoveryNode.objects
+            .filter(scan_run_id=scan_run_id, node_type=ntype)
+            .filter(endpoint__in=ep_variants)
+            .filter(vuln_type=vuln_type)
+            .order_by("created_at")
+            .first()
+        )
+        if existing:
+            _merge_context(existing, ctx)
+            _json_out({
+                "node_id": str(existing.node_id),
+                "depth": existing.depth,
+                "node_type": existing.node_type,
+                "deduped": True,
+                "context_merged": bool(ctx),
+                "deduped_reason": "same scan+endpoint+vuln_type+node_type already exists",
+            })
+            return
+
+    store_ep = raw_ep or (parent.endpoint if parent else "")
+    if store_ep:
+        store_ep = _normalize_ep(store_ep, target_url)
+
     node = DiscoveryNode.objects.create(
-        scan_run_id=p["scan_run_id"],
+        scan_run_id=scan_run_id,
         parent=parent,
         depth=depth,
-        node_type=p.get("node_type", "clue"),
-        endpoint=p.get("endpoint", parent.endpoint if parent else ""),
-        vuln_type=p.get("vuln_type", ""),
+        node_type=ntype,
+        endpoint=store_ep,
+        vuln_type=vuln_type,
         summary=p.get("summary", ""),
         context=ctx,
         status=p.get("status", "pending"),
@@ -213,12 +289,11 @@ def cmd_push_discovery(p):
 
     result = {"node_id": str(node.node_id), "depth": depth}
 
-    ntype = p.get("node_type", "clue")
     if ntype in ("vuln", "exploit_step", "clue"):
         score = {"vuln": 0.7, "exploit_step": 0.85, "clue": 0.5}.get(ntype, 0.5)
         cand = Candidate.objects.create(
-            scan_run_id=p["scan_run_id"],
-            vuln_type=p.get("vuln_type") or "signal_stub",
+            scan_run_id=scan_run_id,
+            vuln_type=vuln_type or "signal_stub",
             hypothesis=p.get("summary", ""),
             priority_score=score,
             detection_stage="llm_deep",
@@ -226,7 +301,7 @@ def cmd_push_discovery(p):
             features={
                 "discovery_node_id": str(node.node_id),
                 "node_type": ntype,
-                "endpoint": p.get("endpoint", ""),
+                "endpoint": store_ep,
                 "depth": depth,
             },
         )
