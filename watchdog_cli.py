@@ -33,6 +33,7 @@ from watchdog_mcp.tools_source import _list_tree, _read_file, _grep
 from watchdog_mcp.tools_discovery import build_exploit_chains, pick_next_node
 from watchdog_mcp.tools_oracle import _safe_get, _response_diff_blocks
 from watchdog_mcp.tools_oob import _register_token, _get_hits, _clear_hits
+from watchdog_mcp.link_extractor import extract_links_and_hashes
 
 from api.storage_service import (
     confirm_candidate as _confirm_candidate,
@@ -43,6 +44,11 @@ from api.storage_service import (
 )
 from api.services import analyze_params, analyze_path, calculate_priority
 from api.llm_trace_store import record_llm_trace as _record_llm_trace
+from api.mcp_agent import (
+    _gather_previous_knowledge,
+    _seed_from_previous,
+    _auto_push_discovered_links,
+)
 
 from api.models import (
     ScanRun, DiscoveryNode, Candidate, Finding, RequestCatalog, LLMTrace,
@@ -465,28 +471,67 @@ def cmd_get_scan_notes(p):
 # ═══════════════════════════════════════════════════════
 
 def cmd_create_scan(p):
+    cfg = p.get("config", {"mode": "manual"})
     run = ScanRun.objects.create(
         target_url=p["target_url"],
         mode=p.get("mode", "discovery"),
         status="running",
         request_budget_total=int(p.get("budget", 200)),
-        config=p.get("config", {"mode": "manual"}),
+        config=cfg,
     )
-    _json_out({"scan_id": str(run.run_id), "status": run.status})
+    result = {"scan_id": str(run.run_id), "status": run.status}
+
+    # Resume: load prior knowledge (tree + findings + candidates) if requested.
+    # `_prev_run_id` is persisted in config so cmd_create_root can pick it up
+    # after the root node is materialized, mirroring mcp_agent startup.
+    resume_from = cfg.get("resume_from", "auto")
+    try:
+        prev = _gather_previous_knowledge(
+            run.target_url, str(run.run_id), resume_from,
+        )
+    except Exception:
+        prev = None
+    if prev:
+        new_cfg = dict(run.config or {})
+        new_cfg["_prev_run_id"] = prev.get("prev_run_id", "")
+        run.config = new_cfg
+        run.save(update_fields=["config"])
+        result["resume_from"] = prev.get("prev_run_id", "")
+        result["prev_nodes"] = len(prev.get("nodes") or [])
+        result["prev_findings"] = len(prev.get("findings") or [])
+    _json_out(result)
 
 
 def cmd_create_root(p):
+    run = ScanRun.objects.get(run_id=p["scan_run_id"])
     node = DiscoveryNode.objects.create(
-        scan_run_id=p["scan_run_id"],
+        scan_run=run,
         parent=None,
         depth=0,
         node_type="target",
         endpoint=p["target_url"],
         summary=f"Root target: {p['target_url']}",
         context={"target_url": p["target_url"]},
-        status="explored",
+        status="pending",
     )
-    _json_out({"root_id": str(node.node_id)})
+    cfg = dict(run.config or {})
+    cfg["_root_node_id"] = str(node.node_id)
+    prev_run_id = cfg.pop("_prev_run_id", None)
+    run.config = cfg
+    run.save(update_fields=["config"])
+
+    result = {"root_id": str(node.node_id)}
+    if prev_run_id:
+        try:
+            prev = _gather_previous_knowledge(
+                run.target_url, str(run.run_id), prev_run_id,
+            )
+            if prev:
+                seeded = _seed_from_previous(run, node, prev)
+                result["seeded"] = seeded
+        except Exception as e:
+            result["seed_error"] = str(e)
+    _json_out(result)
 
 
 def cmd_create_finding(p):
@@ -655,12 +700,53 @@ def cmd_list_nodes(p):
 
 
 # ═══════════════════════════════════════════════════════
+# MCP parity helpers (auto-push discovery, UA/auth header injection)
+# ═══════════════════════════════════════════════════════
+
+def _cli_auto_push(scan_run_id, result_dict, tool_name, current_node_id=""):
+    """Reuse mcp_agent._auto_push_discovered_links to auto-create child nodes
+    from HTTP response links/hashes — same behavior as the MCP agent path."""
+    try:
+        scan_run = ScanRun.objects.get(run_id=scan_run_id)
+        raw_text = json.dumps(result_dict, default=str)
+        _auto_push_discovered_links(scan_run, raw_text, tool_name, current_node_id)
+    except Exception:
+        pass
+
+
+def _maybe_inject_headers(p):
+    """Inject Bug Bounty UA and auto-auth headers when scan_run_id is present.
+    Mirrors _maybe_inject_bug_bounty_ua + credentials wiring in mcp_agent."""
+    scan_run_id = p.get("scan_run_id")
+    if not scan_run_id:
+        return
+    try:
+        run = ScanRun.objects.get(run_id=scan_run_id)
+    except ScanRun.DoesNotExist:
+        return
+    headers = p.get("headers") or {}
+    cfg = run.config or {}
+    ua_id = cfg.get("bug_bounty_ua")
+    if ua_id and "User-Agent" not in headers:
+        headers["User-Agent"] = f"WatchdogMCP/1.0 (BugBounty: {ua_id})"
+    if "Authorization" not in headers and "Cookie" not in headers:
+        creds = cfg.get("credentials")
+        if creds and isinstance(creds, list):
+            for cred in creds:
+                if cred.get("type") == "bearer" and cred.get("token"):
+                    headers["Authorization"] = f"Bearer {cred['token']}"
+                    break
+    p["headers"] = headers
+
+
+# ═══════════════════════════════════════════════════════
 # HTTP tools (session-based)
 # ═══════════════════════════════════════════════════════
 
 _SESSIONS = {}
 
 def cmd_http_request(p):
+    _maybe_inject_headers(p)
     method = p.get("method", "GET").upper()
     url = p["url"]
     headers = p.get("headers", {})
@@ -691,16 +777,34 @@ def cmd_http_request(p):
         _json_out({"error": str(e)})
         return
 
-    _json_out({
+    full_body = resp.text
+    ct = resp.headers.get("Content-Type", "")
+    try:
+        links, hashes = extract_links_and_hashes(
+            full_body, ct, dict(resp.headers), url,
+        )
+    except Exception:
+        links, hashes = [], []
+
+    result = {
         "url": resp.url,
         "status_code": resp.status_code,
         "elapsed": elapsed,
-        "content_length": len(resp.text),
+        "content_length": len(full_body),
         "headers": dict(resp.headers),
         "cookies": {c.name: c.value for c in resp.cookies},
         "session_cookies": {c.name: c.value for c in sess.cookies} if session_id else {},
-        "body": resp.text[:5000],
-    })
+        "body": full_body[:5000],
+        "discovered_links": links,
+        "hash_routes": hashes,
+    }
+    scan_run_id = p.get("scan_run_id")
+    if scan_run_id:
+        _cli_auto_push(
+            scan_run_id, result, "http_request",
+            p.get("current_node_id", ""),
+        )
+    _json_out(result)
 
 
 # ═══════════════════════════════════════════════════════
