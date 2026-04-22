@@ -3455,14 +3455,14 @@ def _gather_previous_knowledge(
     current_run_id: str,
     resume_from: str = "",
 ) -> dict | None:
-    """Find a previous scan and extract useful nodes for cold-start avoidance.
+    """Find a previous scan and return its full tree + findings + candidates for resume.
 
     resume_from:
       - "off"        → 자동 resume 끔. None 반환 (신규 cold scan).
       - "<run_id>"   → 그 특정 scan 에서 가져옴 (target 일치 무관).
       - 미지정/"auto"→ 같은 target_url 의 최근 finished/failed scan 자동 탐지 (기본).
     """
-    from api.models import DiscoveryNode
+    from api.models import DiscoveryNode, Finding, Candidate
 
     rf = (resume_from or "").strip().lower()
     if rf == "off":
@@ -3488,221 +3488,180 @@ def _gather_previous_knowledge(
         if not prev_run:
             return None
 
-    prev_nodes = DiscoveryNode.objects.filter(scan_run=prev_run).order_by("depth", "created_at")
-    if not prev_nodes.exists():
+    # 부모가 자식보다 먼저 나오도록 depth 순 정렬 (트리 보존 import 를 위해).
+    prev_nodes = list(
+        DiscoveryNode.objects.filter(scan_run=prev_run).order_by("depth", "created_at")
+    )
+    if not prev_nodes:
         return None
 
-    endpoints = []
-    vulns = []
-    dead_ends = []
-    clues = []
-
-    # dedup: (normalized_endpoint, vuln_type, node_type_bucket) 기준으로 첫 번째만 수집.
-    # 이전 scan 에서 같은 endpoint 노드가 여러 개 있었던 경우 중복 전파 방지.
-    _seen_keys: set[tuple[str, str, str]] = set()
-
-    for node in prev_nodes:
-        raw_ep = node.endpoint or ""
-        ep_norm = _normalize_endpoint_for_dedup(raw_ep, target_url)
-        vt = node.vuln_type or ""
-
-        # status=dead_end 가 type 보다 우선
-        if node.status == "dead_end" or node.node_type == "dead_end":
-            bucket = "dead_end"
-        elif node.node_type == "endpoint":
-            bucket = "endpoint"
-        elif node.node_type == "vuln":
-            bucket = "vuln"
-        elif node.node_type in ("clue", "exploit_step"):
-            bucket = node.node_type
-        else:
-            continue
-
-        dedup_key = (ep_norm, vt, bucket)
-        if ep_norm != "/" and dedup_key in _seen_keys:
-            continue
-        _seen_keys.add(dedup_key)
-
-        entry = {
-            "node_type": node.node_type,
-            "endpoint": raw_ep,
-            "vuln_type": vt,
-            "summary": node.summary[:300],
-            "status": node.status,
-            "depth": node.depth,
-        }
-        if bucket == "dead_end":
-            dead_ends.append(entry)
-        elif bucket == "endpoint":
-            endpoints.append(entry)
-        elif bucket == "vuln":
-            vulns.append(entry)
-        else:
-            clues.append(entry)
-
-    if not endpoints and not vulns:
-        return None
+    prev_findings = list(Finding.objects.filter(scan_run=prev_run))
+    prev_candidates = list(Candidate.objects.filter(scan_run=prev_run))
 
     return {
         "prev_run_id": str(prev_run.run_id),
-        "endpoints": endpoints[:20],
-        "vulns": vulns[:15],
-        "dead_ends": dead_ends[:20],
-        "clues": clues[:10],
+        "nodes": prev_nodes,
+        "findings": prev_findings,
+        "candidates": prev_candidates,
     }
 
 
-SEED_BUDGET_RATIO = 0.3  # max 30% of DISCOVERY_MAX_NODES for seeded nodes
-
 def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
-    """Seed endpoint + re-verify + dead_end + clue nodes from previous scan results.
+    """Import previous scan's full tree into this scan — resume semantics.
 
-    Returns: {"endpoints": N, "vulns": N, "dead_ends": N, "clues": N, "total": N}
+    - 트리 구조 보존 (parent_id 관계 유지).
+    - confirmed/dead_end/explored 상태는 그대로 (재탐색 X), pending/exploring → pending 재큐.
+    - context 전체 복사 + seeded_from 태그 추가.
+    - Finding/Candidate 복제 (새 scan_run 에 링크).
+    - status=dead_end vuln 노드는 DeadEnd KB 에도 등록 (cross-scan 학습).
     """
-    from api.models import DiscoveryNode
-    from watchdog_mcp.tools_discovery import DISCOVERY_MAX_NODES
+    from urllib.parse import urlparse as _urlparse
+    from api.models import DiscoveryNode, Finding, Candidate, DeadEnd
 
-    seed_cap = int(DISCOVERY_MAX_NODES * SEED_BUDGET_RATIO)
-    counts = {"endpoints": 0, "vulns": 0, "dead_ends": 0, "clues": 0}
-    endpoint_node_map: dict[str, DiscoveryNode] = {}
+    counts = {
+        "endpoints": 0, "vulns": 0, "dead_ends": 0, "clues": 0,
+        "findings": 0, "candidates": 0, "resumed": 0, "preserved": 0,
+    }
+    prev_nodes = prev_knowledge.get("nodes") or []
+    prev_findings = prev_knowledge.get("findings") or []
+    prev_candidates = prev_knowledge.get("candidates") or []
     prev_run_id = prev_knowledge.get("prev_run_id", "")
+    if not prev_nodes:
+        counts["total"] = 0
+        return counts
 
-    # dedup within seeding: (normalized_endpoint, vuln_type, node_type) → skip
-    _seeded_keys: set[tuple[str, str, str]] = set()
+    target_host = ""
+    try:
+        target_host = _urlparse(scan_run.target_url or "").netloc.lower()
+    except Exception:
+        pass
 
-    def _seeded_total() -> int:
-        return sum(counts.values())
-
-    _target_url = scan_run.target_url or ""
-
-    def _check_seeded(ep: str, vt: str, ntype: str) -> bool:
-        """Return True if this (ep, vt, ntype) was already seeded → skip."""
-        key = (_normalize_endpoint_for_dedup(ep, _target_url), vt, ntype)
-        if key in _seeded_keys:
-            return True
-        _seeded_keys.add(key)
-        return False
-
-    def _find_parent_for_ep(ep: str) -> DiscoveryNode:
-        """Lookup seeded endpoint parent by normalized path; fallback to root."""
-        norm = _normalize_endpoint_for_dedup(ep, _target_url)
-        return endpoint_node_map.get(norm, root_node)
-
-    # 1) endpoint nodes — pending 으로 push (worker 가 다시 탐색 + 새 vuln 발견 가능)
-    for ep in prev_knowledge.get("endpoints", []):
-        if _seeded_total() >= seed_cap:
+    # 이전 root (type=target, parent=None) 는 현재 root_node 로 치환.
+    prev_root_id = None
+    for n in prev_nodes:
+        if n.node_type == "target" and n.parent_id is None:
+            prev_root_id = n.node_id
             break
-        raw_ep = ep.get("endpoint", "")
-        if not raw_ep:
-            continue
-        if _check_seeded(raw_ep, "", "endpoint"):
-            continue
-        ep_node = DiscoveryNode.objects.create(
-            scan_run=scan_run,
-            parent=root_node,
-            depth=1,
-            node_type="endpoint",
-            endpoint=raw_ep,
-            vuln_type="",
-            summary=f"[seeded] {ep['summary'][:200]}",
-            context={
-                "seeded_from": prev_run_id,
-                "prev_status": ep.get("status", ""),
-            },
-            status="pending",
-        )
-        ep_norm = _normalize_endpoint_for_dedup(raw_ep, _target_url)
-        endpoint_node_map[ep_norm] = ep_node
-        counts["endpoints"] += 1
 
-    # 2) vuln nodes — explored/confirmed 만 recheck=True 로 push (패치 여부 확인)
-    for vuln in prev_knowledge.get("vulns", []):
-        if _seeded_total() >= seed_cap:
-            break
-        if vuln.get("status") not in ("explored", "confirmed"):
-            continue
-        raw_ep = vuln.get("endpoint", "")
-        vt = vuln.get("vuln_type", "")
-        if _check_seeded(raw_ep, vt, "vuln"):
-            continue
-        parent = _find_parent_for_ep(raw_ep)
-        DiscoveryNode.objects.create(
-            scan_run=scan_run,
-            parent=parent,
-            depth=parent.depth + 1,
-            node_type="vuln",
-            endpoint=raw_ep,
-            vuln_type=vt,
-            summary=f"[re-verify] {vuln['summary'][:200]}",
-            context={
-                "seeded_from": prev_run_id,
-                "recheck": True,
-                "prev_status": vuln.get("status", ""),
-                "action": "re-verify this vuln — it was successful before but may be patched now",
-            },
-            status="pending",
-        )
-        counts["vulns"] += 1
+    # old node_id → new DiscoveryNode.
+    id_map: dict = {}
+    if prev_root_id is not None:
+        id_map[prev_root_id] = root_node
 
-    # 3) dead_end nodes — status=dead_end 로 직접 push.
-    from django.utils import timezone as _tz
-    for de in prev_knowledge.get("dead_ends", []):
-        if _seeded_total() >= seed_cap:
-            break
-        raw_ep = de.get("endpoint", "")
-        if not raw_ep:
-            continue
-        vt = de.get("vuln_type", "")
-        if _check_seeded(raw_ep, vt, "dead_end"):
-            continue
-        parent = _find_parent_for_ep(raw_ep)
-        DiscoveryNode.objects.create(
-            scan_run=scan_run,
-            parent=parent,
-            depth=parent.depth + 1,
-            node_type="vuln",
-            endpoint=raw_ep,
-            vuln_type=vt,
-            summary=f"[prev dead_end] {de['summary'][:200]}",
-            context={
-                "seeded_from": prev_run_id,
-                "prev_dead_end": True,
-                "skip_reason": de.get("summary", "")[:300],
-            },
-            status="dead_end",
-            explored_at=_tz.now(),
-        )
-        counts["dead_ends"] += 1
+    # old cand_id → new Candidate (findings 재연결용).
+    cand_map: dict = {}
 
-    # 4) clue / exploit_step — 부분 chain 정보 보존.
-    for cl in prev_knowledge.get("clues", []):
-        if _seeded_total() >= seed_cap:
-            break
-        raw_ep = cl.get("endpoint", "")
-        nt = cl.get("node_type") or "clue"
-        if nt not in ("clue", "exploit_step"):
+    for prev in prev_nodes:
+        if prev.node_id == prev_root_id:
             continue
-        vt = cl.get("vuln_type", "")
-        if _check_seeded(raw_ep, vt, nt):
-            continue
-        parent = _find_parent_for_ep(raw_ep)
-        DiscoveryNode.objects.create(
-            scan_run=scan_run,
-            parent=parent,
-            depth=parent.depth + 1,
-            node_type=nt,
-            endpoint=raw_ep,
-            vuln_type=vt,
-            summary=f"[prev {nt}] {cl['summary'][:200]}",
-            context={
-                "seeded_from": prev_run_id,
-                "prev_status": cl.get("status", ""),
-            },
-            status="pending",
-        )
-        counts["clues"] += 1
 
-    counts["total"] = _seeded_total()
+        # 부모 해결 — 이미 매핑된 부모가 있으면 재활용, 아니면 orphan → root.
+        new_parent = id_map.get(prev.parent_id, root_node) if prev.parent_id else root_node
+        new_depth = (new_parent.depth + 1) if new_parent else 1
+
+        old_status = prev.status or "pending"
+        if old_status in ("confirmed", "dead_end", "explored"):
+            new_status = old_status
+            counts["preserved"] += 1
+            tag = f"[{old_status}]"
+            explored_at = prev.explored_at
+        else:
+            new_status = "pending"
+            counts["resumed"] += 1
+            tag = "[resume]"
+            explored_at = None
+
+        merged_ctx = dict(prev.context or {})
+        merged_ctx["seeded_from"] = prev_run_id
+        merged_ctx["prev_node_id"] = str(prev.node_id)
+        merged_ctx["prev_status"] = old_status
+
+        new_node = DiscoveryNode.objects.create(
+            scan_run=scan_run,
+            parent=new_parent,
+            depth=new_depth,
+            node_type=prev.node_type,
+            endpoint=prev.endpoint or "",
+            vuln_type=prev.vuln_type or "",
+            summary=f"{tag} {(prev.summary or '')[:250]}",
+            context=merged_ctx,
+            status=new_status,
+            explored_at=explored_at,
+        )
+        id_map[prev.node_id] = new_node
+
+        if prev.node_type == "endpoint":
+            counts["endpoints"] += 1
+        elif prev.node_type == "vuln":
+            if old_status == "dead_end":
+                counts["dead_ends"] += 1
+                # DeadEnd KB 등록 — 다음 스캔에서 동일 패턴 회피.
+                if prev.endpoint and prev.vuln_type and target_host:
+                    try:
+                        DeadEnd.objects.get_or_create(
+                            target_host=target_host,
+                            endpoint=prev.endpoint[:500],
+                            vuln_type=prev.vuln_type,
+                            pattern_id=None,
+                            defaults={"reason": (prev.summary or "prev scan dead_end")[:500]},
+                        )
+                    except Exception:
+                        pass
+            else:
+                counts["vulns"] += 1
+        elif prev.node_type in ("clue", "exploit_step"):
+            counts["clues"] += 1
+
+    # Candidate 복제 — 원본 scan_run FK 는 CASCADE 라 다른 스캔이 참조 못 함.
+    for c in prev_candidates:
+        try:
+            new_cand = Candidate.objects.create(
+                scan_run=scan_run,
+                request=c.request,
+                vuln_type=c.vuln_type,
+                hypothesis=c.hypothesis,
+                priority_score=c.priority_score,
+                detection_stage=c.detection_stage,
+                status=c.status,
+                required_auth_context=c.required_auth_context,
+                features=dict(
+                    c.features or {},
+                    seeded_from=prev_run_id,
+                    prev_cand_id=str(c.cand_id),
+                ),
+            )
+            cand_map[c.cand_id] = new_cand
+            counts["candidates"] += 1
+        except Exception:
+            pass
+
+    # Finding 복제 — candidate 재연결.
+    for f in prev_findings:
+        try:
+            new_cand = cand_map.get(f.candidate_id) if f.candidate_id else None
+            llm_ana = dict(
+                f.llm_analysis or {},
+                seeded_from=prev_run_id,
+                prev_finding_id=str(f.finding_id),
+            )
+            Finding.objects.create(
+                scan_run=scan_run,
+                candidate=new_cand,
+                title=f"[from prev] {f.title}"[:256],
+                vuln_type=f.vuln_type,
+                severity=f.severity,
+                confidence=f.confidence,
+                summary=f.summary,
+                reproduction_steps=f.reproduction_steps,
+                llm_analysis=llm_ana,
+            )
+            counts["findings"] += 1
+        except Exception:
+            pass
+
+    counts["total"] = (
+        counts["endpoints"] + counts["vulns"] + counts["dead_ends"] + counts["clues"]
+    )
     return counts
 
 
@@ -3774,28 +3733,29 @@ async def _run_discovery_loop(
         scan_run.target_url, str(scan_run.run_id), resume_from,
     )
     if prev_knowledge:
-        # B: root context 에는 요약만 박는다 — 매 worker user_msg 의 node.context json
-        # 800자에 prev 풀 데이터가 들어가 정작 노드 정보가 잘리는 문제 방지.
-        # 풀 데이터는 _seed_from_previous 가 트리에 노드로 직접 박으므로 worker 가
-        # get_chain_context / 노드 자체로 접근 가능.
+        # 루트 컨텍스트엔 요약만 박는다 — 풀 트리는 _seed_from_previous 가 노드로
+        # 직접 import 하므로 worker 는 get_chain_context / get_siblings 로 접근.
+        prev_nodes = prev_knowledge.get("nodes") or []
         root_context["previous_scan"] = {
             "prev_run_id": prev_knowledge.get("prev_run_id", ""),
             "summary": {
-                "endpoints": len(prev_knowledge.get("endpoints", [])),
-                "vulns_to_recheck": len(prev_knowledge.get("vulns", [])),
-                "dead_ends": len(prev_knowledge.get("dead_ends", [])),
-                "clues": len(prev_knowledge.get("clues", [])),
+                "nodes": len(prev_nodes),
+                "findings": len(prev_knowledge.get("findings") or []),
+                "candidates": len(prev_knowledge.get("candidates") or []),
             },
-            "note": "Full data already seeded as child nodes. Use get_siblings or browse tree.",
+            "note": (
+                "Full tree imported as child nodes (parent relations preserved). "
+                "confirmed/dead_end/explored nodes kept final status — DO NOT re-explore. "
+                "pending/exploring → pending (continue from where prev scan stopped). "
+                "Prev findings/candidates cloned for reference — check get_finding."
+            ),
         }
         logger.info(
-            f"[{scan_run.run_id}] seeded with previous knowledge "
+            f"[{scan_run.run_id}] resume from {prev_knowledge.get('prev_run_id')} "
             f"(resume_from={resume_from or 'auto'}): "
-            f"prev_run={prev_knowledge.get('prev_run_id')} "
-            f"endpoints={len(prev_knowledge.get('endpoints', []))} "
-            f"vulns={len(prev_knowledge.get('vulns', []))} "
-            f"dead_ends={len(prev_knowledge.get('dead_ends', []))} "
-            f"clues={len(prev_knowledge.get('clues', []))}"
+            f"prev_nodes={len(prev_nodes)} "
+            f"findings={len(prev_knowledge.get('findings') or [])} "
+            f"candidates={len(prev_knowledge.get('candidates') or [])}"
         )
     elif resume_from.lower() == "off":
         logger.info(f"[{scan_run.run_id}] resume_from=off → cold scan (no prev seeding)")
@@ -3828,7 +3788,9 @@ async def _run_discovery_loop(
         f"[{scan_run.run_id}] root node created: {root_node.node_id}, seeded "
         f"total={seeded.get('total', 0)} "
         f"endpoints={seeded.get('endpoints', 0)} vulns={seeded.get('vulns', 0)} "
-        f"dead_ends={seeded.get('dead_ends', 0)} clues={seeded.get('clues', 0)}"
+        f"dead_ends={seeded.get('dead_ends', 0)} clues={seeded.get('clues', 0)} "
+        f"findings={seeded.get('findings', 0)} candidates={seeded.get('candidates', 0)} "
+        f"resumed={seeded.get('resumed', 0)} preserved={seeded.get('preserved', 0)}"
     )
 
     done_event = asyncio.Event()
