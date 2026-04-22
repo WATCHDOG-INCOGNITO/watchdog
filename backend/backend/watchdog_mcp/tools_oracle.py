@@ -12,15 +12,19 @@ XBOW/Shannon이 false positive를 잡는 핵심 기법. Verifier 에이전트가
 from __future__ import annotations
 
 import json
+import hashlib
 import re
+import secrets as _secrets_mod
 import statistics
 import time
+from urllib.parse import urlparse, urlunparse
 
 import requests
 
 DEFAULT_TIMEOUT = 12
 SQLI_TIME_DEFAULT_DELAY = 3
 SQLI_TIME_MARGIN_MS = 1500  # baseline 대비 이만큼 더 느려야 양성
+SPA_PROBE_SIMILARITY_THRESHOLD = 0.92  # 이보다 높으면 catch-all 의심
 
 
 def _safe_get(url: str, *, headers: dict | None = None, timeout: int = DEFAULT_TIMEOUT):
@@ -28,6 +32,36 @@ def _safe_get(url: str, *, headers: dict | None = None, timeout: int = DEFAULT_T
     if headers:
         h.update(headers)
     return requests.get(url, headers=h, timeout=timeout, allow_redirects=False)
+
+
+def _line_similarity(a: str, b: str) -> float:
+    """두 응답의 라인 기반 Jaccard similarity (0.0~1.0). SPA catch-all 탐지용.
+
+    동일한 HTML 셸을 뱉는 SPA 의 경우 99% 이상 나옴. 실제로 다른 리소스가
+    렌더된 경우 서버가 body 안에 데이터를 박으므로 유사도가 유의하게 떨어짐.
+    """
+    def _lines(s: str) -> set[str]:
+        return {ln.strip() for ln in (s or "").splitlines() if ln.strip()}
+    la, lb = _lines(a), _lines(b)
+    if not la and not lb:
+        return 1.0
+    inter = la & lb
+    union = la | lb
+    return len(inter) / len(union) if union else 0.0
+
+
+def _body_sha(body: str) -> str:
+    return hashlib.sha256((body or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+def _probe_path_under(target_url: str, rand_token: str) -> str:
+    """target_url 의 path prefix 를 유지한 random probe URL 생성.
+    target_url=https://mjsec.kr/lms → https://mjsec.kr/lms/__wd_probe_<rand>
+    """
+    p = urlparse(target_url)
+    base_path = (p.path or "/").rstrip("/")
+    probe_path = f"{base_path}/__wd_probe_{rand_token}"
+    return urlunparse((p.scheme, p.netloc, probe_path, "", "", ""))
 
 
 def _response_diff_blocks(baseline: str, payload: str, control: str) -> dict:
@@ -56,6 +90,268 @@ def _response_diff_blocks(baseline: str, payload: str, control: str) -> dict:
 
 
 def register(mcp):
+
+    @mcp.tool()
+    def oracle_spa_catch_all(
+        scan_run_id: str,
+        force_refresh: bool = False,
+    ) -> str:
+        """Probe 2 random non-existent paths under target_url — SPA catch-all 감지.
+
+        React/Vue/Angular SPA 앱은 존재하지 않는 path 에도 서버가 index.html 을
+        반환 (클라이언트 라우팅). 이 상태에서 HTTP 200 + HTML 만 보고
+        "endpoint accessible" / "IDOR confirmed" 로 판단하는 것은 false positive.
+
+        첫 호출 시 TargetProfile.fingerprint.spa_catch_all 에 baseline 캐시.
+        force_refresh=True 면 재프로빙. 이미 캐시된 결과가 있으면 HTTP 호출 없이
+        cached 반환.
+
+        Returns JSON:
+          {
+            "detected": true|false|null,
+            "target_host": "...",
+            "probe_urls": [...],
+            "baseline_status": 200, "baseline_body_len": N, "baseline_body_sha256": "...",
+            "similarity_between_probes": 0.99,
+            "cached": true|false,
+            "hint": "..."
+          }
+
+        IDOR/auth bypass 관련 finding 을 confirm 하기 전에 반드시 이 oracle 을
+        호출해서 detected=true 이면 body_diff 로 재검증해야 한다.
+        """
+        from api.models import ScanRun, TargetProfile
+
+        try:
+            sr = ScanRun.objects.get(run_id=scan_run_id)
+        except Exception as e:
+            return json.dumps({"error": f"scan_run not found: {e}"})
+
+        target_url = (sr.target_url or "").strip()
+        if not target_url:
+            return json.dumps({"error": "scan_run has no target_url"})
+
+        host = urlparse(target_url).netloc.lower()
+        if not host:
+            return json.dumps({"error": f"cannot parse host from {target_url}"})
+
+        profile, _ = TargetProfile.objects.get_or_create(host=host)
+        fp = dict(profile.fingerprint or {})
+        cached = fp.get("spa_catch_all")
+
+        if cached and not force_refresh:
+            return json.dumps({
+                **cached,
+                "cached": True,
+                "hint": (
+                    "Cached baseline. force_refresh=True to re-probe. "
+                    "If detected=true, IDOR/auth findings based on HTTP 200+HTML "
+                    "alone are false positives — use oracle_idor_diff to validate."
+                ),
+            }, ensure_ascii=False)
+
+        # 2개 서로 다른 random path probe
+        tok_a = _secrets_mod.token_hex(8)
+        tok_b = _secrets_mod.token_hex(8)
+        url_a = _probe_path_under(target_url, tok_a)
+        url_b = _probe_path_under(target_url, tok_b)
+
+        try:
+            r_a = _safe_get(url_a)
+            r_b = _safe_get(url_b)
+        except requests.RequestException as e:
+            return json.dumps({"error": f"probe failed: {e}"})
+
+        sim = _line_similarity(r_a.text, r_b.text)
+        sha_a = _body_sha(r_a.text)
+        sha_b = _body_sha(r_b.text)
+
+        # detected 판정:
+        #  - 두 응답 모두 200 + body similarity > threshold → SPA catch-all 확정
+        #  - 두 응답 모두 4xx → 정상 서버 (detected=false)
+        #  - 혼합/다른 상태 → 불확정 (detected=null)
+        detected: bool | None
+        if r_a.status_code == 200 and r_b.status_code == 200 and sim >= SPA_PROBE_SIMILARITY_THRESHOLD:
+            detected = True
+        elif r_a.status_code >= 400 and r_b.status_code >= 400:
+            detected = False
+        else:
+            detected = None
+
+        ctype = (r_a.headers.get("content-type") or "").split(";")[0].strip().lower()
+        record = {
+            "detected": detected,
+            "target_host": host,
+            "probe_urls": [url_a, url_b],
+            "baseline_status": r_a.status_code,
+            "baseline_body_len": len(r_a.text),
+            "baseline_body_sha256": sha_a,
+            "second_probe_status": r_b.status_code,
+            "second_probe_body_len": len(r_b.text),
+            "second_probe_body_sha256": sha_b,
+            "similarity_between_probes": round(sim, 4),
+            "content_type": ctype,
+        }
+
+        # TargetProfile 에 캐시 (재프로빙 비용 절약 + 다른 도구가 조회)
+        fp["spa_catch_all"] = record
+        try:
+            TargetProfile.objects.filter(pk=profile.pk).update(fingerprint=fp)
+        except Exception:
+            pass
+
+        if detected is True:
+            hint = (
+                "SPA catch-all detected — server returns identical HTML shell for "
+                "any non-existent path. IDOR/auth findings based on HTTP status + "
+                "HTML body alone are FALSE POSITIVES. Real IDOR requires: "
+                "(1) call JSON API endpoint (/api/...), not frontend route, or "
+                "(2) use oracle_idor_diff to confirm body content actually differs "
+                "between user IDs (not just the SPA shell)."
+            )
+        elif detected is False:
+            hint = (
+                "Server returns 4xx for non-existent paths — no SPA catch-all. "
+                "Standard server routing active."
+            )
+        else:
+            hint = (
+                f"Inconclusive: probe_a={r_a.status_code} probe_b={r_b.status_code}. "
+                "Treat 200+HTML on valid-looking paths with caution."
+            )
+
+        return json.dumps({**record, "cached": False, "hint": hint}, ensure_ascii=False)
+
+
+    @mcp.tool()
+    def oracle_idor_diff(
+        scan_run_id: str,
+        baseline_url: str,
+        variant_url: str,
+        baseline_cookie: str = "",
+        variant_cookie: str = "",
+    ) -> str:
+        """IDOR 확정 전 필수 body-diff oracle — SPA catch-all + same-shell false positive 차단.
+
+        baseline_url: 본인 리소스 URL (예: /lms/admin/group/60201901)
+        variant_url:  타인 리소스 URL (예: /lms/admin/group/99999999)
+        baseline_cookie / variant_cookie: optional session cookie 헤더 값 (Cookie: ...)
+
+        동작:
+        1. TargetProfile 의 spa_catch_all baseline 과 각 응답 비교 → SPA shell 반환
+           이면 verdict='spa_catch_all' (IDOR 아님)
+        2. baseline vs variant 의 line similarity 계산
+           - sim >= 0.95 → verdict='same_shell' (같은 HTML, 실제 데이터 diff 없음)
+           - sim < 0.85 + 200+200 → verdict='likely_idor' (body 가 실제로 다름 = 진짜 IDOR 가능)
+           - 그 외 → verdict='unclear'
+
+        Returns JSON:
+          {
+            "verdict": "spa_catch_all|same_shell|likely_idor|unclear",
+            "similarity_baseline_variant": 0.97,
+            "similarity_baseline_vs_spa": 0.99,
+            "similarity_variant_vs_spa": 0.99,
+            "baseline_status": 200, "variant_status": 200,
+            "baseline_len": N, "variant_len": M,
+            "novel_lines_in_variant": [...],  // variant 에만 있는 라인 (IDOR 증거 후보)
+            "hint": "..."
+          }
+
+        verdict in {'spa_catch_all','same_shell'} → IDOR 로 finding 찍으면 FP.
+        verdict='likely_idor' + novel_lines 가 실제 사용자 데이터를 포함해야 진짜.
+        """
+        from api.models import ScanRun, TargetProfile
+
+        try:
+            sr = ScanRun.objects.get(run_id=scan_run_id)
+        except Exception as e:
+            return json.dumps({"error": f"scan_run not found: {e}"})
+        host = urlparse(sr.target_url or "").netloc.lower()
+
+        # SPA baseline 조회
+        spa_baseline_body = ""
+        spa_detected = None
+        try:
+            profile = TargetProfile.objects.filter(host=host).first()
+            if profile and profile.fingerprint:
+                spa = (profile.fingerprint or {}).get("spa_catch_all") or {}
+                spa_detected = spa.get("detected")
+                # baseline body 는 저장 안 했으니 sha256 만 비교 가능 — live re-probe 하자
+                if spa_detected is True:
+                    probe_urls = spa.get("probe_urls") or []
+                    if probe_urls:
+                        try:
+                            rr = _safe_get(probe_urls[0])
+                            spa_baseline_body = rr.text or ""
+                        except requests.RequestException:
+                            pass
+        except Exception:
+            pass
+
+        h_base = {"Cookie": baseline_cookie} if baseline_cookie else None
+        h_var = {"Cookie": variant_cookie} if variant_cookie else None
+        try:
+            r_base = _safe_get(baseline_url, headers=h_base)
+            r_var = _safe_get(variant_url, headers=h_var)
+        except requests.RequestException as e:
+            return json.dumps({"error": f"http error: {e}"})
+
+        sim_bv = _line_similarity(r_base.text, r_var.text)
+        sim_b_spa = _line_similarity(r_base.text, spa_baseline_body) if spa_baseline_body else 0.0
+        sim_v_spa = _line_similarity(r_var.text, spa_baseline_body) if spa_baseline_body else 0.0
+
+        # verdict 결정
+        if spa_detected is True and max(sim_b_spa, sim_v_spa) >= SPA_PROBE_SIMILARITY_THRESHOLD:
+            verdict = "spa_catch_all"
+            hint = (
+                "Both responses match the SPA catch-all baseline — server returns "
+                "the SAME HTML shell for any path including random non-existent "
+                "ones. This is NOT an IDOR. Probe the JSON API endpoint "
+                "(/api/... instead of frontend /admin/... route)."
+            )
+        elif r_base.status_code >= 400 or r_var.status_code >= 400:
+            verdict = "unclear"
+            hint = (
+                f"Status mismatch or error: baseline={r_base.status_code} "
+                f"variant={r_var.status_code}. Cannot infer IDOR."
+            )
+        elif sim_bv >= 0.95:
+            verdict = "same_shell"
+            hint = (
+                "Responses are near-identical (sim>=0.95) — likely both returning "
+                "the same HTML shell without user-specific data. Not an IDOR. "
+                "Verify via JSON API."
+            )
+        elif sim_bv < 0.85:
+            verdict = "likely_idor"
+            hint = (
+                "Response bodies differ substantially — inspect novel_lines_in_variant "
+                "for actual user data (names, IDs, emails). If novel lines contain "
+                "the OTHER user's data, this is a real IDOR."
+            )
+        else:
+            verdict = "unclear"
+            hint = (
+                f"Ambiguous similarity ({sim_bv:.2f}) — neither clearly same nor "
+                "different. Try different IDs or inspect novel lines manually."
+            )
+
+        diff = _response_diff_blocks(r_base.text, r_var.text, spa_baseline_body)
+
+        return json.dumps({
+            "verdict": verdict,
+            "similarity_baseline_variant": round(sim_bv, 4),
+            "similarity_baseline_vs_spa": round(sim_b_spa, 4),
+            "similarity_variant_vs_spa": round(sim_v_spa, 4),
+            "spa_catch_all_detected": spa_detected,
+            "baseline_status": r_base.status_code,
+            "variant_status": r_var.status_code,
+            "baseline_len": len(r_base.text),
+            "variant_len": len(r_var.text),
+            "novel_lines_in_variant": diff.get("novel_lines", []),
+            "hint": hint,
+        }, ensure_ascii=False)
+
 
     @mcp.tool()
     def oracle_response_diff(
