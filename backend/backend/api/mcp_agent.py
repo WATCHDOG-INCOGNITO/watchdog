@@ -364,7 +364,12 @@ record_pattern_use.
 
 - SQLi: error-only ≠ confirmed. Use oracle_sqli_boolean or _time.
 - XSS: reflection-only ≠ confirmed. Use oracle_xss dialog/sentinel; OOB hits also strong.
-- IDOR: two-persona diff + sensitive field.
+- IDOR / auth_bypass / access_control / privilege_escalation: HTTP 200 +
+  HTML body 만으로 판정 금지 — SPA 는 어떤 path 든 index.html 반환. 순서:
+  (a) oracle_spa_catch_all(scan_run_id) — cached 가능, 비용 0~2 call.
+  (b) oracle_idor_diff(scan_run_id, baseline_url, variant_url) — verdict
+      spa_catch_all / same_shell 이면 false_positive, likely_idor + novel
+      lines 에 실 사용자 데이터 포함 시에만 confirmed.
 - SSRF: oracle_ssrf or OOB hit from victim host.
 - LFI: oracle_lfi signature.
 
@@ -2245,6 +2250,23 @@ prior recheck, sink info).
 6. If KB payloads fail but behavior is suspicious: mutate_payload OR craft your
    own based on observed responses.
 
+★ IDOR / auth_bypass / access_control 계열은 2-step 필수:
+  (a) oracle_spa_catch_all(scan_run_id) — target 이 SPA catch-all 인지 판별.
+      cached 된 결과가 있으면 즉시 반환 (비용 0). detected=True 면 HTTP 200
+      + HTML 셸은 endpoint 존재 증거가 아니라 SPA 프런트엔드의 fallback.
+      어떤 path (존재하지 않는 /lms/service/... 포함) 도 200+HTML 반환하므로
+      "다른 경로로 접근 가능" = access control bypass 로 결론 금지.
+  (b) oracle_idor_diff(scan_run_id, baseline_url=<본인 리소스>,
+      variant_url=<타인 리소스>, baseline_cookie=..., variant_cookie=...).
+      verdict 값에 따라:
+        - spa_catch_all / same_shell → NOT IDOR. confirm_finding 금지.
+          /api/* JSON endpoint 로 내려가거나 clue 로 마킹.
+        - likely_idor → novel_lines_in_variant 에 실제 타인 사용자 데이터
+          (이름/이메일/ID) 포함 확인 후에만 confirm.
+        - unclear → 다른 ID 2-3개 추가 시도.
+  SPA 기반 타겟에서 HTTP 200 + HTML body 만으로 IDOR confirm 하면 거의 항상
+  false positive. 이전 스캔 3건 IDOR findings 가 이 이유로 오판됐음.
+
 ## Output contract — TIER A (mandatory data finalize)
 다음 도구 호출 누락 시 노드/KB 가 stuck/incomplete 상태로 끝남:
 
@@ -2377,6 +2399,14 @@ A flag/confirm node OR a vuln node marked for re-verification (recheck).
 3. If recheck=True (target may have been patched): if oracle now FAILS, this
    is "patched since last scan" — mark_dead_end + push a NEW vuln node to test
    bypass/incomplete-fix variants for the same vuln_type.
+
+★ IDOR / auth_bypass / access_control / privilege_escalation 계열은 cand
+evidence 에 HTTP 200 + HTML body 만 있으면 FP 가능성 매우 높음. reject
+전에 먼저:
+  (a) oracle_spa_catch_all(scan_run_id) 호출 — detected=True 면 catch-all.
+  (b) oracle_idor_diff 로 baseline vs variant body diff 재검증.
+verdict in {spa_catch_all, same_shell} → dismiss_candidate 필수.
+verdict=likely_idor + novel_lines 에 실제 사용자 데이터 포함 시에만 confirm.
 
 ## Output contract
 - IF verified:
@@ -3430,6 +3460,22 @@ def _seed_credentials(scan_run, cred_list: list) -> list:
     return personas
 
 
+_SEED_PREFIX_RE = _re.compile(
+    r"^(\[(?:from prev|seeded|resume|confirmed|dead_end|explored|re-verify|"
+    r"prev dead_end|prev clue|prev exploit_step)\]\s*)+",
+    _re.IGNORECASE,
+)
+
+
+def _strip_seed_prefix(s: str) -> str:
+    """Remove stacked resume-tag prefixes so chained re-runs don't compound
+    (e.g. '[from prev] [from prev] Admin ...' → 'Admin ...').
+    """
+    if not s:
+        return s
+    return _SEED_PREFIX_RE.sub("", s).lstrip()
+
+
 def _normalize_target_url(url: str) -> str:
     """Normalize target URL for comparison: lowercase scheme+host, strip trailing slash."""
     from urllib.parse import urlparse, urlunparse
@@ -3576,6 +3622,7 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
         merged_ctx["prev_node_id"] = str(prev.node_id)
         merged_ctx["prev_status"] = old_status
 
+        clean_summary = _strip_seed_prefix(prev.summary or "")
         new_node = DiscoveryNode.objects.create(
             scan_run=scan_run,
             parent=new_parent,
@@ -3583,7 +3630,7 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
             node_type=prev.node_type,
             endpoint=prev.endpoint or "",
             vuln_type=prev.vuln_type or "",
-            summary=f"{tag} {(prev.summary or '')[:250]}",
+            summary=f"{tag} {clean_summary[:250]}",
             context=merged_ctx,
             status=new_status,
             explored_at=explored_at,
@@ -3644,10 +3691,11 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
                 seeded_from=prev_run_id,
                 prev_finding_id=str(f.finding_id),
             )
+            clean_title = _strip_seed_prefix(f.title or "")
             Finding.objects.create(
                 scan_run=scan_run,
                 candidate=new_cand,
-                title=f"[from prev] {f.title}"[:256],
+                title=f"[from prev] {clean_title}"[:256],
                 vuln_type=f.vuln_type,
                 severity=f.severity,
                 confidence=f.confidence,

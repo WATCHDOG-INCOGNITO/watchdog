@@ -49,6 +49,12 @@ _seed_from_previous 가 이전 scan 의 confirmed vuln 을 recheck=True 로 push
    - `oracle_lfi(url, file_signature)`
    - `oracle_ssrf(url, oob_token)`
    - `oracle_response_diff(url_a, url_b)` — generic
+   - `oracle_spa_catch_all(scan_run_id)` — target 이 모든 path 에 200+HTML
+     반환하는 SPA catch-all 인지 판별. detected=true 면 HTTP status 기반
+     판정 무효. IDOR/auth_bypass/access_control 계열 confirm 전 필수.
+   - `oracle_idor_diff(scan_run_id, baseline_url, variant_url)` — IDOR
+     전용. verdict in {spa_catch_all, same_shell} → FP 로 reject,
+     verdict=likely_idor + novel_lines 실 데이터 포함 → confirm.
 4. **Recheck mode** (context.recheck=True — vuln succeeded in prior scan):
    - oracle 실패 → "patched since last scan" 강한 신호 →
      `mark_dead_end(reason="patched")` + `learn_dead_end(reason="patched in

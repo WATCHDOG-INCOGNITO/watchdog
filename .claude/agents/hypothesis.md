@@ -60,6 +60,20 @@ multi_http_probe(requests_json='[
    dedicated `session_id` instead.
 7. `oracle_*(...)` — verify deterministically (oracle_sqli_boolean / xss /
    lfi / ssrf / response_diff / sqli_time).
+
+   ★ **IDOR / auth_bypass / access_control 은 2-step 필수**:
+   - (a) `oracle_spa_catch_all(scan_run_id)` — target 이 SPA catch-all 이면
+     어떤 path 든 200+HTML 반환. HTTP status 200 만 보고 confirmed 찍으면
+     false positive. cached=True 면 재호출 비용 없음.
+   - (b) `oracle_idor_diff(scan_run_id, baseline_url=<본인 ID>,
+     variant_url=<타인 ID>, baseline_cookie=..., variant_cookie=...)`.
+     verdict 값에 따라:
+       * `spa_catch_all` / `same_shell` → IDOR 아님. confirm_finding 금지.
+         JSON API endpoint (/api/...) 로 내려가서 재검증하거나 clue 로만 마킹.
+       * `likely_idor` → novel_lines_in_variant 확인. 실제 타인 사용자 데이터
+         (이름/이메일/ID) 가 있어야 진짜 IDOR. save_evidence 에 novel_lines
+         원문 그대로 박아 근거 남김.
+       * `unclear` → 다른 ID 2-3 개 더 시도 또는 API endpoint 직접 probe.
 8. After EACH payload: `record_pattern_use(pattern_id, succeeded=True/False)`
    — TIER A. Don't skip.
 9. KB payloads fail but behavior suspicious → `mutate_payload(seed_pattern_id,
