@@ -510,6 +510,7 @@ function NewScanModal({ onClose, onCreated }) {
   const [targetUrl, setTargetUrl] = useState("");
   const [requestBudget, setRequestBudget] = useState(10);
   const [forceSpa, setForceSpa] = useState(false);
+  const [bugBountyUA, setBugBountyUA] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
@@ -586,6 +587,7 @@ function NewScanModal({ onClose, onCreated }) {
     try {
       const config = { mode: "mcp" };
       if (forceSpa) config.force_spa = true;
+      if (bugBountyUA.trim()) config.bug_bounty_ua = bugBountyUA.trim();
 
       const creds = buildCredentials();
       if (creds) config.credentials = creds;
@@ -639,34 +641,41 @@ function NewScanModal({ onClose, onCreated }) {
           <span>SPA 모드 강제 사용</span>
         </label>
 
+        <label className="field">
+          <span>버그바운티 User-Agent (선택)</span>
+          <input
+            value={bugBountyUA}
+            onChange={(e) => setBugBountyUA(e.target.value)}
+            placeholder="BugBountyHunter-yourname-h1program"
+          />
+          <span style={{ fontSize: "0.8em", opacity: 0.6, marginTop: 2 }}>
+            모든 HTTP 요청의 User-Agent 헤더에 고정 삽입됩니다.
+            예: <code>WatchdogMCP/1.0 (BugBounty: yourname-h1program)</code>
+          </span>
+        </label>
+
         <label className="checkbox-row">
           <input type="checkbox" checked={showAuth} onChange={(e) => setShowAuth(e.target.checked)} />
           <span>로그인 정보 추가 (선택) — 인증 후 endpoint 도 정찰</span>
         </label>
 
         {showAuth ? (
-          <div style={{
-            marginTop: 8, padding: 12, border: "1px solid #d3dae4",
-            borderRadius: 6, background: "#f7f9fc",
-          }}>
-            <div style={{ marginBottom: 8, fontSize: "0.85em", opacity: 0.75 }}>
+          <div className="auth-config-panel">
+            <div className="auth-config-note">
               여러 persona (admin / user1 / api 등) 추가 가능. label 로 구분 →
               IDOR cross-test, role 별 권한 차이 테스트.
             </div>
 
             {creds.map((c, idx) => (
-              <div key={idx} style={{
-                marginBottom: 10, padding: 10, border: "1px solid #c5cfdc",
-                borderRadius: 4, background: "#fff",
-              }}>
-                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
-                  <label className="field" style={{ flex: "0 0 140px", margin: 0 }}>
-                    <span style={{ fontSize: "0.8em" }}>label</span>
+              <div key={idx} className="auth-persona-card">
+                <div className="auth-persona-head">
+                  <label className="field field-compact auth-label-field">
+                    <span>label</span>
                     <input value={c.label} onChange={(e) => updateCred(idx, { label: e.target.value })}
                       placeholder="admin / user1 / api" />
                   </label>
-                  <label className="field" style={{ flex: 1, margin: 0 }}>
-                    <span style={{ fontSize: "0.8em" }}>type</span>
+                  <label className="field field-compact">
+                    <span>type</span>
                     <select value={c.type} onChange={(e) => updateCred(idx, { type: e.target.value })}>
                       <option value="form">Form login</option>
                       <option value="bearer">Bearer token</option>
@@ -676,7 +685,6 @@ function NewScanModal({ onClose, onCreated }) {
                   </label>
                   {creds.length > 1 ? (
                     <button type="button" className="ghost-button danger-button"
-                      style={{ marginTop: 16, padding: "4px 10px" }}
                       onClick={() => removeCred(idx)}>제거</button>
                   ) : null}
                 </div>
@@ -688,7 +696,7 @@ function NewScanModal({ onClose, onCreated }) {
                       <input value={c.login_url} onChange={(e) => updateCred(idx, { login_url: e.target.value })}
                         placeholder="http://target/login or /api/auth/login" />
                     </label>
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <div className="auth-two-column">
                       <label className="field">
                         <span>username 필드명</span>
                         <input value={c.username_field} onChange={(e) => updateCred(idx, { username_field: e.target.value })} />
@@ -698,7 +706,7 @@ function NewScanModal({ onClose, onCreated }) {
                         <input value={c.password_field} onChange={(e) => updateCred(idx, { password_field: e.target.value })} />
                       </label>
                     </div>
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <div className="auth-two-column">
                       <label className="field">
                         <span>username</span>
                         <input value={c.username} onChange={(e) => updateCred(idx, { username: e.target.value })} />
@@ -728,7 +736,7 @@ function NewScanModal({ onClose, onCreated }) {
                 ) : null}
 
                 {c.type === "basic" ? (
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <div className="auth-two-column">
                     <label className="field">
                       <span>username</span>
                       <input value={c.username} onChange={(e) => updateCred(idx, { username: e.target.value })} />
@@ -742,13 +750,14 @@ function NewScanModal({ onClose, onCreated }) {
               </div>
             ))}
 
-            <button type="button" className="ghost-button" onClick={addCred} style={{ width: "100%" }}>
-              + 다른 persona 추가
+            <button type="button" className="ghost-button auth-add-button" onClick={addCred}>
+              <span className="button-icon" aria-hidden="true">+</span>
+              <span>다른 persona 추가</span>
             </button>
 
-            <div style={{ marginTop: 8, fontSize: "0.8em", opacity: 0.6 }}>
-              ⚠ 평문 저장 (ScanRun.config). 운영 환경엔 별도 secret store 권장.<br />
-              ℹ login endpoint 자체도 SQLi/auth_bypass 시도 대상 — credential 은 정찰 보조일 뿐 면제권 아님.
+            <div className="auth-config-warning">
+              평문 저장 (ScanRun.config). 운영 환경엔 별도 secret store 권장.<br />
+              login endpoint 자체도 SQLi/auth_bypass 시도 대상 — credential 은 정찰 보조일 뿐 면제권 아님.
             </div>
           </div>
         ) : null}
@@ -756,7 +765,8 @@ function NewScanModal({ onClose, onCreated }) {
         <div className="modal-actions" style={{ marginTop: 18 }}>
           <button type="button" className="ghost-button" onClick={onClose}>취소</button>
           <button type="button" className="primary-button" disabled={submitting || !targetUrl.trim()} onClick={handleSubmit}>
-            {submitting ? "시작 중..." : "새 스캔"}
+            <span className="button-icon" aria-hidden="true">+</span>
+            <span>{submitting ? "시작 중..." : "새 스캔"}</span>
           </button>
         </div>
       </div>
@@ -874,6 +884,7 @@ function ResultsView({
       <section className="hero-card">
         <div className="hero-topline">
           <div>
+            <div className="section-kicker">Target</div>
             <h1>{scan.target_url}</h1>
           </div>
 
@@ -885,11 +896,18 @@ function ResultsView({
 
         <div className="hero-actions" style={{ marginTop: 18 }}>
           <button type="button" className="icon-button" title="스냅샷 새로고침" onClick={onRefresh}>↻</button>
-          <button type="button" className="ghost-button" onClick={onOpenRunDetails}>자세히 보기</button>
-          <button type="button" className="ghost-button" onClick={onOpenLlmTrace}>LLM 기록 보기</button>
+          <button type="button" className="ghost-button" onClick={onOpenRunDetails}>
+            <span className="button-icon" aria-hidden="true">i</span>
+            <span>자세히 보기</span>
+          </button>
+          <button type="button" className="ghost-button" onClick={onOpenLlmTrace}>
+            <span className="button-icon" aria-hidden="true">≡</span>
+            <span>LLM 기록 보기</span>
+          </button>
           {scan.status === "running" ? (
             <button type="button" className="ghost-button danger-button" disabled={stopLoading} onClick={onStop}>
-              {stopLoading ? "중지 요청 중..." : "중지"}
+              <span className="button-icon" aria-hidden="true">■</span>
+              <span>{stopLoading ? "중지 요청 중..." : "중지"}</span>
             </button>
           ) : null}
         </div>
@@ -963,22 +981,57 @@ function ResultsView({
 }
 
 const NODE_TYPE_META = {
-  target: { icon: "\u25C9", label: "\ud0c0\uac9f" },
-  endpoint: { icon: "\u2192", label: "\uc5d4\ub4dc\ud3ec\uc778\ud2b8" },
-  vuln: { icon: "\u26a0", label: "\ucde8\uc57d\uc810" },
-  clue: { icon: "\u2727", label: "\ub2e8\uc11c" },
-  exploit_step: { icon: "\u2191", label: "\uc775\uc2a4\ud50c\ub85c\uc787" },
-  flag: { icon: "\u2691", label: "\ud50c\ub798\uadf8" },
-  dead_end: { icon: "\u00d7", label: "\ub9c9\ub2e4\ub978 \uacf5" },
+  target: { icon: "T", label: "\ud0c0\uac9f" },
+  endpoint: { icon: "E", label: "\uc5d4\ub4dc\ud3ec\uc778\ud2b8" },
+  vuln: { icon: "V", label: "\ucde8\uc57d\uc810" },
+  clue: { icon: "C", label: "\ub2e8\uc11c" },
+  exploit_step: { icon: "X", label: "\uc775\uc2a4\ud50c\ub85c\uc787" },
+  flag: { icon: "F", label: "\ud50c\ub798\uadf8" },
+  dead_end: { icon: "-", label: "\ub9c9\ub2e4\ub978 \uacf3" },
 };
 
 const NODE_STATUS_LABEL = {
   pending: "\ub300\uae30",
   exploring: "\ud0d0\uc0c9 \uc911",
   explored: "\ud0d0\uc0c9 \uc644\ub8cc",
-  dead_end: "\ub9c9\ub2e4\ub978 \uacf5",
+  dead_end: "\ub9c9\ub2e4\ub978 \uacf3",
   confirmed: "\ud655\uc815",
 };
+
+function splitDiscoverySummary(summary = "") {
+  const text = String(summary || "").trim();
+  const match = text.match(/^\[([^\]]+)\]\s*/);
+  if (!match) return { prefix: "", body: text };
+  const body = text.slice(match[0].length).trim();
+  return { prefix: match[1], body: body || text };
+}
+
+function getDiscoveryApiLabel(node = {}) {
+  const ctx = node.context || {};
+  let value = node.endpoint || ctx.endpoint || ctx.url || ctx.target_url || ctx.request_url || "";
+
+  if (!value && node.summary) {
+    const { body } = splitDiscoverySummary(node.summary);
+    const match = body.match(/https?:\/\/[^\s)]+|\/[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]+/);
+    value = match?.[0] || "";
+  }
+
+  if (!value) return "API";
+  const raw = String(value).trim();
+  try {
+    if (/^https?:\/\//i.test(raw)) {
+      const parsed = new URL(raw);
+      return parsed.pathname && parsed.pathname !== "/" ? parsed.pathname : parsed.host;
+    }
+  } catch {
+    // Fall back to the raw value below.
+  }
+  return raw.split("?")[0] || raw;
+}
+
+function normalizeDiscoveryEndpoint(endpoint = "") {
+  return String(endpoint || "").split("?")[0].replace(/\/+$/, "") || "/";
+}
 
 function buildTreeFromFlat(flatNodes) {
   const map = new Map();
@@ -997,10 +1050,10 @@ function buildTreeFromFlat(flatNodes) {
   return roots;
 }
 
-const CARD_W = 240;
-const CARD_H = 64;
-const GAP_X = 280;
-const GAP_Y = 90;
+const CARD_W = 272;
+const CARD_H = 96;
+const GAP_X = 326;
+const GAP_Y = 118;
 const ZOOM_MIN = 0.25;
 const ZOOM_MAX = 2.5;
 
@@ -1056,29 +1109,42 @@ function CanvasNode({ node, x, y, selected, onSelect }) {
   const meta = NODE_TYPE_META[node.node_type] || NODE_TYPE_META.clue;
   const statusLabel = NODE_STATUS_LABEL[node.status] || node.status;
   const isSelected = selected === node.node_id;
+  const summaryParts = splitDiscoverySummary(node.summary);
+  const childCount = node.children_count ?? node.children?.length ?? 0;
+  const endpoint = node.endpoint ? node.endpoint.split("?")[0] : "";
+  const apiLabel = getDiscoveryApiLabel(node);
 
   return (
     <div
       className={`canvas-node node-type-${node.node_type} ${isSelected ? "canvas-node-selected" : ""}`}
       style={{ left: x, top: y }}
+      title={`${apiLabel}${node.summary ? ` - ${node.summary}` : ""}`}
       onClick={(e) => { e.stopPropagation(); onSelect(isSelected ? null : node.node_id); }}
     >
       <div className="node-head">
         <span className="node-icon">{meta.icon}</span>
-        <span className="node-type-label">{meta.label}</span>
-        {node.vuln_type ? <span className="node-vuln-badge">{node.vuln_type}</span> : null}
+        <span className="node-api-label">{apiLabel}</span>
         <span className={`node-status-pill node-status-${node.status}`}>{statusLabel}</span>
       </div>
-      <div className="node-summary">{node.summary}</div>
+      <div className="node-summary">{summaryParts.body || "(요약 없음)"}</div>
+      <div className="canvas-node-foot">
+        {summaryParts.prefix ? <span className="node-prefix-tag">{summaryParts.prefix}</span> : null}
+        {node.vuln_type ? <span className="node-vuln-badge">{node.vuln_type}</span> : null}
+        {endpoint && endpoint !== apiLabel ? <span className="node-endpoint-chip">{endpoint}</span> : null}
+        {childCount > 0 ? <span className="node-mini-meta">자식 {childCount}</span> : null}
+      </div>
     </div>
   );
 }
 
-function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findings = [], endpointSpecs = [], onClose }) {
+function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findings = [], endpointSpecs = [], onClose, onSelectNode }) {
   if (!node) return null;
 
   const meta = NODE_TYPE_META[node.node_type] || NODE_TYPE_META.clue;
   const statusLabel = NODE_STATUS_LABEL[node.status] || node.status;
+  const summaryParts = splitDiscoverySummary(node.summary);
+  const apiLabel = getDiscoveryApiLabel(node);
+  const panelRef = useRef(null);
 
   const chain = useMemo(() => {
     const path = [];
@@ -1102,13 +1168,55 @@ function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findi
   // ── 노드 ↔ candidate / finding / request 매칭 ──
   // 우선 features.discovery_node_id 직매칭, 없으면 endpoint+vuln_type 매칭
   const nodeId = node.node_id;
-  const epNorm = (node.endpoint || "").split("?")[0].replace(/\/+$/, "") || "/";
+  const epNorm = normalizeDiscoveryEndpoint(node.endpoint);
+
+  const findNodeIdByEndpoint = useCallback((endpoint, vulnType = "") => {
+    const normalized = normalizeDiscoveryEndpoint(endpoint);
+    if (!normalized) return null;
+    const exact = allNodes.find((n) => (
+      normalizeDiscoveryEndpoint(n.endpoint) === normalized &&
+      (!vulnType || n.vuln_type === vulnType)
+    ));
+    if (exact) return exact.node_id;
+    return allNodes.find((n) => normalizeDiscoveryEndpoint(n.endpoint) === normalized)?.node_id || null;
+  }, [allNodes]);
+
+  const getCandidateTargetNodeId = useCallback((candidate) => {
+    const feat = candidate?.features || {};
+    if (feat.discovery_node_id && allNodes.some((n) => n.node_id === feat.discovery_node_id)) {
+      return feat.discovery_node_id;
+    }
+    const endpoint = feat.endpoint || candidate?.request?.endpoint || candidate?.endpoint || "";
+    return findNodeIdByEndpoint(endpoint, candidate?.vuln_type);
+  }, [allNodes, findNodeIdByEndpoint]);
+
+  const getFindingTargetNodeId = useCallback((finding) => {
+    const candidate = candidates.find((c) => c.cand_id === finding?.candidate);
+    if (candidate) return getCandidateTargetNodeId(candidate);
+    return findNodeIdByEndpoint(finding?.endpoint || "", finding?.vuln_type);
+  }, [candidates, findNodeIdByEndpoint, getCandidateTargetNodeId]);
+
+  const navProps = useCallback((targetNodeId) => {
+    if (!targetNodeId || targetNodeId === nodeId || !onSelectNode) return {};
+    return {
+      role: "button",
+      tabIndex: 0,
+      title: "해당 탐색 노드로 이동",
+      onClick: () => onSelectNode(targetNodeId),
+      onKeyDown: (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSelectNode(targetNodeId);
+        }
+      },
+    };
+  }, [nodeId, onSelectNode]);
 
   const linkedCandidates = useMemo(() => {
     return candidates.filter((c) => {
       const feat = c.features || {};
       if (feat.discovery_node_id === nodeId) return true;
-      const cep = (feat.endpoint || (c.request && c.request.endpoint) || "").split("?")[0].replace(/\/+$/, "") || "/";
+      const cep = normalizeDiscoveryEndpoint(feat.endpoint || (c.request && c.request.endpoint) || "");
       return cep === epNorm && (!node.vuln_type || c.vuln_type === node.vuln_type);
     });
   }, [candidates, nodeId, epNorm, node.vuln_type]);
@@ -1120,9 +1228,9 @@ function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findi
   );
 
   const linkedRequests = useMemo(() => {
-    if (!node.endpoint) return [];
+      if (!node.endpoint) return [];
     return requests.filter((r) => {
-      const rep = (r.endpoint || "").split("?")[0].replace(/\/+$/, "") || "/";
+      const rep = normalizeDiscoveryEndpoint(r.endpoint);
       return rep === epNorm;
     }).slice(0, 20);
   }, [requests, node.endpoint, epNorm]);
@@ -1131,23 +1239,28 @@ function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findi
   const linkedSpecs = useMemo(() => {
     if (!node.endpoint || node.node_type === "target") return [];
     return endpointSpecs.filter((s) => {
-      const sep = (s.endpoint || "").split("?")[0].replace(/\/+$/, "") || "/";
+      const sep = normalizeDiscoveryEndpoint(s.endpoint);
       return sep === epNorm;
     });
   }, [endpointSpecs, node.endpoint, node.node_type, epNorm]);
 
+  useEffect(() => {
+    if (panelRef.current) panelRef.current.scrollTop = 0;
+  }, [node.node_id]);
+
   return (
-    <div className="node-panel" onClick={(e) => e.stopPropagation()}>
+    <div className="node-panel" ref={panelRef} onClick={(e) => e.stopPropagation()}>
       <div className="node-panel-head">
-        <div className="node-panel-title">
+        <div className={`node-panel-title node-type-${node.node_type}`}>
           <span className="node-icon">{meta.icon}</span>
-          <span className={`node-type-label node-type-${node.node_type}`}>{meta.label}</span>
+          <span className="node-api-label">{apiLabel}</span>
           <span className={`node-status-pill node-status-${node.status}`}>{statusLabel}</span>
+          {summaryParts.prefix ? <span className="node-prefix-tag">{summaryParts.prefix}</span> : null}
         </div>
         <button type="button" className="ghost-button" onClick={onClose}>닫기</button>
       </div>
 
-      <div className="node-panel-summary">{node.summary}</div>
+      <div className="node-panel-summary">{summaryParts.body || node.summary}</div>
 
       <div className="node-panel-grid">
         {node.endpoint ? <div><span>Endpoint</span><strong>{node.endpoint}</strong></div> : null}
@@ -1165,10 +1278,15 @@ function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findi
           <div className="node-chain">
             {chain.map((c, i) => {
               const m = NODE_TYPE_META[c.node_type] || NODE_TYPE_META.clue;
+              const parts = splitDiscoverySummary(c.summary);
+              const chainText = parts.body || c.summary || "";
+              const go = navProps(c.node_id);
               return (
-                <div key={c.node_id} className={`node-chain-step ${c.node_id === node.node_id ? "current" : ""}`}>
+                <div key={c.node_id} className={`node-chain-step ${c.node_id === node.node_id ? "current" : ""} ${go.role ? "node-linked-row" : ""}`} {...go}>
                   <span className="node-chain-icon">{m.icon}</span>
-                  <span className="node-chain-text">{c.summary.slice(0, 80)}{c.summary.length > 80 ? "..." : ""}</span>
+                  {parts.prefix ? <span className="node-prefix-tag node-prefix-tag-compact">{parts.prefix}</span> : null}
+                  <span className="node-chain-text">{chainText.slice(0, 80)}{chainText.length > 80 ? "..." : ""}</span>
+                  {go.role ? <span className="node-row-jump">이동</span> : null}
                   {i < chain.length - 1 ? <span className="node-chain-arrow">→</span> : null}
                 </div>
               );
@@ -1191,11 +1309,16 @@ function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findi
             {children.map((c) => {
               const cm = NODE_TYPE_META[c.node_type] || NODE_TYPE_META.clue;
               const sl = NODE_STATUS_LABEL[c.status] || c.status;
+              const parts = splitDiscoverySummary(c.summary);
+              const childText = parts.body || c.summary || "";
+              const go = navProps(c.node_id);
               return (
-                <div key={c.node_id} className="node-child-row">
+                <div key={c.node_id} className={`node-child-row ${go.role ? "node-linked-row" : ""}`} {...go}>
                   <span className="node-icon">{cm.icon}</span>
-                  <span className="node-child-summary">{c.summary.slice(0, 60)}</span>
+                  {parts.prefix ? <span className="node-prefix-tag node-prefix-tag-compact">{parts.prefix}</span> : null}
+                  <span className="node-child-summary">{childText.slice(0, 60)}</span>
                   <span className={`node-status-pill node-status-${c.status}`}>{sl}</span>
+                  {go.role ? <span className="node-row-jump">이동</span> : null}
                 </div>
               );
             })}
@@ -1205,38 +1328,43 @@ function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findi
 
       {linkedSpecs.length > 0 ? (
         <div className="node-panel-section">
-          <div className="mini-title">📋 API 명세 ({linkedSpecs.length})</div>
+          <div className="mini-title">API 명세 ({linkedSpecs.length})</div>
           <div className="node-children-list">
-            {linkedSpecs.map((s) => (
-              <div key={s.spec_id} className="node-child-row" style={{ flexDirection: "column", alignItems: "stretch", gap: 4 }}>
-                <div>
-                  <strong>{s.method}</strong> {s.endpoint}
-                  {s.auth_required ? <span style={{ marginLeft: 6, opacity: 0.7 }}>🔒 auth</span> : null}
-                  <span style={{ marginLeft: 8, opacity: 0.6, fontSize: "0.85em" }}>seen {s.times_seen}× </span>
+            {linkedSpecs.map((s) => {
+              const targetId = findNodeIdByEndpoint(s.endpoint);
+              const go = navProps(targetId);
+              return (
+                <div key={s.spec_id} className={`node-child-row node-child-row-stack ${go.role ? "node-linked-row" : ""}`} {...go}>
+                  <div>
+                    <strong>{s.method}</strong> {s.endpoint}
+                    {s.auth_required ? <span className="auth-badge">AUTH</span> : null}
+                    <span className="spec-seen">seen {s.times_seen}x</span>
+                    {go.role ? <span className="node-row-jump">이동</span> : null}
+                  </div>
+                  {s.suspected_vuln_types && s.suspected_vuln_types.length > 0 ? (
+                    <div className="spec-inline-meta">
+                      <span>의심 vuln: </span>
+                      {s.suspected_vuln_types.map((vt) => (
+                        <span key={vt} className="node-status-pill node-status-pending">{vt}</span>
+                      ))}
+                    </div>
+                  ) : null}
+                  {s.sink_hints && s.sink_hints.length > 0 ? (
+                    <div className="spec-inline-meta">
+                      sink: {s.sink_hints.join(", ")}
+                    </div>
+                  ) : null}
+                  {s.params_schema && Object.keys(s.params_schema).length > 0 ? (
+                    <div className="spec-inline-meta spec-inline-dim">
+                      params: {Object.keys(s.params_schema).join(", ")}
+                    </div>
+                  ) : null}
+                  {s.notes ? (
+                    <div className="spec-note">{s.notes.slice(0, 200)}</div>
+                  ) : null}
                 </div>
-                {s.suspected_vuln_types && s.suspected_vuln_types.length > 0 ? (
-                  <div style={{ fontSize: "0.85em" }}>
-                    <span style={{ opacity: 0.7 }}>의심 vuln: </span>
-                    {s.suspected_vuln_types.map((vt) => (
-                      <span key={vt} className="node-status-pill node-status-pending" style={{ marginRight: 4 }}>{vt}</span>
-                    ))}
-                  </div>
-                ) : null}
-                {s.sink_hints && s.sink_hints.length > 0 ? (
-                  <div style={{ fontSize: "0.85em", opacity: 0.8 }}>
-                    sink: {s.sink_hints.join(", ")}
-                  </div>
-                ) : null}
-                {s.params_schema && Object.keys(s.params_schema).length > 0 ? (
-                  <div style={{ fontSize: "0.8em", opacity: 0.7 }}>
-                    params: {Object.keys(s.params_schema).join(", ")}
-                  </div>
-                ) : null}
-                {s.notes ? (
-                  <div style={{ fontSize: "0.8em", opacity: 0.6, fontStyle: "italic" }}>{s.notes.slice(0, 200)}</div>
-                ) : null}
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       ) : null}
@@ -1245,16 +1373,20 @@ function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findi
         <div className="node-panel-section">
           <div className="mini-title">취약점 ({linkedFindings.length})</div>
           <div className="node-children-list">
-            {linkedFindings.map((f) => (
-              <div key={f.finding_id} className="node-child-row">
-                <span className="node-icon">⚠</span>
-                <span className="node-child-summary">
-                  <strong>[{(f.severity || "?").toUpperCase()}]</strong> {f.title || "(제목 없음)"}
-                  {f.summary ? <div style={{ opacity: 0.7, fontSize: "0.85em", marginTop: 2 }}>{f.summary.slice(0, 200)}</div> : null}
-                </span>
-                <span className={`node-status-pill node-status-confirmed`}>{f.vuln_type}</span>
-              </div>
-            ))}
+            {linkedFindings.map((f) => {
+              const go = navProps(getFindingTargetNodeId(f));
+              return (
+                <div key={f.finding_id} className={`node-child-row ${go.role ? "node-linked-row" : ""}`} {...go}>
+                  <span className="node-icon">!</span>
+                  <span className="node-child-summary">
+                    <strong>[{(f.severity || "?").toUpperCase()}]</strong> {f.title || "(제목 없음)"}
+                    {f.summary ? <div className="node-child-subtext">{f.summary.slice(0, 200)}</div> : null}
+                  </span>
+                  <span className={`node-status-pill node-status-confirmed`}>{f.vuln_type}</span>
+                  {go.role ? <span className="node-row-jump">이동</span> : null}
+                </div>
+              );
+            })}
           </div>
         </div>
       ) : null}
@@ -1263,18 +1395,22 @@ function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findi
         <div className="node-panel-section">
           <div className="mini-title">후보 ({linkedCandidates.length})</div>
           <div className="node-children-list">
-            {linkedCandidates.slice(0, 10).map((c) => (
-              <div key={c.cand_id} className="node-child-row">
-                <span className="node-icon">◆</span>
-                <span className="node-child-summary">
-                  {c.vuln_type} — {(c.hypothesis || "").slice(0, 80)}
-                  {c.priority_score ? <span style={{ opacity: 0.6, marginLeft: 6 }}>p={Number(c.priority_score).toFixed(2)}</span> : null}
-                </span>
-                <span className={`node-status-pill node-status-${c.status === "confirmed" ? "confirmed" : c.status === "false_positive" || c.status === "dismissed" ? "dead_end" : "pending"}`}>
-                  {c.status}
-                </span>
-              </div>
-            ))}
+            {linkedCandidates.slice(0, 10).map((c) => {
+              const go = navProps(getCandidateTargetNodeId(c));
+              return (
+                <div key={c.cand_id} className={`node-child-row ${go.role ? "node-linked-row" : ""}`} {...go}>
+                  <span className="node-icon">C</span>
+                  <span className="node-child-summary">
+                    {c.vuln_type} - {(c.hypothesis || "").slice(0, 80)}
+                    {c.priority_score ? <span className="node-child-score">p={Number(c.priority_score).toFixed(2)}</span> : null}
+                  </span>
+                  <span className={`node-status-pill node-status-${c.status === "confirmed" ? "confirmed" : c.status === "false_positive" || c.status === "dismissed" ? "dead_end" : "pending"}`}>
+                    {c.status}
+                  </span>
+                  {go.role ? <span className="node-row-jump">이동</span> : null}
+                </div>
+              );
+            })}
           </div>
         </div>
       ) : null}
@@ -1283,20 +1419,24 @@ function NodeDetailPanel({ node, allNodes, requests = [], candidates = [], findi
         <div className="node-panel-section">
           <div className="mini-title">관련 요청 ({linkedRequests.length})</div>
           <div className="node-children-list">
-            {linkedRequests.slice(0, 10).map((r) => (
-              <div key={r.req_id || r.request_id} className="node-child-row">
-                <span className="node-icon">{r.method === "GET" ? "→" : r.method === "POST" ? "↑" : "·"}</span>
-                <span className="node-child-summary">
-                  <strong>{r.method}</strong> {r.endpoint}
-                  {r.params && Object.keys(r.params).length > 0 ? (
-                    <div style={{ opacity: 0.7, fontSize: "0.85em", marginTop: 2 }}>
-                      params: {Object.keys(r.params).join(", ").slice(0, 120)}
-                    </div>
-                  ) : null}
-                </span>
-                <span className="node-status-pill node-status-explored">{r.source || "?"}</span>
-              </div>
-            ))}
+            {linkedRequests.slice(0, 10).map((r) => {
+              const go = navProps(findNodeIdByEndpoint(r.endpoint));
+              return (
+                <div key={r.req_id || r.request_id} className={`node-child-row ${go.role ? "node-linked-row" : ""}`} {...go}>
+                  <span className="node-icon">{r.method === "GET" ? "G" : r.method === "POST" ? "P" : "R"}</span>
+                  <span className="node-child-summary">
+                    <strong>{r.method}</strong> {r.endpoint}
+                    {r.params && Object.keys(r.params).length > 0 ? (
+                      <div className="node-child-subtext">
+                        params: {Object.keys(r.params).join(", ").slice(0, 120)}
+                      </div>
+                    ) : null}
+                  </span>
+                  <span className="node-status-pill node-status-explored">{r.source || "?"}</span>
+                  {go.role ? <span className="node-row-jump">이동</span> : null}
+                </div>
+              );
+            })}
           </div>
         </div>
       ) : null}
@@ -1393,49 +1533,45 @@ function PathTreeRows({ node, depth, expanded, onToggle, selectedId, onSelectSpe
   const hasChildren = node._sortedChildren.length > 0;
   const hasSpecs = node.specs.length > 0;
   const hasMore = hasChildren || node.specs.length > 1;  // 토글 가치
-  const indent = depth * 16;
   return (
     <>
       <tr
         onClick={() => hasMore ? onToggle(node.fullPath) : (node.specs[0] && onSelectSpec(node.specs[0].spec_id))}
-        style={{
-          cursor: "pointer",
-          background: isOpen ? "#eef4fc" : (depth === 0 ? "#f7f9fc" : "#fff"),
-          borderBottom: "1px solid #e6ebf2",
-          color: "#1f2a3a",
-          fontWeight: depth === 0 ? 500 : 400,
-        }}
+        className={`endpoint-tree-row ${isOpen ? "is-open" : ""} ${depth === 0 ? "is-root-row" : ""}`}
+        style={{ "--path-indent": `${depth * 16}px` }}
       >
-        <td style={{ padding: "6px 12px" }}>
+        <td className="endpoint-method-cell">
           {hasSpecs ? (
-            <span style={{ display: "inline-flex", gap: 3 }}>
+            <span className="method-badge-list">
               {Array.from(new Set(node.specs.map((s) => s.method))).map((m) => (
-                <span key={m} style={{ fontSize: "0.75em", padding: "1px 5px", border: "1px solid #c5cfdc", borderRadius: 3, background: "#fff" }}>{m}</span>
+                <span key={m} className="method-badge">{m}</span>
               ))}
             </span>
-          ) : <span style={{ opacity: 0.4 }}>—</span>}
+          ) : <span className="spec-muted spec-blank">&nbsp;</span>}
         </td>
-        <td style={{ padding: "6px 12px", paddingLeft: 12 + indent }}>
+        <td className="endpoint-path-cell">
+          <span className="endpoint-path-line">
+            {hasMore ? (
+              <span className="tree-caret">
+                {isOpen ? "v" : ">"}
+              </span>
+            ) : <span className="tree-caret tree-caret-leaf">-</span>}
+            <span className="endpoint-path-text">/{node.name}</span>
+            {node._descAuth ? <span className="auth-badge">AUTH</span> : null}
+          </span>
           {hasMore ? (
-            <span style={{ marginRight: 6, opacity: 0.7, display: "inline-block", width: 12 }}>
-              {isOpen ? "▼" : "▶"}
-            </span>
-          ) : <span style={{ marginRight: 6, opacity: 0.3, display: "inline-block", width: 12 }}>·</span>}
-          <span>/{node.name}</span>
-          {node._descAuth ? <span style={{ marginLeft: 6, opacity: 0.65, fontSize: "0.85em" }}>🔒</span> : null}
-          {hasMore ? (
-            <span style={{ marginLeft: 8, opacity: 0.6, fontWeight: 400, fontSize: "0.82em" }}>
-              ({node._descSpecs} spec{node._descSpecs > 1 ? "s" : ""})
+            <span className="endpoint-path-meta">
+              {node._descSpecs}개 명세 포함
             </span>
           ) : null}
         </td>
-        <td style={{ padding: "6px 12px" }}>
-          {(node._descUnion || []).slice(0, 6).map((vt) => (
-            <span key={vt} className="node-status-pill node-status-pending" style={{ marginRight: 3, fontSize: "0.78em" }}>{vt}</span>
+        <td className="endpoint-vuln-cell">
+          {(node._descUnion || []).slice(0, 4).map((vt) => (
+            <span key={vt} className="node-status-pill node-status-pending">{vt}</span>
           ))}
-          {(node._descUnion || []).length > 6 ? <span style={{ opacity: 0.6, fontSize: "0.8em" }}>+{node._descUnion.length - 6}</span> : null}
+          {(node._descUnion || []).length > 4 ? <span className="spec-muted vuln-more">+{node._descUnion.length - 4}</span> : null}
         </td>
-        <td style={{ padding: "6px 12px", textAlign: "right", opacity: 0.7 }}>{node._descSeen}×</td>
+        <td className="spec-seen-cell">{node._descSeen}x</td>
       </tr>
       {isOpen ? (
         <>
@@ -1444,27 +1580,25 @@ function PathTreeRows({ node, depth, expanded, onToggle, selectedId, onSelectSpe
             <tr
               key={s.spec_id}
               onClick={(e) => { e.stopPropagation(); onSelectSpec(s.spec_id); }}
-              style={{
-                cursor: "pointer",
-                background: selectedId === s.spec_id ? "#dbe7fb" : "#fff",
-                borderBottom: "1px solid #f0f3f8",
-                color: "#1f2a3a",
-                fontSize: "0.92em",
-              }}
+              className={`endpoint-tree-row endpoint-method-row ${selectedId === s.spec_id ? "is-selected" : ""}`}
+              style={{ "--path-indent": `${(depth + 1) * 16}px` }}
             >
-              <td style={{ padding: "5px 12px" }}>
-                <span style={{ fontSize: "0.78em", padding: "1px 5px", border: "1px solid #c5cfdc", borderRadius: 3, background: "#fff" }}>{s.method}</span>
+              <td className="endpoint-method-cell">
+                <span className="method-badge">{s.method}</span>
               </td>
-              <td style={{ padding: "5px 12px", paddingLeft: 12 + indent + 24, opacity: 0.85 }}>
-                <span style={{ opacity: 0.5, marginRight: 4 }}>└ method</span>
-                {s.auth_required ? <span style={{ marginLeft: 6, opacity: 0.65 }}>🔒</span> : null}
+              <td className="endpoint-path-cell">
+                <span className="endpoint-path-line">
+                  <span className="tree-caret tree-caret-leaf">-</span>
+                  <span className="endpoint-path-text">동일 endpoint</span>
+                  {s.auth_required ? <span className="auth-badge">AUTH</span> : null}
+                </span>
               </td>
-              <td style={{ padding: "5px 12px" }}>
+              <td className="endpoint-vuln-cell">
                 {(s.suspected_vuln_types || []).map((vt) => (
-                  <span key={vt} className="node-status-pill node-status-pending" style={{ marginRight: 3, fontSize: "0.78em" }}>{vt}</span>
+                  <span key={vt} className="node-status-pill node-status-pending">{vt}</span>
                 ))}
               </td>
-              <td style={{ padding: "5px 12px", textAlign: "right", opacity: 0.7 }}>{s.times_seen}×</td>
+              <td className="spec-seen-cell">{s.times_seen}x</td>
             </tr>
           ))}
           {/* 자식 path 재귀 */}
@@ -1520,6 +1654,17 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
     });
   }, [data, filter, vulnFilter]);
 
+  useEffect(() => {
+    if (loading) return;
+    if (!filtered.length) {
+      if (selectedId !== null) setSelectedId(null);
+      return;
+    }
+    if (!filtered.some((s) => s.spec_id === selectedId)) {
+      setSelectedId(filtered[0].spec_id);
+    }
+  }, [filtered, loading, selectedId]);
+
   // 모든 spec 을 path segment 단위 N단계 트리로 빌드.
   // /api → /Users → {id} → /posts → {id} 식으로 무한 깊이 nest 가능.
   const pathTree = useMemo(() => buildPathTree(filtered), [filtered]);
@@ -1557,24 +1702,17 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div
-        className="modal-card modal-card-wide"
+        className="modal-card modal-card-wide endpoint-spec-modal"
         onClick={stopProp}
-        style={{
-          maxWidth: 1200,
-          width: "min(1200px, 100%)",
-          padding: 0,
-          display: "flex",
-          flexDirection: "column",
-          maxHeight: "85vh",
-          overflow: "hidden",
-        }}
       >
-        <div className="modal-head" style={{ padding: "16px 20px", borderBottom: "1px solid #e6ebf2" }}>
+        <div className="modal-head endpoint-spec-head">
           <div>
-            <h2 style={{ margin: 0 }}>📋 API 명세 (Endpoint Spec KB)</h2>
-            <div style={{ marginTop: 4, opacity: 0.7, fontSize: "0.85em" }}>
-              host: <code>{data.host || "-"}</code> · {data.count} specs
-              {targetUrl ? <span style={{ marginLeft: 8 }}>· target: <code>{targetUrl}</code></span> : null}
+            <div className="section-kicker">Endpoint Spec KB</div>
+            <h2>API 명세</h2>
+            <div className="endpoint-spec-meta">
+              <span>host <code>{data.host || "-"}</code></span>
+              <span>{data.count}개 명세</span>
+              {targetUrl ? <span>target <code>{targetUrl}</code></span> : null}
             </div>
           </div>
           <div className="modal-actions">
@@ -1583,37 +1721,32 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
           </div>
         </div>
 
-        <div style={{
-          padding: "10px 20px", display: "flex", gap: 8, alignItems: "center",
-          flexWrap: "wrap", background: "#f7f9fc", borderBottom: "1px solid #e6ebf2",
-        }}>
+        <div className="endpoint-spec-toolbar">
           <input
             type="text"
             placeholder="endpoint / sink / notes 검색…"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            style={{ flex: 1, minWidth: 200, padding: "7px 12px", border: "1px solid #ccd5e0", borderRadius: 4, background: "#fff" }}
           />
           <select
             value={vulnFilter}
             onChange={(e) => setVulnFilter(e.target.value)}
-            style={{ padding: "7px 10px", border: "1px solid #ccd5e0", borderRadius: 4, background: "#fff" }}
           >
-            <option value="">all vuln_types</option>
+            <option value="">전체 vuln_types</option>
             {allVulnTypes.map((vt) => (
               <option key={vt} value={vt}>{vt}</option>
             ))}
           </select>
-          <span style={{ opacity: 0.7, fontSize: "0.85em", color: "#5a6573" }}>{filtered.length} / {data.count}</span>
-          <button type="button" className="ghost-button" style={{ padding: "4px 10px", fontSize: "0.85em" }} onClick={expandAll}>전체 펼치기</button>
-          <button type="button" className="ghost-button" style={{ padding: "4px 10px", fontSize: "0.85em" }} onClick={collapseAll}>접기</button>
+          <span className="endpoint-spec-count">{filtered.length} / {data.count}</span>
+          <button type="button" className="ghost-button endpoint-spec-tool-button" onClick={expandAll}>전체 펼치기</button>
+          <button type="button" className="ghost-button endpoint-spec-tool-button" onClick={collapseAll}>접기</button>
         </div>
 
         {error ? <div className="callout callout-error">{error}</div> : null}
         {loading && !data.specs?.length ? <div className="callout callout-neutral">명세를 불러오는 중...</div> : null}
 
         {!loading && data.count === 0 ? (
-          <div className="callout callout-neutral" style={{ margin: 14 }}>
+          <div className="callout callout-neutral endpoint-spec-empty">
             이 host 에 누적된 endpoint 명세가 아직 없습니다. EntryPoint sub-agent 가
             <code> record_endpoint_spec</code> 를 호출하거나, 취약점 confirm 시 안전망이
             자동으로 명세를 만듭니다. discovery scan 을 한 번 더 돌리거나 같은 host
@@ -1621,15 +1754,21 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
           </div>
         ) : null}
 
-        <div style={{ display: "flex", flex: 1, overflow: "hidden", background: "#fff" }}>
-          <div style={{ flex: 1, overflowY: "auto", borderRight: "1px solid #e6ebf2" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.9em", background: "#fff" }}>
-              <thead style={{ position: "sticky", top: 0, background: "#eef2f7", zIndex: 1 }}>
+        <div className="endpoint-spec-body">
+          <div className="endpoint-spec-table-pane">
+            <table className="endpoint-spec-table">
+              <colgroup>
+                <col className="col-method" />
+                <col className="col-endpoint" />
+                <col className="col-vuln" />
+                <col className="col-seen" />
+              </colgroup>
+              <thead>
                 <tr>
-                  <th style={{ textAlign: "left", padding: "8px 12px", borderBottom: "2px solid #d3dae4", width: 70, color: "#1f2a3a" }}>method</th>
-                  <th style={{ textAlign: "left", padding: "8px 12px", borderBottom: "2px solid #d3dae4", color: "#1f2a3a" }}>endpoint</th>
-                  <th style={{ textAlign: "left", padding: "8px 12px", borderBottom: "2px solid #d3dae4", color: "#1f2a3a" }}>의심 vuln</th>
-                  <th style={{ textAlign: "right", padding: "8px 12px", borderBottom: "2px solid #d3dae4", width: 70, color: "#1f2a3a" }}>seen</th>
+                  <th>method</th>
+                  <th>endpoint</th>
+                  <th>의심 vuln</th>
+                  <th>seen</th>
                 </tr>
               </thead>
               <tbody>
@@ -1646,21 +1785,21 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
           </div>
 
           {selected ? (
-            <div style={{ width: 440, padding: 18, overflowY: "auto", background: "#f7f9fc", color: "#1f2a3a" }}>
-              <div style={{ marginBottom: 8 }}>
-                <strong style={{ fontSize: "1.1em" }}>{selected.method} {selected.endpoint}</strong>
-                {selected.auth_required ? <span style={{ marginLeft: 8 }}>🔒 auth</span> : null}
+            <div className="endpoint-spec-detail-pane">
+              <div className="endpoint-spec-detail-title">
+                <strong>{selected.method} {selected.endpoint}</strong>
+                {selected.auth_required ? <span className="auth-badge">AUTH</span> : null}
               </div>
-              <div style={{ opacity: 0.7, fontSize: "0.85em", marginBottom: 12 }}>
-                seen {selected.times_seen}×{selected.last_seen_at ? ` · last ${selected.last_seen_at.slice(0, 19).replace("T", " ")}` : ""}
+              <div className="endpoint-spec-detail-meta">
+                seen {selected.times_seen}x{selected.last_seen_at ? ` / last ${selected.last_seen_at.slice(0, 19).replace("T", " ")}` : ""}
               </div>
 
               {selected.suspected_vuln_types?.length ? (
                 <div className="node-panel-section">
                   <div className="mini-title">의심 vuln_types</div>
-                  <div>
+                  <div className="endpoint-spec-pill-row">
                     {selected.suspected_vuln_types.map((vt) => (
-                      <span key={vt} className="node-status-pill node-status-pending" style={{ marginRight: 4 }}>{vt}</span>
+                      <span key={vt} className="node-status-pill node-status-pending">{vt}</span>
                     ))}
                   </div>
                 </div>
@@ -1697,13 +1836,13 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
               {selected.notes ? (
                 <div className="node-panel-section">
                   <div className="mini-title">Notes</div>
-                  <div style={{ whiteSpace: "pre-wrap", fontSize: "0.9em", opacity: 0.85 }}>{selected.notes}</div>
+                  <div className="endpoint-spec-notes">{selected.notes}</div>
                 </div>
               ) : null}
             </div>
           ) : (
-            <div style={{ width: 440, padding: 24, fontSize: "0.9em", background: "#f7f9fc", color: "#5a6573" }}>
-              ← 좌측 표에서 endpoint 를 선택하면 상세 명세 (params / sinks / response shape / notes) 가 보입니다.
+            <div className="endpoint-spec-empty-detail">
+              좌측 표에서 endpoint 를 선택하면 상세 명세, params, sinks, response shape, notes 가 보입니다.
             </div>
           )}
         </div>
@@ -1787,7 +1926,7 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
       { key: "explored", count: stats.explored, label: "\ud0d0\uc0c9 \uc644\ub8cc" },
       { key: "exploring", count: stats.exploring, label: "\ud0d0\uc0c9 \uc911" },
       { key: "pending", count: stats.pending, label: "\ub300\uae30" },
-      { key: "dead_end", count: stats.dead_end, label: "\ub9c9\ub2e4\ub978 \uacf5" },
+      { key: "dead_end", count: stats.dead_end, label: "\ub9c9\ub2e4\ub978 \uacf3" },
     ].filter((s) => s.count > 0);
   }, [stats]);
 
@@ -1860,9 +1999,10 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
     dragRef.current = null;
   }, []);
 
-  const fitToView = useCallback(() => {
+  const fitToView = useCallback((minScale = ZOOM_MIN) => {
     const vp = vpRef.current;
     if (!vp || !positions.size) return;
+    const lowerBound = typeof minScale === "number" ? minScale : ZOOM_MIN;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const { x, y } of positions.values()) {
       if (x < minX) minX = x;
@@ -1874,13 +2014,29 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
     const w = maxX - minX + pad * 2;
     const h = maxY - minY + pad * 2;
     const rect = vp.getBoundingClientRect();
-    const s = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.min(rect.width / w, rect.height / h)));
+    const s = Math.max(lowerBound, Math.min(ZOOM_MAX, Math.min(rect.width / w, rect.height / h)));
     setZoom(s);
     setPan({ x: (rect.width - w * s) / 2 - minX * s + pad * s, y: (rect.height - h * s) / 2 - minY * s + pad * s });
   }, [positions]);
 
+  const selectAndFocusNode = useCallback((nodeId) => {
+    if (!nodeId) {
+      setSelectedNodeId(null);
+      return;
+    }
+    setSelectedNodeId(nodeId);
+    const pos = positions.get(nodeId);
+    const vp = vpRef.current;
+    if (!pos || !vp) return;
+    const rect = vp.getBoundingClientRect();
+    setPan({
+      x: rect.width / 2 - (pos.x + CARD_W / 2) * zoom,
+      y: rect.height / 2 - (pos.y + CARD_H / 2) * zoom,
+    });
+  }, [positions, zoom]);
+
   useEffect(() => {
-    if (positions.size && zoom === 1 && pan.x === 40 && pan.y === 40) fitToView();
+    if (positions.size && zoom === 1 && pan.x === 40 && pan.y === 40) fitToView(0.72);
   }, [positions, fitToView, zoom, pan]);
 
   return (
@@ -1891,7 +2047,7 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
             <div className="section-kicker">Discovery</div>
             <h2>탐색 캔버스</h2>
           </div>
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <div className="canvas-head-actions">
             <span className="canvas-zoom-label">{Math.round(zoom * 100)}%</span>
             <button type="button" className="icon-button" title="화면 맞춤" onClick={fitToView}>⊞</button>
             <button type="button" className="icon-button" title="새로고침" onClick={fetchTree}>↻</button>
@@ -1900,29 +2056,41 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
         </div>
 
         <div className="discovery-stats">
-          <span>노드 <strong>{stats.total}</strong></span>
-          <span>확정 <strong>{stats.confirmed}</strong></span>
-          <span>막다른 곳 <strong>{stats.dead_end}</strong></span>
-          <span>대기 <strong>{stats.pending}</strong></span>
-          <span>최대 깊이 <strong>{stats.maxDepth}</strong></span>
+          <div className="discovery-stat-chip"><span>노드</span><strong>{stats.total}</strong></div>
+          <div className="discovery-stat-chip tone-confirmed"><span>확정</span><strong>{stats.confirmed}</strong></div>
+          <div className="discovery-stat-chip tone-explored"><span>완료</span><strong>{stats.explored}</strong></div>
+          <div className="discovery-stat-chip tone-exploring"><span>탐색 중</span><strong>{stats.exploring}</strong></div>
+          <div className="discovery-stat-chip tone-pending"><span>대기</span><strong>{stats.pending}</strong></div>
+          <div className="discovery-stat-chip tone-dead"><span>막다른 곳</span><strong>{stats.dead_end}</strong></div>
+          <div className="discovery-stat-chip"><span>최대 깊이</span><strong>{stats.maxDepth}</strong></div>
         </div>
 
         {resumeInfo && resumeInfo.total > 0 ? (
-          <div className="callout callout-neutral" style={{ marginTop: 8, padding: "6px 10px", fontSize: "0.9em" }}>
-            ↻ 이전 scan 이어받음 (<code>{resumeInfo.prev_run_id.slice(0, 8) || "?"}</code>)
+          <div className="callout callout-neutral discovery-resume-callout">
+            이전 scan 이어받음 (<code>{resumeInfo.prev_run_id.slice(0, 8) || "?"}</code>)
             — endpoint <strong>{resumeInfo.endpoints}</strong>
             · 재검증 vuln <strong>{resumeInfo.vulns}</strong>
             · prev dead_end <strong>{resumeInfo.dead}</strong>
             · clue/exploit <strong>{resumeInfo.clues}</strong>
-            <span style={{ opacity: 0.6, marginLeft: 6 }}>(cold-start 회피 + 패치 검증)</span>
+            <span className="discovery-resume-note">(cold-start 회피 + 패치 검증)</span>
           </div>
         ) : null}
 
         {stats.total > 0 ? (
-          <div className="discovery-bar">
-            {barSegments.map((seg) => (
-              <div key={seg.key} className={`discovery-bar-seg discovery-bar-${seg.key}`} style={{ flex: seg.count }} title={`${seg.label}: ${seg.count}`} />
-            ))}
+          <div className="discovery-bar-wrap">
+            <div className="discovery-bar">
+              {barSegments.map((seg) => (
+                <div key={seg.key} className={`discovery-bar-seg discovery-bar-${seg.key}`} style={{ flex: seg.count }} title={`${seg.label}: ${seg.count}`} />
+              ))}
+            </div>
+            <div className="discovery-legend">
+              {barSegments.map((seg) => (
+                <span key={seg.key}>
+                  <i className={`discovery-legend-dot discovery-bar-${seg.key}`} />
+                  {seg.label} <strong>{seg.count}</strong>
+                </span>
+              ))}
+            </div>
           </div>
         ) : null}
 
@@ -1960,6 +2128,7 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
               findings={findings}
               endpointSpecs={endpointSpecs}
               onClose={() => setSelectedNodeId(null)}
+              onSelectNode={selectAndFocusNode}
             />
           ) : null}
         </div>
@@ -2287,13 +2456,18 @@ export default function App() {
       <header className="app-header">
         <div>
           <div className="brand-row">
-            <div className="brand-mark">WATCHDOG</div>
+            <div className="brand-mark">
+              <span className="brand-sigil" aria-hidden="true" />
+              <span>WATCHDOG</span>
+            </div>
+            <span className="brand-version">Security Ops</span>
           </div>
         </div>
 
         <div className="header-actions">
           <button type="button" className="primary-button" onClick={() => setShowNewScan(true)}>
-            새 스캔
+            <span className="button-icon" aria-hidden="true">+</span>
+            <span>새 스캔</span>
           </button>
         </div>
       </header>

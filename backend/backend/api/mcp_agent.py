@@ -520,6 +520,8 @@ EXTENDED_LIMIT_TOOLS = {
 HTTP_RESULT_TOOLS = {"http_request", "curl_request", "http_session_request"}
 AUTO_AUTH_TOOLS = {"http_request", "http_session_request", "curl_request"}
 AUTO_AUTH_SKIP_PATHS = ("/login", "/signin", "/sign-in", "/auth/login", "/register")
+BUG_BOUNTY_UA_TOOLS = {"http_request", "http_session_request", "curl_request", "multi_http_probe"}
+_BUG_BOUNTY_UA_CACHE: dict[str, str | None] = {}
 HTTP_HEADERS_TO_KEEP = {
     "content-type", "location", "set-cookie", "server", "cache-control",
     "x-frame-options", "x-content-type-options", "x-xss-protection",
@@ -822,6 +824,57 @@ def _maybe_inject_auto_auth(scan_run: ScanRun, tool_name: str, tool_args: dict) 
     return updated
 
 
+def _build_bug_bounty_ua(scan_run: ScanRun) -> str | None:
+    run_id = str(scan_run.run_id)
+    if run_id in _BUG_BOUNTY_UA_CACHE:
+        return _BUG_BOUNTY_UA_CACHE[run_id]
+    bb_id = (scan_run.config or {}).get("bug_bounty_ua", "")
+    if not bb_id or not str(bb_id).strip():
+        _BUG_BOUNTY_UA_CACHE[run_id] = None
+        return None
+    ua = f"WatchdogMCP/1.0 (BugBounty: {str(bb_id).strip()})"
+    _BUG_BOUNTY_UA_CACHE[run_id] = ua
+    return ua
+
+
+def _maybe_inject_bug_bounty_ua(scan_run: ScanRun, tool_name: str, tool_args: dict) -> dict:
+    if tool_name not in BUG_BOUNTY_UA_TOOLS:
+        return tool_args
+
+    ua = _build_bug_bounty_ua(scan_run)
+    if not ua:
+        return tool_args
+
+    updated = dict(tool_args)
+
+    if tool_name == "multi_http_probe":
+        try:
+            req_list = json.loads(updated.get("requests_json", "[]"))
+        except (json.JSONDecodeError, TypeError):
+            return updated
+        for item in req_list:
+            hdrs = item.get("headers") or {}
+            if not isinstance(hdrs, dict):
+                hdrs = {}
+            hdrs["User-Agent"] = ua
+            item["headers"] = hdrs
+        updated["requests_json"] = json.dumps(req_list, ensure_ascii=False)
+    elif tool_name == "curl_request":
+        headers = _parse_curl_headers(updated.get("headers", ""))
+        headers["User-Agent"] = ua
+        updated["headers"] = _dump_curl_headers(headers)
+    elif tool_name == "http_session_request":
+        headers = _parse_json_headers(updated.get("headers_json", "{}"))
+        headers["User-Agent"] = ua
+        updated["headers_json"] = _compact_json(headers)
+    else:
+        headers = _parse_json_headers(updated.get("headers", "{}"))
+        headers["User-Agent"] = ua
+        updated["headers"] = _compact_json(headers)
+
+    return updated
+
+
 def _summarize_set_cookie(value: str) -> str:
     parts = [part.strip() for part in value.split(";") if part.strip()]
     if not parts:
@@ -842,6 +895,132 @@ def _looks_like_spa_fallback(content_type: str, body: str) -> bool:
         "<html" in lowered
         and ("<div id=\"root\"" in lowered or "type=\"module\"" in lowered or "<title>" in lowered)
     )
+
+
+import re as _re
+
+_LINK_EXTRACT_RE_HTML = [
+    _re.compile(r'<a\s[^>]*?href\s*=\s*["\']([^"\'#][^"\']*)', _re.I),
+    _re.compile(r'<form\s[^>]*?action\s*=\s*["\']([^"\'#][^"\']*)', _re.I),
+    _re.compile(r'<link\s[^>]*?href\s*=\s*["\']([^"\'#][^"\']*)', _re.I),
+    _re.compile(r'<iframe\s[^>]*?src\s*=\s*["\']([^"\'#][^"\']*)', _re.I),
+    _re.compile(r'<script\s[^>]*?src\s*=\s*["\']([^"\'#][^"\']*)', _re.I),
+    _re.compile(r'<meta\s[^>]*?content\s*=\s*["\'][^"\']*url\s*=\s*([^"\';\s]+)', _re.I),
+    _re.compile(r'(?:window\.location|location\.href)\s*=\s*["\']([^"\']+)', _re.I),
+]
+_LINK_EXTRACT_RE_JS = [
+    _re.compile(r'''(?:fetch|axios\.(?:get|post|put|delete|patch))\s*\(\s*[`'"](\/[^`'"]*?)[`'"]'''),
+    _re.compile(r'''(?:fetch|axios\.(?:get|post|put|delete|patch))\s*\(\s*[`'"](https?://[^`'"]+)[`'"]'''),
+    _re.compile(r'''\.open\s*\(\s*[`'"]\w+[`'"]\s*,\s*[`'"](\/[^`'"]+)[`'"]'''),
+    _re.compile(r'''\.open\s*\(\s*[`'"]\w+[`'"]\s*,\s*[`'"](https?://[^`'"]+)[`'"]'''),
+    _re.compile(r'''[`'"](?:\$\{[^}]+\})?(\/api\/[^`'"]{2,})[`'"]'''),
+    _re.compile(r'''[`'"](\/(?:api|v[0-9]+|admin|auth|graphql|rest|internal|private|debug|swagger|docs)[\/][^`'"]{1,})[`'"]'''),
+]
+# url: key matching uses depth-aware extraction (top-level only, no nested sub-objects)
+_LINK_EXTRACT_RE_JS_BASE_URL = _re.compile(r'''baseURL\s*:\s*[`'"](https?://[^`'"]{4,})[`'"]''')
+_LINK_EXTRACT_RE_JSON = _re.compile(r'"(?:href|url|uri|link|redirect|next|action|src|endpoint|path)"\s*:\s*"(\/[^"]{2,}|https?://[^"]{4,})"', _re.I)
+
+_STATIC_EXT = frozenset({
+    ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+    ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp", ".avif",
+    ".mp4", ".mp3", ".pdf",
+})
+
+
+def _extract_links_from_response(
+    body: str, content_type: str, response_headers: dict, request_url: str,
+) -> list[str]:
+    """Extract URLs/paths from an HTTP response (HTML/JSON/headers).
+
+    Returns deduplicated, sorted list of discovered paths/URLs.
+    Filters out static assets (images, fonts, CSS) that have no attack surface.
+    """
+    from urllib.parse import urljoin, urlparse as _urlparse
+
+    found: set[str] = set()
+    ct_lower = (content_type or "").lower()
+
+    # 1. Response headers: Location, Link, Refresh
+    for hdr_name in ("location", "link", "refresh", "content-location"):
+        val = ""
+        for k, v in (response_headers or {}).items():
+            if k.lower() == hdr_name:
+                val = str(v)
+                break
+        if val:
+            if hdr_name == "link":
+                for m in _re.findall(r'<([^>]+)>', val):
+                    found.add(m)
+            elif hdr_name == "refresh" and "url=" in val.lower():
+                idx = val.lower().index("url=")
+                found.add(val[idx + 4:].strip().strip("'\""))
+            else:
+                found.add(val.strip())
+
+    # 2. HTML body
+    if body and ("html" in ct_lower or body.lstrip()[:15].lower().startswith(("<!doctype", "<html"))):
+        for pat in _LINK_EXTRACT_RE_HTML:
+            for m in pat.findall(body):
+                found.add(m)
+
+    # 3. JSON body
+    if body and ("json" in ct_lower or body.lstrip()[:1] in ("{", "[")):
+        for m in _LINK_EXTRACT_RE_JSON.findall(body):
+            found.add(m)
+
+    # 4. JS patterns (inline scripts or JS content-type)
+    js_relative: list[str] = []
+    if body and ("javascript" in ct_lower or "html" in ct_lower):
+        for pat in _LINK_EXTRACT_RE_JS:
+            for m in pat.findall(body):
+                found.add(m)
+                if m.startswith("/"):
+                    js_relative.append(m)
+
+    # 4b. Object-literal depth-aware extraction (top-level keys only)
+    if body and ("javascript" in ct_lower or "html" in ct_lower):
+        for bu in _LINK_EXTRACT_RE_JS_BASE_URL.findall(body):
+            found.add(bu)
+        from watchdog_mcp.link_extractor import _extract_baseurl_url_pairs, _extract_depth1_js_urls
+        for combined in _extract_baseurl_url_pairs(body):
+            found.add(combined)
+        for url_val in _extract_depth1_js_urls(body):
+            found.add(url_val)
+
+    # Normalize: resolve relative URLs against request_url
+    normalized: set[str] = set()
+    base = request_url or ""
+    for raw in found:
+        raw = raw.strip()
+        if not raw or raw.startswith(("data:", "javascript:", "mailto:", "tel:", "#")):
+            continue
+        if raw.startswith("//"):
+            raw = "https:" + raw
+        if not raw.startswith(("http://", "https://", "/")):
+            if base:
+                raw = urljoin(base, raw)
+            else:
+                continue
+        # Convert absolute same-origin URLs to paths
+        if raw.startswith(("http://", "https://")) and base:
+            try:
+                raw_p = _urlparse(raw)
+                base_p = _urlparse(base)
+                if raw_p.netloc.lower() == base_p.netloc.lower():
+                    raw = raw_p.path + ("?" + raw_p.query if raw_p.query else "")
+            except Exception:
+                pass
+        # Filter out static assets
+        try:
+            path_part = _urlparse(raw).path if raw.startswith("http") else raw.split("?")[0]
+            ext = "." + path_part.rsplit(".", 1)[-1].lower() if "." in path_part.rsplit("/", 1)[-1] else ""
+            if ext in _STATIC_EXT:
+                continue
+        except Exception:
+            pass
+        normalized.add(raw)
+
+    return sorted(normalized)[:50]
 
 
 def _compact_http_tool_result(text: str) -> str:
@@ -879,42 +1058,277 @@ def _compact_http_tool_result(text: str) -> str:
         compact["body_preview"] = _truncate_tool_result(body, preview_limit)
     if _looks_like_spa_fallback(content_type, body):
         compact["spa_fallback_html"] = True
+
+    # Prefer pre-extracted links from MCP tool (extracted from full body at source).
+    # Fall back to re-extracting from the (already truncated) body in compact.
+    pre_links = data.get("discovered_links")
+    if isinstance(pre_links, list) and pre_links:
+        compact["discovered_links"] = pre_links
+    else:
+        raw_headers = data.get("response_headers") if isinstance(data.get("response_headers"), dict) else {}
+        discovered = _extract_links_from_response(body, content_type, raw_headers, data.get("url", ""))
+        if discovered:
+            compact["discovered_links"] = discovered
+
+    # SPA hash routes — surface to LLM for browser_navigate exploration
+    pre_hashes = data.get("hash_routes")
+    if isinstance(pre_hashes, list) and pre_hashes:
+        compact["hash_routes"] = pre_hashes
+
     return _compact_json(compact)
+
+
+_AUTO_PUSH_TOOLS = {"http_request", "http_session_request", "multi_http_probe"}
+
+
+def _auto_push_discovered_links(
+    scan_run: ScanRun, raw_text: str, tool_name: str, current_node_id: str = "",
+):
+    """Safety net: extract links from raw HTTP response and auto-push as endpoint nodes.
+
+    Runs synchronously (called via sync_to_async). Creates DiscoveryNode objects
+    directly with dedup checks, avoiding the need to call the MCP tool function.
+
+    Prefers pre-extracted `discovered_links` from tool responses (extracted at source
+    from the full body). Falls back to re-extracting from the truncated body/body_preview.
+    Handles formats: http_request ({status_code,body}), multi_http_probe ({results:[...]}),
+    http_session_request ({status_code,body}).
+
+    When current_node_id is provided, new endpoints are pushed as children of that node
+    (preserving the exploration chain context). Falls back to root node when unavailable.
+    """
+    from api.models import DiscoveryNode
+    from watchdog_mcp.tools_discovery import _normalize_ep, _merge_context, DISCOVERY_MAX_NODES
+
+    root_node_id = (scan_run.config or {}).get("_root_node_id")
+    if not root_node_id:
+        return
+
+    # Prefer current node as parent to preserve exploration chain context;
+    # fall back to root node if current_node_id is unavailable or invalid.
+    parent_node = None
+    if current_node_id:
+        try:
+            parent_node = DiscoveryNode.objects.get(node_id=current_node_id)
+        except DiscoveryNode.DoesNotExist:
+            pass
+    if parent_node is None:
+        try:
+            parent_node = DiscoveryNode.objects.get(node_id=root_node_id)
+        except DiscoveryNode.DoesNotExist:
+            return
+
+    try:
+        data = json.loads(raw_text)
+    except Exception:
+        return
+
+    # Collect (response_dict, source_url) tuples from various tool output formats
+    responses: list[dict] = []
+    if isinstance(data, dict):
+        if "status_code" in data:
+            responses.append(data)
+        elif "results" in data and isinstance(data["results"], list):
+            for item in data["results"]:
+                if isinstance(item, dict) and "status_code" in item:
+                    responses.append(item)
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and "status_code" in item:
+                responses.append(item)
+
+    scan_run_id = str(scan_run.run_id)
+    target_url = scan_run.target_url or ""
+    all_links: list[tuple[str, str]] = []  # (link, source_ep)
+    all_hash_routes: set[str] = set()
+
+    for resp in responses:
+        status_code = resp.get("status_code", 0)
+        if isinstance(status_code, int) and status_code >= 400:
+            ct = str(resp.get("content_type", "") or "").lower()
+            has_pre_links = isinstance(resp.get("discovered_links"), list) and resp["discovered_links"]
+            if not has_pre_links and "html" not in ct:
+                continue
+
+        request_url = str(resp.get("url", "") or "")
+        source_ep = request_url
+        if source_ep.startswith(("http://", "https://")):
+            try:
+                source_ep = urlparse(source_ep).path
+            except Exception:
+                pass
+
+        # Collect hash routes from pre-extracted data
+        pre_hashes = resp.get("hash_routes")
+        if isinstance(pre_hashes, list):
+            for h in pre_hashes:
+                if isinstance(h, str):
+                    all_hash_routes.add(h)
+
+        # Prefer pre-extracted links (from full body at MCP tool level)
+        pre_links = resp.get("discovered_links")
+        if isinstance(pre_links, list) and pre_links:
+            for link in pre_links:
+                if isinstance(link, str):
+                    all_links.append((link, source_ep))
+        else:
+            body = str(resp.get("body") or resp.get("body_preview") or "")
+            content_type = str(resp.get("content_type", "") or "")
+            raw_headers = resp.get("response_headers") or resp.get("headers") or {}
+            if not isinstance(raw_headers, dict):
+                raw_headers = {}
+            from watchdog_mcp.link_extractor import extract_links_and_hashes
+            links, hashes = extract_links_and_hashes(body, content_type, raw_headers, request_url)
+            for link in links:
+                all_links.append((link, source_ep))
+            all_hash_routes.update(hashes)
+
+    if not all_links and not all_hash_routes:
+        return
+
+    existing_count = DiscoveryNode.objects.filter(scan_run_id=scan_run_id).count()
+    if existing_count >= DISCOVERY_MAX_NODES:
+        return
+
+    parent_depth = parent_node.depth if parent_node else 0
+    pushed = 0
+
+    # Auto-push discovered endpoint links
+    for link, source_ep in all_links[:30]:
+        ep_norm = _normalize_ep(link, target_url)
+        ep_variants = {link, ep_norm, ep_norm.rstrip("/"), ep_norm + "/",
+                       ep_norm.lower()}
+        if "?" not in ep_norm:
+            ep_variants.add(ep_norm.split("?", 1)[0])
+        ep_variants.discard("")
+
+        existing = (
+            DiscoveryNode.objects
+            .filter(scan_run_id=scan_run_id, node_type="endpoint")
+            .filter(endpoint__in=ep_variants)
+            .filter(vuln_type="")
+            .first()
+        )
+        if existing:
+            _merge_context(existing, {
+                "discovered_from": source_ep,
+                "source": "auto_link_extraction",
+            })
+            continue
+
+        try:
+            DiscoveryNode.objects.create(
+                scan_run_id=scan_run_id,
+                parent=parent_node,
+                depth=parent_depth + 1,
+                node_type="endpoint",
+                endpoint=ep_norm,
+                vuln_type="",
+                summary=f"Auto-discovered via {source_ep}",
+                context={
+                    "discovered_from": source_ep,
+                    "source": "auto_link_extraction",
+                    "http_tool": tool_name,
+                },
+                status="pending",
+            )
+            pushed += 1
+        except Exception:
+            pass
+
+        if existing_count + pushed >= DISCOVERY_MAX_NODES:
+            break
+
+    # Auto-push SPA hash routes as clue nodes (need browser navigation to trigger APIs)
+    for route in sorted(all_hash_routes)[:15]:
+        if existing_count + pushed >= DISCOVERY_MAX_NODES:
+            break
+        route_norm = route.strip()
+        if not route_norm or len(route_norm) < 3:
+            continue
+
+        existing = (
+            DiscoveryNode.objects
+            .filter(scan_run_id=scan_run_id, node_type="clue")
+            .filter(endpoint=route_norm)
+            .first()
+        )
+        if existing:
+            continue
+
+        try:
+            DiscoveryNode.objects.create(
+                scan_run_id=scan_run_id,
+                parent=parent_node,
+                depth=parent_depth + 1,
+                node_type="clue",
+                endpoint=route_norm,
+                vuln_type="",
+                summary=f"SPA hash route — browser_navigate to discover APIs",
+                context={
+                    "source": "auto_hash_route_extraction",
+                    "http_tool": tool_name,
+                    "needs_browser": True,
+                },
+                status="pending",
+            )
+            pushed += 1
+        except Exception:
+            pass
+
+    if pushed:
+        logger.info(
+            f"[{scan_run.run_id}] auto-pushed {pushed} discovered links/routes "
+            f"from {tool_name} ({all_links[0][1] if all_links else 'N/A'})"
+        )
 
 
 async def _execute_single_tool(
     scan_run: ScanRun,
     tool_router: dict,
     tb,
+    current_node_id: str = "",
 ) -> dict:
     raise_if_stop_requested(scan_run)
     tool_name = tb.name
     tool_args = dict(tb.input or {})
     tool_args = _maybe_inject_auto_auth(scan_run, tool_name, tool_args)
+    tool_args = _maybe_inject_bug_bounty_ua(scan_run, tool_name, tool_args)
     logger.info(
         f"[{scan_run.run_id}] tool {tool_name}"
         f"({json.dumps(tool_args, ensure_ascii=False)[:200]})"
     )
+    raw_text = ""
     try:
         if tool_name in tool_router:
             session, original = tool_router[tool_name]
             result = await session.call_tool(original, tool_args)
             if result.content:
-                text = "\n".join(
+                raw_text = "\n".join(
                     c.text if hasattr(c, "text") else str(c)
                     for c in result.content
                 )
             else:
-                text = "(빈 결과)"
+                raw_text = "(빈 결과)"
             is_error = bool(getattr(result, "isError", False))
         else:
-            text = f"도구 {tool_name} 차단 — 이 role 화이트리스트에 없음."
+            raw_text = f"도구 {tool_name} 차단 — 이 role 화이트리스트에 없음."
             is_error = True
     except Exception as e:
         logger.error(f"[{scan_run.run_id}] tool error {tool_name}: {e}")
-        text = f"도구 오류: {e}"
+        raw_text = f"도구 오류: {e}"
         is_error = True
 
+    # Auto-push discovered links from HTTP responses (safety net)
+    if tool_name in _AUTO_PUSH_TOOLS and not is_error:
+        try:
+            await sync_to_async(_auto_push_discovered_links)(
+                scan_run, raw_text, tool_name, current_node_id,
+            )
+        except Exception as e:
+            logger.debug(f"[{scan_run.run_id}] auto-push links error: {e}")
+
+    text = raw_text
     if tool_name in HTTP_RESULT_TOOLS and not is_error:
         text = _compact_http_tool_result(text)
     limit = _tool_result_limit(tool_name)
@@ -930,6 +1344,7 @@ async def _execute_tool_calls(
     scan_run: ScanRun,
     tool_router: dict,
     tool_use_blocks: list,
+    current_node_id: str = "",
 ) -> list[dict]:
     """LLM 한 턴의 tool_use 블록을 실행한다.
 
@@ -950,13 +1365,13 @@ async def _execute_tool_calls(
 
         async def _bounded(tb):
             async with sem:
-                return await _execute_single_tool(scan_run, tool_router, tb)
+                return await _execute_single_tool(scan_run, tool_router, tb, current_node_id)
 
         gathered = await asyncio.gather(*[_bounded(tb) for tb in parallel_blocks])
         results.extend(gathered)
 
     for tb in sequential_blocks:
-        results.append(await _execute_single_tool(scan_run, tool_router, tb))
+        results.append(await _execute_single_tool(scan_run, tool_router, tb, current_node_id))
 
     return results
 
@@ -971,6 +1386,7 @@ async def _run_role_phase(
     initial_user_message: str,
     acc: _Accumulator,
     max_turns: int = MAX_TURNS_PER_ROLE,
+    current_node_id: str = "",
 ) -> tuple[str, list[dict]]:
     """한 role의 conversation을 끝까지 돌리고 (최종 텍스트, 메시지 히스토리) 반환.
 
@@ -1133,7 +1549,9 @@ async def _run_role_phase(
             break
 
         messages.append({"role": "assistant", "content": response.content})
-        tool_results = await _execute_tool_calls(scan_run, tool_router, tool_use_blocks)
+        tool_results = await _execute_tool_calls(
+            scan_run, tool_router, tool_use_blocks, current_node_id,
+        )
 
         await sync_to_async(record_llm_trace)(
             scan_run=scan_run,
@@ -1180,6 +1598,16 @@ async def _run_multi_agent_loop(
     )
 
     scan_config = scan_run.config or {}
+
+    bb_ua = _build_bug_bounty_ua(scan_run)
+    bb_hint = ""
+    if bb_ua:
+        bb_hint = (
+            f"\n[BUG-BOUNTY] User-Agent 자동 주입 활성: {bb_ua}\n"
+            "  모든 http_request/multi_http_probe/curl_request/http_session_request 에 자동 적용됨.\n"
+            "  브라우저 사용 시 browser_set_user_agent 를 먼저 호출하세요."
+        )
+
     cred_list = _normalize_credential_list(scan_config.get("credentials"))
     auth_hint = ""
     if cred_list:
@@ -1226,6 +1654,7 @@ async def _run_multi_agent_loop(
         f"타겟 URL: {scan_run.target_url}\n"
         f"스캔 ID: {scan_run.run_id}\n"
         f"{auth_hint}\n"
+        f"{bb_hint}\n"
         f"{source_hint}\n"
         f"위 타겟을 정찰하고 hypotheses(JSON)를 출력하세요."
     )
@@ -1759,6 +2188,17 @@ For EACH suspected vuln_type:
                                "kb_pattern_hints":[<pattern_id>...]})
   create_candidate_manual(...) — also register Candidate.
 
+For EACH new URL/API discovered in HTTP responses (HTML links, JSON hrefs,
+redirect Location headers, form actions, JS fetch/axios URLs, Set-Cookie paths):
+  push_discovery(parent_node_id=<this endpoint node_id>, node_type="endpoint",
+                 endpoint="/new-path",
+                 summary="Discovered via <current-endpoint> response",
+                 context_json={"discovered_from":"<current-endpoint>",
+                               "methods":[...], "source":"response_link"})
+  ⚠ parent 는 현재 탐색 중인 너의 node_id — 체인 컨텍스트(세션, 인증, 발견경로)를
+  보존하기 위함. 다음 에이전트가 get_chain_context 로 너의 맥락을 물려받는다.
+  dedup 이 자동 처리하므로 이미 있는 endpoint 도 안전하게 push 가능.
+
 If clean after inspection → mark_dead_end. If interesting non-vuln signal
 (stack trace, internal URL, leaked token) → push "clue" or store_secret.
 
@@ -1824,6 +2264,13 @@ prior recheck, sink info).
 ⚠️ 안전망: confirm_finding 호출 시 backend 가 candidate→endpoint+vuln_type 매칭으로
 연결된 vuln 노드를 자동으로 confirmed 전이. 그러나 save_evidence/
 record_pattern_use 누락은 자동 보완 불가 — 너가 명시 호출해야 KB 누적.
+
+## Recursive endpoint discovery
+payload 테스트 중 HTTP 응답에서 새 URL/API 를 발견하면 (redirect, error page 의
+link, JSON 내 href, stack trace 경로 등) push_discovery(node_type="endpoint",
+parent_node_id=<this vuln node_id>, endpoint="/new-path") 로 등록하라.
+parent 를 현재 노드로 해야 체인(세션/인증) 맥락이 보존된다.
+vuln 테스트가 주 역할이지만 새 attack surface 발견도 자산이다.
 
 자율성: KB 는 권장이지만 source 분석으로 더 좋은 가설이 있으면 그걸 우선해도 OK.
 """
@@ -2007,6 +2454,68 @@ shared state (store_secret, add_scan_note, push_discovery).
 - When [BUDGET] shows <= 3 remaining, stop exploring and finalize: push remaining
   leads as nodes (with FULL context_json), or mark_dead_end if truly nothing.
 
+## Cross-node knowledge sharing (★ 중요)
+다른 브랜치의 에이전트가 이미 유용한 것을 발견했을 수 있다.
+탐색 시작 시 반드시:
+1. get_secrets() — 다른 워커가 저장한 세션 쿠키, admin 토큰, API 키, 크레덴셜 확인.
+2. get_scan_notes("architecture") — 앱 구조, 프레임워크, 인증 방식 등 정보 확인.
+3. get_siblings() — 형제 노드의 상태와 발견 요약 확인.
+
+### 발견 공유 규칙
+- 세션/토큰/크레덴셜 → store_secret(key="admin_session", value=..., category="credential")
+  즉시 저장. 다른 워커가 같은 세션을 바로 사용할 수 있다.
+- 아키텍처 발견 → add_scan_note("architecture", "Express.js + MongoDB, JWT auth, ...")
+- 비즈니스 로직/레이스 컨디션 단서 → push_discovery(node_type="clue") + context_json에 상세 기록.
+- 복합 공격 프리미티브 → store_secret(key="ssrf_internal_<endpoint>", value=..., category="primitive")
+  핸드오프 키 네이밍: category는 "credential" | "primitive" | "csrf_token" | "session",
+  key 형식은 "<type>_<context>" (예: "admin_jwt", "ssrf_internal_metadata",
+  "csrf_token_/transfer", "race_coupon_apply").
+
+### 세션/토큰 유효성 검증
+다른 워커의 세션을 재사용할 때는 먼저 간단한 요청으로 유효성을 확인할 것.
+만료되었다면:
+1. 원래 세션을 얻은 경로를 get_scan_notes 에서 찾아 재획득 시도.
+2. 재획득 성공 시 store_secret 으로 갱신 (같은 key에 덮어쓰기).
+3. 재획득 실패 시 add_scan_note("stale_secret", "key=admin_session, expired at ...") 기록.
+
+### CSRF 토큰 공유
+- CSRF 토큰 발견 시 store_secret(key="csrf_token_<endpoint>", value=..., category="csrf_token").
+- CSRF 토큰은 자주 갱신됨. 사용 직전에 get_secrets 로 최신 값을 가져올 것.
+- 토큰이 만료/거부되면 해당 endpoint 에 GET 요청해서 새 토큰을 추출, store_secret 갱신.
+
+### Race condition 조율
+race condition 공격이 필요한 경우:
+1. push_discovery(node_type="clue", summary="Race condition target",
+   context_json={"race_endpoints": ["/apply-coupon", "/checkout"],
+   "race_method": "POST", "race_body": {...}, "timing_window_ms": 100})
+2. 실제 race condition 테스트: multi_http_probe 로 동일 요청을 concurrent 실행.
+3. 결과를 add_scan_note("race_result", "...") 로 공유.
+
+### 충돌 정책 (다른 브랜치에서 모순된 정보)
+- 세션/토큰이 여러 개 있으면 → 모두 시도, 작동하는 것 사용.
+- 아키텍처 노트가 모순되면 → 최신 타임스탬프 우선, 직접 확인 후 판단.
+- 판단 불가하면 → 너의 endpoint에서 직접 테스트해서 확인.
+
+### 활용 시나리오 (유연하게 적용)
+- 다른 브랜치에서 admin 세션이 발견되었다 → 너의 endpoint에서 admin 권한으로 테스트 가능.
+- 다른 endpoint에서 IDOR 패턴이 확인되었다 → 같은 패턴을 너의 endpoint에도 적용.
+- SSRF primitive 발견 → store_secret 확인 후 internal endpoint 접근에 활용.
+- 레이스 컨디션: 다른 브랜치의 쿠폰 적용 + 너의 결제 요청을 동시에 → push clue with combined context.
+- 비즈니스 로직: 회원가입 → 인증 바이패스 → 관리자 기능 접근 체인을 조합.
+- privilege escalation: 일반 유저 세션 + admin endpoint 발견 → 권한 상승 시도.
+핵심: 위 시나리오는 예시일 뿐. 상황에 맞게 자유롭게 조합하고 창의적으로 활용할 것.
+
+## Recursive endpoint discovery (all agents)
+HTTP 응답 (HTML, JSON, redirect, header) 에서 아직 트리에 없는 새 URL/API 를
+발견하면 push_discovery(node_type="endpoint", parent_node_id=<your node_id>,
+endpoint="/new-path", summary="Discovered via /current-path response") 로 등록하라.
+⚠ parent 는 **현재 탐색 중인 너의 node_id** — 이래야 get_chain_context 로
+조상의 세션/인증/발견 맥락이 체인으로 보존된다.
+(예: register → login → dashboard 체인이면 dashboard 에이전트가 login 의 쿠키를
+get_secrets 로 물려받을 수 있다.)
+push_discovery dedup 이 중복을 자동 처리하므로 이미 있는 endpoint 를 push 해도 안전하다.
+새 endpoint 를 놓치면 = 공격 경로 누락. 적극적으로 push 할 것.
+
 자율성 우선: 도구는 신호 제공, 의사결정은 너.
 """
 
@@ -2048,13 +2557,13 @@ EXPLORER_TOOLS = {
     "store_secret", "get_secrets", "add_scan_note", "get_scan_notes",
     # HTTP
     "http_request", "http_session_request", "http_session_cookies",
-    "http_session_close", "curl_request",
+    "http_session_close", "curl_request", "multi_http_probe",
     # Scanners
     "sqlmap_scan", "dalfox_scan", "nuclei_scan", "ffuf_scan",
     "nikto_scan", "wafw00f_scan", "whatweb_scan",
     # Browser
     "browser_navigate", "browser_get_dom", "browser_extract_api_endpoints",
-    "browser_get_network_log", "browser_screenshot",
+    "browser_get_network_log", "browser_screenshot", "browser_set_user_agent",
     # Analysis
     "analyze_endpoint", "list_candidates", "get_scan_summary",
     # Source
@@ -2377,6 +2886,7 @@ async def _explorer_worker(
     acc: _Accumulator,
     last_activity_ref: list,
     done_event: asyncio.Event,
+    root_node_id: str = "",
 ):
     """Discovery worker — DB queue에서 pending node를 pick, explore, push children."""
     import time as _t
@@ -2417,18 +2927,19 @@ async def _explorer_worker(
                 f"Use list_source_tree, read_source, grep_source to analyze the app.\n"
             )
 
-        shared_state_hint = ""
-        if node.node_type in ("exploit_step", "clue", "vuln") and node.depth >= 2:
-            shared_state_hint = (
-                "\n## Shared State\n"
-                "This is a deep node. Other workers may have discovered credentials or\n"
-                "architecture info. Call get_secrets and get_scan_notes EARLY.\n"
-                "If YOU discover credentials/tokens, call store_secret immediately.\n"
-            )
+        shared_state_hint = (
+            "\n## Shared State (cross-node collaboration)\n"
+            "Other workers explore in parallel. Before starting:\n"
+            "  get_secrets() → check for sessions, tokens, creds from other branches.\n"
+            "  get_scan_notes('architecture') → check app structure, auth patterns.\n"
+            "If YOU discover credentials/tokens/sessions, call store_secret immediately\n"
+            "so other workers can use them.\n"
+        )
 
         user_msg = (
             f"target_url: {scan_run.target_url}\n"
             f"scan_run_id: {scan_run.run_id}\n"
+            f"root_target_node_id: {root_node_id}\n"
             f"{source_hint}{shared_state_hint}\n"
             f"## Your Node\n"
             f"- node_id: {node.node_id}\n"
@@ -2438,8 +2949,9 @@ async def _explorer_worker(
             f"- vuln_type: {node.vuln_type or 'N/A'}\n"
             f"- summary: {node.summary}\n"
             f"- context: {json.dumps(node.context, ensure_ascii=False)[:800]}\n\n"
-            f"Start by calling get_chain_context(node_id=\"{node.node_id}\") and "
-            f"get_siblings(node_id=\"{node.node_id}\"), then explore this node.\n"
+            f"Start by calling get_chain_context(node_id=\"{node.node_id}\"), "
+            f"get_siblings(node_id=\"{node.node_id}\"), and get_secrets(). "
+            f"Check what other workers have already discovered, then explore this node.\n"
             f"Push child discoveries for anything interesting. "
             f"Mark dead_end if nothing found."
         )
@@ -2490,6 +3002,7 @@ async def _explorer_worker(
                 scan_run, anthropic, f"{sub_role}:{name}", sub_prompt,
                 tools, tool_router, user_msg, acc,
                 max_turns=budget,
+                current_node_id=str(node.node_id),
             )
         except Exception as e:
             logger.error(
@@ -2931,6 +3444,12 @@ def _normalize_target_url(url: str) -> str:
     ))
 
 
+def _normalize_endpoint_for_dedup(ep: str, target_url: str = "") -> str:
+    """Delegate to the shared _normalize_ep in tools_discovery for consistent behavior."""
+    from watchdog_mcp.tools_discovery import _normalize_ep
+    return _normalize_ep(ep, target_url)
+
+
 def _gather_previous_knowledge(
     target_url: str,
     current_run_id: str,
@@ -2951,7 +3470,6 @@ def _gather_previous_knowledge(
 
     prev_run = None
     if resume_from and rf not in ("", "auto"):
-        # 명시적 run_id (UUID 형태). target_url 일치 안 해도 강제 resume.
         prev_run = ScanRun.objects.filter(run_id=resume_from).exclude(run_id=current_run_id).first()
         if not prev_run:
             return None
@@ -2979,24 +3497,47 @@ def _gather_previous_knowledge(
     dead_ends = []
     clues = []
 
+    # dedup: (normalized_endpoint, vuln_type, node_type_bucket) 기준으로 첫 번째만 수집.
+    # 이전 scan 에서 같은 endpoint 노드가 여러 개 있었던 경우 중복 전파 방지.
+    _seen_keys: set[tuple[str, str, str]] = set()
+
     for node in prev_nodes:
+        raw_ep = node.endpoint or ""
+        ep_norm = _normalize_endpoint_for_dedup(raw_ep, target_url)
+        vt = node.vuln_type or ""
+
+        # status=dead_end 가 type 보다 우선
+        if node.status == "dead_end" or node.node_type == "dead_end":
+            bucket = "dead_end"
+        elif node.node_type == "endpoint":
+            bucket = "endpoint"
+        elif node.node_type == "vuln":
+            bucket = "vuln"
+        elif node.node_type in ("clue", "exploit_step"):
+            bucket = node.node_type
+        else:
+            continue
+
+        dedup_key = (ep_norm, vt, bucket)
+        if ep_norm != "/" and dedup_key in _seen_keys:
+            continue
+        _seen_keys.add(dedup_key)
+
         entry = {
             "node_type": node.node_type,
-            "endpoint": node.endpoint or "",
-            "vuln_type": node.vuln_type or "",
+            "endpoint": raw_ep,
+            "vuln_type": vt,
             "summary": node.summary[:300],
             "status": node.status,
             "depth": node.depth,
         }
-        # status=dead_end 가 type 보다 우선. node_type='vuln' 이어도 status=dead_end 면
-        # dead_end 로 분류해야 다음 scan 에서 dead_end 노드로 seeding (회피).
-        if node.status == "dead_end" or node.node_type == "dead_end":
+        if bucket == "dead_end":
             dead_ends.append(entry)
-        elif node.node_type == "endpoint":
+        elif bucket == "endpoint":
             endpoints.append(entry)
-        elif node.node_type == "vuln":
+        elif bucket == "vuln":
             vulns.append(entry)
-        elif node.node_type in ("clue", "exploit_step"):
+        else:
             clues.append(entry)
 
     if not endpoints and not vulns:
@@ -3023,24 +3564,45 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
 
     seed_cap = int(DISCOVERY_MAX_NODES * SEED_BUDGET_RATIO)
     counts = {"endpoints": 0, "vulns": 0, "dead_ends": 0, "clues": 0}
-    endpoint_node_map = {}
+    endpoint_node_map: dict[str, DiscoveryNode] = {}
     prev_run_id = prev_knowledge.get("prev_run_id", "")
+
+    # dedup within seeding: (normalized_endpoint, vuln_type, node_type) → skip
+    _seeded_keys: set[tuple[str, str, str]] = set()
 
     def _seeded_total() -> int:
         return sum(counts.values())
+
+    _target_url = scan_run.target_url or ""
+
+    def _check_seeded(ep: str, vt: str, ntype: str) -> bool:
+        """Return True if this (ep, vt, ntype) was already seeded → skip."""
+        key = (_normalize_endpoint_for_dedup(ep, _target_url), vt, ntype)
+        if key in _seeded_keys:
+            return True
+        _seeded_keys.add(key)
+        return False
+
+    def _find_parent_for_ep(ep: str) -> DiscoveryNode:
+        """Lookup seeded endpoint parent by normalized path; fallback to root."""
+        norm = _normalize_endpoint_for_dedup(ep, _target_url)
+        return endpoint_node_map.get(norm, root_node)
 
     # 1) endpoint nodes — pending 으로 push (worker 가 다시 탐색 + 새 vuln 발견 가능)
     for ep in prev_knowledge.get("endpoints", []):
         if _seeded_total() >= seed_cap:
             break
-        if not ep.get("endpoint"):
+        raw_ep = ep.get("endpoint", "")
+        if not raw_ep:
+            continue
+        if _check_seeded(raw_ep, "", "endpoint"):
             continue
         ep_node = DiscoveryNode.objects.create(
             scan_run=scan_run,
             parent=root_node,
             depth=1,
             node_type="endpoint",
-            endpoint=ep["endpoint"],
+            endpoint=raw_ep,
             vuln_type="",
             summary=f"[seeded] {ep['summary'][:200]}",
             context={
@@ -3049,7 +3611,8 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
             },
             status="pending",
         )
-        endpoint_node_map[ep["endpoint"]] = ep_node
+        ep_norm = _normalize_endpoint_for_dedup(raw_ep, _target_url)
+        endpoint_node_map[ep_norm] = ep_node
         counts["endpoints"] += 1
 
     # 2) vuln nodes — explored/confirmed 만 recheck=True 로 push (패치 여부 확인)
@@ -3058,15 +3621,18 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
             break
         if vuln.get("status") not in ("explored", "confirmed"):
             continue
-        ep = vuln.get("endpoint", "")
-        parent = endpoint_node_map.get(ep, root_node)
+        raw_ep = vuln.get("endpoint", "")
+        vt = vuln.get("vuln_type", "")
+        if _check_seeded(raw_ep, vt, "vuln"):
+            continue
+        parent = _find_parent_for_ep(raw_ep)
         DiscoveryNode.objects.create(
             scan_run=scan_run,
             parent=parent,
             depth=parent.depth + 1,
             node_type="vuln",
-            endpoint=ep,
-            vuln_type=vuln.get("vuln_type", ""),
+            endpoint=raw_ep,
+            vuln_type=vt,
             summary=f"[re-verify] {vuln['summary'][:200]}",
             context={
                 "seeded_from": prev_run_id,
@@ -3079,24 +3645,24 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
         counts["vulns"] += 1
 
     # 3) dead_end nodes — status=dead_end 로 직접 push.
-    # worker pick_next_node 가 pending/exploring 만 잡으니 dead_end 는 자동 skip.
-    # 동시에 트리에 시각적으로 박혀 있어서 LLM/사람이 "이건 이미 막혔다" 알 수 있고,
-    # check_payload_dedup / recall_dead_ends 의 매칭 정확도도 높아짐.
     from django.utils import timezone as _tz
     for de in prev_knowledge.get("dead_ends", []):
         if _seeded_total() >= seed_cap:
             break
-        ep = de.get("endpoint", "")
-        if not ep:
+        raw_ep = de.get("endpoint", "")
+        if not raw_ep:
             continue
-        parent = endpoint_node_map.get(ep, root_node)
+        vt = de.get("vuln_type", "")
+        if _check_seeded(raw_ep, vt, "dead_end"):
+            continue
+        parent = _find_parent_for_ep(raw_ep)
         DiscoveryNode.objects.create(
             scan_run=scan_run,
             parent=parent,
             depth=parent.depth + 1,
             node_type="vuln",
-            endpoint=ep,
-            vuln_type=de.get("vuln_type", ""),
+            endpoint=raw_ep,
+            vuln_type=vt,
             summary=f"[prev dead_end] {de['summary'][:200]}",
             context={
                 "seeded_from": prev_run_id,
@@ -3108,23 +3674,25 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
         )
         counts["dead_ends"] += 1
 
-    # 4) clue / exploit_step — 부분 chain 정보 보존. status=pending 으로 push 해
-    # worker 가 follow-up 가능. 단 깊이 2 이상이면 적절한 부모 없을 수 있어 root 자식.
+    # 4) clue / exploit_step — 부분 chain 정보 보존.
     for cl in prev_knowledge.get("clues", []):
         if _seeded_total() >= seed_cap:
             break
-        ep = cl.get("endpoint", "")
-        parent = endpoint_node_map.get(ep, root_node)
+        raw_ep = cl.get("endpoint", "")
         nt = cl.get("node_type") or "clue"
         if nt not in ("clue", "exploit_step"):
             continue
+        vt = cl.get("vuln_type", "")
+        if _check_seeded(raw_ep, vt, nt):
+            continue
+        parent = _find_parent_for_ep(raw_ep)
         DiscoveryNode.objects.create(
             scan_run=scan_run,
             parent=parent,
             depth=parent.depth + 1,
             node_type=nt,
-            endpoint=ep,
-            vuln_type=cl.get("vuln_type", ""),
+            endpoint=raw_ep,
+            vuln_type=vt,
             summary=f"[prev {nt}] {cl['summary'][:200]}",
             context={
                 "seeded_from": prev_run_id,
@@ -3169,6 +3737,10 @@ async def _run_discovery_loop(
     root_context = {"target_url": scan_run.target_url}
     if scan_config.get("source_root"):
         root_context["source_root"] = scan_config["source_root"]
+
+    bb_ua = _build_bug_bounty_ua(scan_run)
+    if bb_ua:
+        root_context["bug_bounty_ua"] = bb_ua
 
     # 사용자 제공 credentials 자동 처리 — list 또는 single dict 둘 다 지원.
     # _seed_credentials 가 ScanRun.config["_secrets"] 에 label prefix 로 박음.
@@ -3240,6 +3812,12 @@ async def _run_discovery_loop(
         status="pending",
     )
 
+    # Store root_node_id in config so _auto_push_discovered_links can access it
+    cfg = dict(scan_run.config or {})
+    cfg["_root_node_id"] = str(root_node.node_id)
+    scan_run.config = cfg
+    await sync_to_async(scan_run.save)(update_fields=["config"])
+
     seeded = {"total": 0}
     if prev_knowledge:
         seeded = await sync_to_async(_seed_from_previous)(
@@ -3261,6 +3839,7 @@ async def _run_discovery_loop(
             _explorer_worker(
                 f"W{i+1}", scan_run, anthropic, explorer_tools, tool_router,
                 acc, last_activity, done_event,
+                root_node_id=str(root_node.node_id),
             ),
             name=f"explorer-{i+1}",
         )

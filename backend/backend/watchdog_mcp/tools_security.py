@@ -223,15 +223,25 @@ def register(mcp):
                                     allow_redirects=follow_redirects)
             elapsed = round(time.time() - start, 3)
 
-            return json.dumps({
+            full_body = resp.text
+            ct = resp.headers.get("Content-Type", "")
+            from watchdog_mcp.link_extractor import extract_links_and_hashes
+            links, hashes = extract_links_and_hashes(full_body, ct, dict(resp.headers), resp.url)
+
+            result = {
                 "url": resp.url,
                 "status_code": resp.status_code,
                 "elapsed": elapsed,
-                "content_length": len(resp.text),
-                "content_type": resp.headers.get("Content-Type", ""),
+                "content_length": len(full_body),
+                "content_type": ct,
                 "response_headers": dict(resp.headers),
-                "body": resp.text[:5000],
-            })
+                "body": full_body[:5000],
+            }
+            if links:
+                result["discovered_links"] = links
+            if hashes:
+                result["hash_routes"] = hashes
+            return json.dumps(result)
         except requests.RequestException as e:
             return json.dumps({"url": url, "error": str(e)})
 
@@ -309,16 +319,25 @@ def register(mcp):
                     resp = requests.request(method, url, headers=hdrs,
                                             timeout=timeout_s, allow_redirects=follow)
                 elapsed = round(time.time() - t0, 3)
-                return {
+                full_body = resp.text
+                ct = resp.headers.get("Content-Type", "")
+                from watchdog_mcp.link_extractor import extract_links_and_hashes
+                links, hashes = extract_links_and_hashes(full_body, ct, dict(resp.headers), resp.url, limit=20)
+                entry = {
                     "idx": idx,
                     "url": resp.url,
                     "status_code": resp.status_code,
                     "elapsed": elapsed,
-                    "content_length": len(resp.text),
-                    "content_type": resp.headers.get("Content-Type", ""),
+                    "content_length": len(full_body),
+                    "content_type": ct,
                     "headers": dict(resp.headers),
-                    "body_preview": resp.text[:2000],
+                    "body_preview": full_body[:2000],
                 }
+                if links:
+                    entry["discovered_links"] = links
+                if hashes:
+                    entry["hash_routes"] = hashes
+                return entry
             except requests.RequestException as e:
                 return {"idx": idx, "url": url, "error": str(e)}
 

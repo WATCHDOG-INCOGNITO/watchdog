@@ -133,18 +133,28 @@ def register(mcp):
         new_cookies = {c.name: c.value for c in resp.cookies}
         all_cookies = {c.name: c.value for c in sess.cookies}
 
-        return json.dumps({
+        full_body = resp.text
+        ct = resp.headers.get("Content-Type", "")
+        from watchdog_mcp.link_extractor import extract_links_and_hashes
+        links, hashes = extract_links_and_hashes(full_body, ct, dict(resp.headers), resp.url)
+
+        result = {
             "session_id": session_id,
             "url": resp.url,
             "status_code": resp.status_code,
             "elapsed": elapsed,
-            "content_length": len(resp.text),
-            "content_type": resp.headers.get("Content-Type", ""),
+            "content_length": len(full_body),
+            "content_type": ct,
             "response_headers": dict(resp.headers),
             "new_cookies": new_cookies,
             "all_cookies": all_cookies,
-            "body": resp.text[:5000],
-        }, ensure_ascii=False)
+            "body": full_body[:5000],
+        }
+        if links:
+            result["discovered_links"] = links
+        if hashes:
+            result["hash_routes"] = hashes
+        return json.dumps(result, ensure_ascii=False)
 
     @mcp.tool()
     def http_session_cookies(session_id: str) -> str:

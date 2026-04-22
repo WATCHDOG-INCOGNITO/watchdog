@@ -16,9 +16,132 @@ logger = logging.getLogger(__name__)
 import os
 from datetime import timedelta
 
-DISCOVERY_MAX_DEPTH = 15
-DISCOVERY_MAX_NODES = 200
+DISCOVERY_MAX_DEPTH = int(os.environ.get("WATCHDOG_DISCOVERY_MAX_DEPTH", "50"))
+DISCOVERY_MAX_NODES = int(os.environ.get("WATCHDOG_DISCOVERY_MAX_NODES", "1000"))
 DISCOVERY_STALE_S = int(os.environ.get("WATCHDOG_DISCOVERY_STALE_S", "300"))
+
+
+def _normalize_ep(ep: str, target_url: str = "") -> str:
+    """Normalize endpoint for storage and dedup.
+
+    - Same-origin full URLs → path + sorted query param names.
+    - Cross-origin full URLs → scheme://host:port/path + sorted query param names.
+      Scheme is preserved because http vs https can expose different attack surfaces.
+    - Trailing slash stripped, path lowercased.
+    """
+    from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
+    if not ep:
+        return "/"
+    path_part = ep
+    host_prefix = ""
+    query = ""
+    if ep.startswith(("http://", "https://")):
+        try:
+            parsed = _urlparse(ep)
+            target_host = ""
+            target_scheme = ""
+            if target_url:
+                try:
+                    tp = _urlparse(target_url)
+                    target_host = tp.netloc.lower()
+                    target_scheme = tp.scheme.lower()
+                except Exception:
+                    pass
+            ep_host = parsed.netloc.lower()
+            ep_scheme = parsed.scheme.lower()
+            if target_host and ep_host != target_host:
+                host_prefix = f"{ep_scheme}://{ep_host}"
+            elif target_host and ep_host == target_host and ep_scheme != target_scheme:
+                host_prefix = f"{ep_scheme}://{ep_host}"
+            path_part = parsed.path
+            query = parsed.query
+        except Exception:
+            pass
+    elif "?" in ep:
+        path_part, query = ep.split("?", 1)
+
+    path_part = path_part.rstrip("/") or "/"
+    param_suffix = ""
+    if query:
+        try:
+            param_names = sorted(set(_parse_qs(query, keep_blank_values=True).keys()))
+            if param_names:
+                param_suffix = "?" + "&".join(f"{n}=" for n in param_names)
+        except Exception:
+            pass
+    result = path_part.lower() + param_suffix
+    if host_prefix:
+        result = host_prefix + result
+    return result
+
+
+def _merge_context(existing_node, new_ctx: dict) -> None:
+    """Merge new discovery context into an existing node.
+
+    Accumulates methods, discovered_from sources, and other metadata
+    so that a deduped endpoint doesn't lose information about how it was found.
+    """
+    if not new_ctx:
+        return
+    old_ctx = dict(existing_node.context or {})
+    changed = False
+
+    # Accumulate methods
+    old_methods = set(old_ctx.get("methods") or [])
+    new_methods = set(new_ctx.get("methods") or [])
+    if new_methods - old_methods:
+        old_ctx["methods"] = sorted(old_methods | new_methods)
+        changed = True
+
+    # Accumulate discovered_from sources
+    old_sources = old_ctx.get("discovered_from_list") or []
+    if isinstance(old_sources, str):
+        old_sources = [old_sources]
+    if old_ctx.get("discovered_from") and old_ctx["discovered_from"] not in old_sources:
+        old_sources.append(old_ctx["discovered_from"])
+    new_from = new_ctx.get("discovered_from", "")
+    if new_from and new_from not in old_sources:
+        old_sources.append(new_from)
+        old_ctx["discovered_from_list"] = old_sources[-10:]
+        changed = True
+
+    # Accumulate params from context (type-safe: handle dict, list, or mixed)
+    old_params = old_ctx.get("params")
+    new_params = new_ctx.get("params")
+    if new_params:
+        if isinstance(old_params, list) and isinstance(new_params, list):
+            merged = list(dict.fromkeys(old_params + new_params))
+            if merged != old_params:
+                old_ctx["params"] = merged
+                changed = True
+        elif isinstance(old_params, dict) and isinstance(new_params, dict):
+            merged_params = {**old_params, **new_params}
+            if merged_params != old_params:
+                old_ctx["params"] = merged_params
+                changed = True
+        elif old_params is None:
+            old_ctx["params"] = new_params
+            changed = True
+        else:
+            def _params_to_dict(p):
+                if isinstance(p, dict):
+                    return p
+                if isinstance(p, list):
+                    return {str(v): "" for v in p}
+                return {}
+            merged_params = {**_params_to_dict(old_params), **_params_to_dict(new_params)}
+            old_ctx["params"] = merged_params
+            changed = True
+
+    # Preserve any extra keys from new context that don't exist yet
+    for k, v in new_ctx.items():
+        if k not in old_ctx and k not in ("methods", "discovered_from", "params", "discovered_from_list"):
+            old_ctx[k] = v
+            changed = True
+
+    if changed:
+        existing_node.context = old_ctx
+        existing_node.save(update_fields=["context"])
 
 
 def register(mcp):
@@ -77,13 +200,34 @@ def register(mcp):
                 "total_nodes": existing_count,
             })
 
-        # 안전망 — 같은 scan 에 (endpoint, vuln_type, node_type) 조합이 이미 있으면
-        # 새로 만들지 않고 기존 노드 반환. worker race 또는 LLM 의 중복 push 방지.
-        # endpoint 없는 clue/flag 등은 dedup 안 함 (의미가 다를 수 있음).
-        # trailing-slash 변형 허용.
+        # Dedup: same scan + (normalized endpoint, vuln_type, node_type) → return existing.
+        # Normalization preserves cross-origin host and query param names.
         if endpoint and node_type in ("endpoint", "vuln", "exploit_step"):
-            ep_norm = endpoint.split("?", 1)[0].rstrip("/") or "/"
-            ep_variants = [endpoint, ep_norm, ep_norm + "/"]
+            from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
+
+            # Resolve target_url for same/cross-origin detection
+            target_url = ""
+            try:
+                sr = ScanRun.objects.get(run_id=scan_run_id)
+                target_url = sr.target_url or ""
+            except Exception:
+                pass
+
+            ep_norm = _normalize_ep(endpoint, target_url)
+            ep_variants = set()
+            for raw in (endpoint, ep_norm, ep_norm.rstrip("/"), ep_norm + "/"):
+                ep_variants.add(raw)
+                ep_variants.add(raw.lower())
+            # Only add path-only fallback when the normalized endpoint has NO query params.
+            # Otherwise /search?q= would collapse into existing /search, losing the
+            # distinct attack surface that query params represent.
+            if "?" not in ep_norm:
+                path_only = ep_norm.split("?", 1)[0]
+                ep_variants.add(path_only)
+                ep_variants.add(path_only + "/")
+                ep_variants.add(path_only.lower())
+            ep_variants.discard("")
+
             existing = (
                 DiscoveryNode.objects
                 .filter(scan_run_id=scan_run_id, node_type=node_type)
@@ -93,23 +237,37 @@ def register(mcp):
                 .first()
             )
             if existing:
+                # Merge new context into existing node (accumulate methods, sources)
+                _merge_context(existing, ctx)
                 return json.dumps({
                     "node_id": str(existing.node_id),
                     "depth": existing.depth,
                     "node_type": existing.node_type,
                     "deduped": True,
+                    "context_merged": bool(ctx),
                     "deduped_reason": "same scan+endpoint+vuln_type+node_type already exists",
                     "queue_pending": DiscoveryNode.objects.filter(
                         scan_run_id=scan_run_id, status="pending",
                     ).count(),
                 })
 
+        # Normalize stored endpoint
+        store_ep = endpoint or (parent.endpoint if parent else "")
+        if store_ep:
+            target_url = ""
+            try:
+                sr = ScanRun.objects.get(run_id=scan_run_id)
+                target_url = sr.target_url or ""
+            except Exception:
+                pass
+            store_ep = _normalize_ep(store_ep, target_url)
+
         node = DiscoveryNode.objects.create(
             scan_run_id=scan_run_id,
             parent=parent,
             depth=depth,
             node_type=node_type,
-            endpoint=endpoint or (parent.endpoint if parent else ""),
+            endpoint=store_ep,
             vuln_type=vuln_type,
             summary=summary,
             context=ctx,

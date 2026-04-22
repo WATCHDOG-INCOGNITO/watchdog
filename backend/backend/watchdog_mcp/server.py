@@ -53,12 +53,41 @@ register_session(mcp)
 register_oob(mcp)
 register_discovery(mcp)
 
+def _truthy(value: str | None) -> bool:
+    return bool(value and value.lower() not in {"0", "false", "no", "off"})
+
+
+def _select_transport(argv: list[str]) -> str:
+    for arg in argv:
+        if arg.startswith("--transport="):
+            return arg.split("=", 1)[1]
+
+    if "--stdio" in argv:
+        return "stdio"
+    if "--streamable-http" in argv or "--http" in argv:
+        return "streamable-http"
+    if "--sse" in argv:
+        return "sse"
+
+    env_transport = os.environ.get("MCP_TRANSPORT")
+    if env_transport:
+        return env_transport
+    if _truthy(os.environ.get("MCP_STREAMABLE_HTTP")):
+        return "streamable-http"
+    if _truthy(os.environ.get("MCP_SSE")):
+        return "sse"
+    return "stdio"
+
+
 def main():
     import sys
-    if "--sse" in sys.argv or os.environ.get("MCP_SSE"):
-        mcp.run(transport="sse")
-    else:
-        mcp.run()
+
+    transport = _select_transport(sys.argv[1:])
+    if transport not in {"stdio", "sse", "streamable-http"}:
+        raise ValueError(
+            "Unsupported MCP transport. Use stdio, sse, or streamable-http."
+        )
+    mcp.run(transport=transport)
 
 if __name__ == "__main__":
     main()
