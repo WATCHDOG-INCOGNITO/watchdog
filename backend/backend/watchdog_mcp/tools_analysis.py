@@ -114,6 +114,24 @@ def register(mcp):
         def _create():
             from api.models import DiscoveryNode
             scan_run = ScanRun.objects.get(run_id=run_id)
+            hypothesis_text = (hypothesis or "").lower()
+            blocked_only_evidence = any(
+                marker in hypothesis_text
+                for marker in (
+                    "403", "401", "405", "csrf", "authentication", "auth layer",
+                    "blocked", "cannot be tested", "login redirect", "routing",
+                    "method not allowed", "requires authentication",
+                )
+            )
+            existing = (
+                Candidate.objects
+                .filter(scan_run=scan_run, vuln_type=vuln_type, request__endpoint=endpoint)
+                .exclude(status="confirmed")
+                .order_by("-created_at")
+                .first()
+            )
+            if existing:
+                return str(existing.cand_id), None
             req = RequestCatalog.objects.create(
                 scan_run=scan_run,
                 endpoint=endpoint,
@@ -145,13 +163,19 @@ def register(mcp):
             features = {"source": "llm_manual", "params": params_dict, "endpoint": endpoint}
             if node_id:
                 features["discovery_node_id"] = node_id
+            if blocked_only_evidence:
+                features["blocked_only_evidence"] = True
+
+            priority = max(score, 0.45)
+            if blocked_only_evidence:
+                priority = min(priority, 0.25)
 
             cand = Candidate.objects.create(
                 scan_run=scan_run,
                 request=req,
                 vuln_type=vuln_type,
                 hypothesis=hypothesis or f"LLM 수동 등록: {method} {endpoint} ({vuln_type})",
-                priority_score=max(score, 0.8),
+                priority_score=priority,
                 detection_stage="llm_screen",
                 status="open",
                 features=features,

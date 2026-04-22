@@ -5,14 +5,17 @@ watchdog_mcp(보안 도구) + PostgreSQL MCP(DB 쿼리) 두 서버를 동시 연
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import shutil
 import sys
 import time
+from base64 import b64encode
 from contextlib import AsyncExitStack
 from decimal import Decimal
+from urllib.parse import urlparse
 
 from asgiref.sync import sync_to_async
 from django.utils import timezone
@@ -73,12 +76,40 @@ SWARM_BUDGET = {
     "verifier_worker": 10,   # 1 attempt만. oracle 1-3회 + confirm/dismiss + learn + emit.
     "reporter": 4,
 }
+MAX_TURNS_PER_ROLE = int(os.environ.get("WATCHDOG_MULTI_MAX_TURNS_PER_ROLE", str(MAX_TURNS_PER_ROLE)))
+ROLE_TURN_BUDGET = {
+    "planner": int(os.environ.get("WATCHDOG_MULTI_PLANNER_TURNS", "10")),
+    "executor": int(os.environ.get("WATCHDOG_MULTI_EXECUTOR_TURNS", "8")),
+    "verifier": int(os.environ.get("WATCHDOG_MULTI_VERIFIER_TURNS", "8")),
+    "reporter": int(os.environ.get("WATCHDOG_MULTI_REPORTER_TURNS", "2")),
+}
+ROLE_OUTPUT_TOKEN_BUDGET = {
+    "planner": int(os.environ.get("WATCHDOG_MULTI_PLANNER_MAX_TOKENS", "1400")),
+    "executor": int(os.environ.get("WATCHDOG_MULTI_EXECUTOR_MAX_TOKENS", "1200")),
+    "verifier": int(os.environ.get("WATCHDOG_MULTI_VERIFIER_MAX_TOKENS", "1200")),
+    "reporter": int(os.environ.get("WATCHDOG_MULTI_REPORTER_MAX_TOKENS", "700")),
+}
+ROLE_CONTEXT_TAIL_MESSAGES = {
+    "planner": int(os.environ.get("WATCHDOG_MULTI_PLANNER_CONTEXT_TAIL", "6")),
+    "executor": int(os.environ.get("WATCHDOG_MULTI_EXECUTOR_CONTEXT_TAIL", "4")),
+    "verifier": int(os.environ.get("WATCHDOG_MULTI_VERIFIER_CONTEXT_TAIL", "4")),
+    "reporter": int(os.environ.get("WATCHDOG_MULTI_REPORTER_CONTEXT_TAIL", "2")),
+}
+ROLE_CONTEXT_SUMMARY_CHARS = {
+    "planner": int(os.environ.get("WATCHDOG_MULTI_PLANNER_CONTEXT_SUMMARY", "1400")),
+    "executor": int(os.environ.get("WATCHDOG_MULTI_EXECUTOR_CONTEXT_SUMMARY", "1100")),
+    "verifier": int(os.environ.get("WATCHDOG_MULTI_VERIFIER_CONTEXT_SUMMARY", "1100")),
+    "reporter": int(os.environ.get("WATCHDOG_MULTI_REPORTER_CONTEXT_SUMMARY", "700")),
+}
+# middle 요약의 stable prefix 길이 — 이 앞부분은 턴 간 불변이라 cache_control 로 캐싱.
+# middle이 append-only 로만 자라므로 middle[:STABLE_CONTEXT_SIZE]는 프리픽스 동일 → cache hit.
+STABLE_CONTEXT_SIZE = int(os.environ.get("WATCHDOG_MULTI_STABLE_CONTEXT_SIZE", "4"))
 SWARM_EXECUTOR_COUNT = int(os.environ.get("WATCHDOG_SWARM_EXECUTORS", "3"))
 SWARM_VERIFIER_COUNT = int(os.environ.get("WATCHDOG_SWARM_VERIFIERS", "2"))
 SWARM_QUIESCENCE_S = int(os.environ.get("WATCHDOG_SWARM_QUIESCENCE_S", "30"))
 SWARM_MAX_HYPOTHESES = int(os.environ.get("WATCHDOG_SWARM_MAX_HYPOTHESES", "20"))
 MAX_PLAN_ITERATIONS = 2  # planner→executor→verifier 사이클 반복 횟수 (replan 포함)
-MODEL = "claude-sonnet-4-20250514"
+MODEL = os.environ.get("WATCHDOG_AGENT_MODEL", "claude-sonnet-4-20250514")
 AGENT_MODE_DEFAULT = os.environ.get("WATCHDOG_AGENT_MODE", "multi").lower()
 
 # Sonnet 4 pricing: input $3/MTok, output $15/MTok
@@ -165,7 +196,7 @@ Tool choice and call count are your call.
 - Source (white-box): list_source_tree, read_source, grep_source
   (SOURCE_ROOTS env limits safe root; for_organizer/exploit are auto-blocked)
 - Knowledge: search_knowledge, retrieve_similar_patterns, retrieve_cve_variants
-- Living KB: recall_target, recall_dead_ends, update_target_profile
+- Living KB: recall_target, recall_dead_ends, update_target_profile, get_secrets
 - DB: pg_* (read-only)
 - Exit: emit_hypotheses(hypotheses_json="...")
 
@@ -176,7 +207,9 @@ confirm_finding / dismiss_candidate (Verifier).
 ## Flow (recommended, not enforced)
 
 0. Start with `recall_target(target_host)` — prior learned patterns / dead_ends / framework.
-0a. If white-box (SOURCE_ROOTS shown in BUDGET line above), call `list_source_tree` first;
+0a. If the user message says credentials are available, call `get_secrets(scan_run_id)` once
+    and plan both authenticated and unauthenticated paths.
+0b. If white-box (SOURCE_ROOTS shown in BUDGET line above), call `list_source_tree` first;
     `grep_source` for sinks like `\\$_GET\\[`, `req\\.body`, `params\\[`, etc.
 1. Recon endpoints (small target <15 → cover all).
 2. analyze_endpoint for suspect vuln_type.
@@ -200,6 +233,8 @@ confirm_finding / dismiss_candidate (Verifier).
      summary in hypothesis rationale so Executor knows the attack plan.
    - explore (≥1/3 of hypotheses): LLM-novel guesses commodity tools won't try
      (framework quirks, logic flaws, composition chains, exotic encoding).
+   - Do not treat `/login`, generic `/api/*`, or plain auth/routing failures alone as a
+     vuln hypothesis. A blocked route is not evidence.
 6. **CRITICAL: Call `emit_hypotheses` before budget runs out.**
    Reserve at least 2 turns for hypothesis generation. Don't over-read source files.
    When [BUDGET] shows ≤ 4 remaining, STOP recon and emit immediately.
@@ -232,7 +267,7 @@ Virtue: fast attempt, fast handoff. ~2-3 LLM turns per hypothesis target.
 - KB: search_knowledge, retrieve_similar_patterns, record_pattern_use, mutate_payload
 - Candidate: create_candidate_manual
 - Evidence aux: save_evidence, auto_collect_evidence
-- Living KB: recall_dead_ends
+- Living KB: recall_dead_ends, get_secrets
 - Exit: emit_attempts(attempts_json="...")
 
 ## Blocked here
@@ -241,6 +276,9 @@ confirm_finding / dismiss_candidate / generate_report (other roles).
 ## Flow
 
 0. Once: recall_dead_ends(target_host) — skip already-failed (endpoint, vuln_type, pattern).
+0a. If credentials are mentioned in the user message, call `get_secrets(scan_run_id)` before
+    concluding a protected endpoint is blocked. For bearer/cookie/basic credentials, HTTP tools
+    may already have default auth headers applied when you target the same host.
 1. **KB first**: For each new vuln_type, call `search_knowledge(vuln_type=...)` once.
    KB has 27 vuln_type categories and `sub_technique` for fine-grained techniques.
    Use `retrieve_similar_patterns(query="...")` with endpoint + tech description for extras.
@@ -254,6 +292,9 @@ confirm_finding / dismiss_candidate / generate_report (other roles).
      composition chain, exotic encoding) — `mutate_payload` for KB variants.
    - **Don't fire generic payloads**. Craft target-specific attacks using KB + source/recon.
 3. record_pattern_use once; matched → create_candidate_manual once; **next immediately**.
+   If all you have is 401/403/405, login redirect, CSRF denial, or SPA fallback HTML,
+   do NOT create_candidate_manual. Emit matched=false with candidate_id=null, or emit
+   an empty attempts array.
 4. evidence_summary short (<300 chars).
 5. After all hypotheses: emit_attempts. Resist extra tries — Verifier handles depth.
    Empty attempts array OK.
@@ -290,7 +331,7 @@ Tool choice and judgment style are your call; below is the arsenal + recommendat
 
 **OOB (async XSS bot, SSRF, RCE)**: oob_get_hits(token), oob_wait_for_hit(token, timeout_s).
 **Aux**: http_request, http_session_request, get_finding, get_scan_summary,
-list_candidates, search_knowledge.
+list_candidates, search_knowledge, get_secrets.
 **Source**: list_source_tree, read_source, grep_source (sink confirmation).
 **Register**: confirm_finding, dismiss_candidate, save_evidence, auto_collect_evidence,
 record_pattern_use.
@@ -317,6 +358,8 @@ record_pattern_use.
    false_positive → dismiss_candidate + record_pattern_use(false_positive=True) +
    **learn_dead_end**.
 
+   Pure 401/403/405, login redirects, or SPA fallback HTML without a differential signal
+   should be dismissed quickly. Do not burn extra turns proving a generic block page.
 ## Class hints (advisory)
 
 - SQLi: error-only ≠ confirmed. Use oracle_sqli_boolean or _time.
@@ -346,7 +389,7 @@ PLANNER_TOOLS = {
     "retrieve_cve_variants", "fetch_cve_details", "suggest_cves_for_framework",
     "list_candidates", "get_scan_summary",
     # Living KB — host-specific 회상 + endpoint spec
-    "recall_target", "recall_dead_ends", "update_target_profile",
+    "recall_target", "recall_dead_ends", "update_target_profile", "get_secrets",
     "recall_endpoint_specs", "record_endpoint_spec",
     # Source code reading (white-box / glass-box CTF)
     "list_source_tree", "read_source", "grep_source",
@@ -360,7 +403,7 @@ EXECUTOR_TOOLS = {
     "browser_screenshot", "browser_extract_api_endpoints",
     "search_knowledge", "retrieve_similar_patterns", "record_pattern_use",
     "mutate_payload", "create_candidate_manual", "save_evidence",
-    "auto_collect_evidence", "list_candidates",
+    "auto_collect_evidence", "list_candidates", "get_secrets",
     # SimHash dedup — payload 시도 전 본질 중복 진단
     "check_payload_dedup",
     # Living KB — dead end 사전 조회 + endpoint spec
@@ -375,7 +418,7 @@ EXECUTOR_TOOLS = {
 }
 VERIFIER_TOOLS = {
     "http_request", "get_finding", "get_scan_summary", "list_candidates",
-    "search_knowledge", "confirm_finding", "dismiss_candidate", "reopen_candidate",
+    "search_knowledge", "get_secrets", "confirm_finding", "dismiss_candidate", "reopen_candidate",
     "save_evidence", "auto_collect_evidence", "record_pattern_use",
     "oracle_xss", "oracle_sqli_boolean", "oracle_sqli_time",
     "oracle_lfi", "oracle_ssrf", "oracle_response_diff",
@@ -465,6 +508,24 @@ EXTENDED_LIMIT_TOOLS = {
 # 한 LLM 턴에서 동시에 호출돼도 안전한 read-only 도구.
 # 상태 변경(write/POST/세션 변형/scanner subprocess)은 전부 제외.
 # 자율성 원칙: 강제 직렬화는 안전망에만. 명백한 read-only는 묶어서 대기시간 ↓.
+TOOL_RESULT_MAX_CHARS = int(os.environ.get("WATCHDOG_TOOL_RESULT_MAX_CHARS", "1200"))
+TOOL_RESULT_EXTENDED_CHARS = int(os.environ.get("WATCHDOG_TOOL_RESULT_EXTENDED_CHARS", "2200"))
+HTTP_TOOL_RESULT_CHARS = int(os.environ.get("WATCHDOG_HTTP_RESULT_MAX_CHARS", "1500"))
+HTTP_BODY_PREVIEW_CHARS = int(os.environ.get("WATCHDOG_HTTP_BODY_PREVIEW_CHARS", "700"))
+EXTENDED_LIMIT_TOOLS = {
+    "read_source", "grep_source", "list_source_tree",
+    "get_chain_context", "get_exploit_chains",
+    "get_secrets", "get_scan_notes",
+}
+HTTP_RESULT_TOOLS = {"http_request", "curl_request", "http_session_request"}
+AUTO_AUTH_TOOLS = {"http_request", "http_session_request", "curl_request"}
+AUTO_AUTH_SKIP_PATHS = ("/login", "/signin", "/sign-in", "/auth/login", "/register")
+HTTP_HEADERS_TO_KEEP = {
+    "content-type", "location", "set-cookie", "server", "cache-control",
+    "x-frame-options", "x-content-type-options", "x-xss-protection",
+    "www-authenticate", "access-control-allow-origin",
+}
+_AUTO_AUTH_CACHE: dict[str, dict | None] = {}
 SAFE_PARALLEL_TOOLS = {
     # KB / 검색
     "search_knowledge", "retrieve_similar_patterns", "retrieve_cve_variants",
@@ -509,6 +570,318 @@ def _truncate_tool_result(text: str, limit: int = TOOL_RESULT_MAX_CHARS) -> str:
     )
 
 
+def _tool_result_limit(tool_name: str) -> int:
+    if tool_name in HTTP_RESULT_TOOLS:
+        return HTTP_TOOL_RESULT_CHARS
+    if tool_name in EXTENDED_LIMIT_TOOLS:
+        return TOOL_RESULT_EXTENDED_CHARS
+    return TOOL_RESULT_MAX_CHARS
+
+
+def _compact_json(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _content_to_summary_text(content, limit: int = 280) -> str:
+    if isinstance(content, str):
+        return _truncate_tool_result(content, limit).replace("\n", " ")
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                btype = block.get("type")
+                if btype == "tool_use":
+                    name = block.get("name", "")
+                    keys = sorted((block.get("input") or {}).keys())
+                    parts.append(f"tool:{name}({','.join(keys[:4])})")
+                elif btype == "tool_result":
+                    text = str(block.get("content", "") or "")
+                    parts.append(f"result:{_truncate_tool_result(text, 140).replace(chr(10), ' ')}")
+                elif btype == "text":
+                    parts.append(_truncate_tool_result(str(block.get("text", "")), 140).replace("\n", " "))
+            else:
+                parts.append(_truncate_tool_result(str(block), 140).replace("\n", " "))
+        return _truncate_tool_result(" | ".join(filter(None, parts)), limit)
+    return _truncate_tool_result(str(content), limit).replace("\n", " ")
+
+
+def _has_tool_result_block(msg: dict) -> bool:
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            return True
+        if getattr(block, "type", None) == "tool_result":
+            return True
+    return False
+
+
+def _summarize_messages_slice(msgs: list[dict], char_limit: int) -> str:
+    summary_lines = []
+    for msg in msgs:
+        if not isinstance(msg, dict):
+            continue
+        msg_role = msg.get("role", "unknown")
+        summary_lines.append(f"[{msg_role}] {_content_to_summary_text(msg.get('content'))}")
+    return _truncate_tool_result("\n".join(summary_lines), char_limit)
+
+
+def _compact_messages_for_call(messages: list[dict], role: str) -> list[dict]:
+    tail_count = ROLE_CONTEXT_TAIL_MESSAGES.get(role)
+    if not tail_count or len(messages) <= tail_count + 1:
+        return messages
+
+    # tail 경계가 tool_use ↔ tool_result 쌍을 자르면 Anthropic API 400
+    # (orphan tool_use_id). tail[0]이 tool_result 담은 user면 직전 assistant를
+    # 같이 끌고 오도록 경계를 왼쪽으로 민다.
+    effective_tail = tail_count
+    while effective_tail < len(messages) - 1:
+        candidate = messages[-effective_tail]
+        if candidate.get("role") == "user" and _has_tool_result_block(candidate):
+            effective_tail += 1
+            continue
+        break
+
+    head = messages[0]
+    tail = messages[-effective_tail:]
+    middle = messages[1:-effective_tail]
+    if not middle:
+        return messages
+
+    # ── Prompt caching 최적화 ────────────────────────────────────────
+    # middle은 append-only 로 자라므로 middle[:STABLE_CONTEXT_SIZE] 프리픽스는
+    # 턴 간 동일 → 그 요약에 cache_control(ephemeral) 을 붙이면 5분 TTL 안에
+    # 90% input 비용 할인. head(초기 user prompt)도 phase 내 불변 → 캐싱.
+    # overflow(middle[STABLE:]) 는 매 턴 바뀌므로 캐시 대상 아님.
+    # ─────────────────────────────────────────────────────────────────
+    summary_budget = ROLE_CONTEXT_SUMMARY_CHARS.get(role, 1200)
+    if len(middle) >= STABLE_CONTEXT_SIZE:
+        stable_text = _summarize_messages_slice(
+            middle[:STABLE_CONTEXT_SIZE], int(summary_budget * 0.75)
+        )
+        overflow_text = _summarize_messages_slice(
+            middle[STABLE_CONTEXT_SIZE:], max(int(summary_budget * 0.25), 300)
+        )
+    else:
+        stable_text = ""
+        overflow_text = _summarize_messages_slice(middle, summary_budget)
+
+    head_content = head.get("content")
+    if isinstance(head_content, str):
+        head_msg = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": head_content,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+    else:
+        head_msg = head
+
+    summary_blocks: list[dict] = []
+    if stable_text:
+        summary_blocks.append({
+            "type": "text",
+            "text": f"[Stable prior context]\n{stable_text}",
+            "cache_control": {"type": "ephemeral"},
+        })
+    if overflow_text:
+        summary_blocks.append({
+            "type": "text",
+            "text": f"[Recent prior context]\n{overflow_text}",
+        })
+
+    compacted: list[dict] = [head_msg]
+    if summary_blocks:
+        compacted.append({"role": "user", "content": summary_blocks})
+    compacted.extend(tail)
+    return compacted
+
+
+def _normalize_credential_list(raw_creds) -> list[dict]:
+    if isinstance(raw_creds, dict) and raw_creds.get("type"):
+        return [raw_creds]
+    if isinstance(raw_creds, list):
+        return [c for c in raw_creds if isinstance(c, dict) and c.get("type")]
+    return []
+
+
+def _select_auto_auth(scan_run: ScanRun) -> dict | None:
+    run_id = str(scan_run.run_id)
+    if run_id in _AUTO_AUTH_CACHE:
+        return _AUTO_AUTH_CACHE[run_id]
+
+    cred_list = _normalize_credential_list((scan_run.config or {}).get("credentials"))
+    if len(cred_list) != 1:
+        _AUTO_AUTH_CACHE[run_id] = None
+        return None
+
+    cred = cred_list[0]
+    ctype = str(cred.get("type", "")).strip().lower()
+    label = str(cred.get("label") or "default")
+    headers = None
+    if ctype == "bearer" and cred.get("token"):
+        headers = {"Authorization": f"Bearer {cred['token']}"}
+    elif ctype == "cookie" and cred.get("cookies"):
+        cookies_val = cred["cookies"]
+        # 프론트엔드가 dict로 파싱해 보낼 수 있음 ({"token": "..."}). HTTP Cookie
+        # 헤더는 문자열이어야 하므로 "k=v; k2=v2" 형태로 직렬화.
+        if isinstance(cookies_val, dict):
+            cookies_val = "; ".join(f"{k}={v}" for k, v in cookies_val.items() if k)
+        headers = {"Cookie": str(cookies_val)}
+    elif ctype == "basic" and cred.get("username") and cred.get("password"):
+        token = b64encode(f"{cred['username']}:{cred['password']}".encode("utf-8")).decode("ascii")
+        headers = {"Authorization": f"Basic {token}"}
+
+    selected = {"label": label, "type": ctype, "headers": headers} if headers else None
+    _AUTO_AUTH_CACHE[run_id] = selected
+    return selected
+
+
+def _same_target_host(scan_run: ScanRun, url: str) -> bool:
+    try:
+        target = urlparse(scan_run.target_url)
+        parsed = urlparse(url)
+        return bool(parsed.netloc) and parsed.netloc.lower() == target.netloc.lower()
+    except Exception:
+        return False
+
+
+def _should_skip_auto_auth(scan_run: ScanRun, url: str) -> bool:
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return True
+    if not _same_target_host(scan_run, url):
+        return True
+    return any(marker in path for marker in AUTO_AUTH_SKIP_PATHS)
+
+
+def _parse_json_headers(raw_value: str) -> dict:
+    if not raw_value:
+        return {}
+    try:
+        value = json.loads(raw_value)
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def _parse_curl_headers(raw_value: str) -> dict:
+    headers = {}
+    for line in (raw_value or "").splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        headers[key.strip()] = value.strip()
+    return headers
+
+
+def _dump_curl_headers(headers: dict) -> str:
+    return "\n".join(f"{key}: {value}" for key, value in headers.items())
+
+
+def _maybe_inject_auto_auth(scan_run: ScanRun, tool_name: str, tool_args: dict) -> dict:
+    if tool_name not in AUTO_AUTH_TOOLS:
+        return tool_args
+
+    auth = _select_auto_auth(scan_run)
+    if not auth or not auth.get("headers"):
+        return tool_args
+
+    url = str(tool_args.get("url") or "")
+    if not url or _should_skip_auto_auth(scan_run, url):
+        return tool_args
+
+    if tool_name == "curl_request":
+        headers = _parse_curl_headers(tool_args.get("headers", ""))
+    elif tool_name == "http_session_request":
+        headers = _parse_json_headers(tool_args.get("headers_json", "{}"))
+    else:
+        headers = _parse_json_headers(tool_args.get("headers", "{}"))
+
+    if any(key.lower() in ("authorization", "cookie") for key in headers):
+        return tool_args
+
+    headers.update(auth["headers"])
+    updated = dict(tool_args)
+    if tool_name == "curl_request":
+        updated["headers"] = _dump_curl_headers(headers)
+    elif tool_name == "http_session_request":
+        updated["headers_json"] = _compact_json(headers)
+    else:
+        updated["headers"] = _compact_json(headers)
+
+    logger.info(
+        f"[{scan_run.run_id}] auto-auth applied to {tool_name} using {auth['label']}({auth['type']})"
+    )
+    return updated
+
+
+def _summarize_set_cookie(value: str) -> str:
+    parts = [part.strip() for part in value.split(";") if part.strip()]
+    if not parts:
+        return value
+    summary = []
+    if "=" in parts[0]:
+        summary.append(parts[0].split("=", 1)[0] + "=<redacted>")
+    for attr in parts[1:4]:
+        summary.append(attr)
+    return "; ".join(summary)
+
+
+def _looks_like_spa_fallback(content_type: str, body: str) -> bool:
+    if "html" not in (content_type or "").lower():
+        return False
+    lowered = (body or "").lower()
+    return (
+        "<html" in lowered
+        and ("<div id=\"root\"" in lowered or "type=\"module\"" in lowered or "<title>" in lowered)
+    )
+
+
+def _compact_http_tool_result(text: str) -> str:
+    try:
+        data = json.loads(text)
+    except Exception:
+        return text
+    if not isinstance(data, dict) or "status_code" not in data:
+        return text
+
+    headers = data.get("response_headers") if isinstance(data.get("response_headers"), dict) else {}
+    filtered_headers = {}
+    for key, value in headers.items():
+        lowered = key.lower()
+        if lowered not in HTTP_HEADERS_TO_KEEP:
+            continue
+        if lowered == "set-cookie":
+            filtered_headers[key] = _summarize_set_cookie(str(value))
+        else:
+            filtered_headers[key] = _truncate_tool_result(str(value), 160)
+
+    body = str(data.get("body", "") or "")
+    content_type = str(data.get("content_type", "") or "")
+    preview_limit = 300 if "javascript" in content_type.lower() else HTTP_BODY_PREVIEW_CHARS
+    compact = {
+        "url": data.get("url", ""),
+        "status_code": data.get("status_code"),
+        "elapsed": data.get("elapsed"),
+        "content_length": data.get("content_length"),
+        "content_type": content_type,
+        "response_headers": filtered_headers,
+    }
+    if body:
+        compact["body_sha1"] = hashlib.sha1(body.encode("utf-8", "ignore")).hexdigest()[:12]
+        compact["body_preview"] = _truncate_tool_result(body, preview_limit)
+    if _looks_like_spa_fallback(content_type, body):
+        compact["spa_fallback_html"] = True
+    return _compact_json(compact)
+
+
 async def _execute_single_tool(
     scan_run: ScanRun,
     tool_router: dict,
@@ -516,7 +889,8 @@ async def _execute_single_tool(
 ) -> dict:
     raise_if_stop_requested(scan_run)
     tool_name = tb.name
-    tool_args = tb.input or {}
+    tool_args = dict(tb.input or {})
+    tool_args = _maybe_inject_auto_auth(scan_run, tool_name, tool_args)
     logger.info(
         f"[{scan_run.run_id}] tool {tool_name}"
         f"({json.dumps(tool_args, ensure_ascii=False)[:200]})"
@@ -541,7 +915,9 @@ async def _execute_single_tool(
         text = f"도구 오류: {e}"
         is_error = True
 
-    limit = TOOL_RESULT_EXTENDED_CHARS if tool_name in EXTENDED_LIMIT_TOOLS else TOOL_RESULT_MAX_CHARS
+    if tool_name in HTTP_RESULT_TOOLS and not is_error:
+        text = _compact_http_tool_result(text)
+    limit = _tool_result_limit(tool_name)
     return {
         "type": "tool_result",
         "tool_use_id": tb.id,
@@ -641,9 +1017,12 @@ async def _run_role_phase(
             "text": system_prompt,
             "cache_control": {"type": "ephemeral"},
         }]
+        call_messages = _compact_messages_for_call(messages, role)
         call_kwargs = dict(
-            model=MODEL, max_tokens=4096,
-            system=cached_system, messages=messages,
+            model=MODEL,
+            max_tokens=ROLE_OUTPUT_TOKEN_BUDGET.get(role, 4096),
+            system=cached_system,
+            messages=call_messages,
         )
         if is_last_turn:
             call_kwargs["tools"] = []
@@ -654,7 +1033,8 @@ async def _run_role_phase(
                     "비면 빈 배열도 OK."
                 ),
             })
-            call_kwargs["messages"] = messages
+            call_messages = _compact_messages_for_call(messages, role)
+            call_kwargs["messages"] = call_messages
         else:
             # 마지막 도구에 cache_control 표시 → 그 위의 system + 모든 도구 schema 캐시.
             cached_tools = [dict(t) for t in tools]
@@ -680,7 +1060,7 @@ async def _run_role_phase(
             "llm_calls_count", "llm_tokens_used", "llm_cost_usd",
         ])
 
-        prompt_preview = build_prompt_preview(messages)
+        prompt_preview = build_prompt_preview(call_messages)
         response_preview = build_response_preview(response.content)
         tool_calls = extract_tool_calls(response.content)
 
@@ -723,7 +1103,12 @@ async def _run_role_phase(
                 stop_reason=f"emit:{emit_block.name}",
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
-                metadata={"role": role, "turn": turn + 1, "emitted": emit_block.name},
+                metadata={
+                    "role": role,
+                    "turn": turn + 1,
+                    "emitted": emit_block.name,
+                    "message_count": len(call_messages),
+                },
             )
             break
 
@@ -739,7 +1124,11 @@ async def _run_role_phase(
                 stop_reason=response.stop_reason,
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
-                metadata={"role": role, "turn": turn + 1},
+                metadata={
+                    "role": role,
+                    "turn": turn + 1,
+                    "message_count": len(call_messages),
+                },
             )
             break
 
@@ -760,6 +1149,7 @@ async def _run_role_phase(
             metadata={
                 "role": role,
                 "turn": turn + 1,
+                "message_count": len(call_messages),
                 "tool_results": summarize_tool_results(tool_results),
             },
         )
@@ -790,6 +1180,22 @@ async def _run_multi_agent_loop(
     )
 
     scan_config = scan_run.config or {}
+    cred_list = _normalize_credential_list(scan_config.get("credentials"))
+    auth_hint = ""
+    if cred_list:
+        personas = await sync_to_async(_seed_credentials)(scan_run, cred_list)
+        if personas:
+            persona_summary = ", ".join(f"{p['label']}({p['type']})" for p in personas)
+            auth_hint = (
+                "\n[AUTH] User-provided credentials available: "
+                + persona_summary
+                + "\nUse get_secrets(scan_run_id=\""
+                + str(scan_run.run_id)
+                + "\") for form or multi-persona auth. Bearer/cookie/basic creds may be auto-attached to same-host HTTP tools."
+            )
+            logger.info(
+                f"[{scan_run.run_id}] multi-mode credentials loaded: {persona_summary}"
+            )
     specific_source = scan_config.get("source_root", "")
     source_hint = ""
     if specific_source and os.path.isdir(specific_source):
@@ -819,6 +1225,7 @@ async def _run_multi_agent_loop(
     plan_brief = (
         f"타겟 URL: {scan_run.target_url}\n"
         f"스캔 ID: {scan_run.run_id}\n"
+        f"{auth_hint}\n"
         f"{source_hint}\n"
         f"위 타겟을 정찰하고 hypotheses(JSON)를 출력하세요."
     )
@@ -862,9 +1269,11 @@ async def _run_multi_agent_loop(
             f"스캔 ID: {scan_run.run_id}\n"
             f"타겟: {scan_run.target_url}\n\n"
             f"다음 hypotheses를 실행하세요:\n```json\n"
-            + json.dumps({"hypotheses": hypotheses}, ensure_ascii=False, indent=2)
+            + _compact_json({"hypotheses": hypotheses})
             + "\n```"
         )
+        if auth_hint:
+            executor_user_msg = f"{auth_hint}\n\n" + executor_user_msg
         executor_text, _ = await _run_role_phase(
             scan_run, anthropic, "executor", EXECUTOR_PROMPT,
             executor_tools, tool_router, executor_user_msg, acc,
@@ -879,9 +1288,11 @@ async def _run_multi_agent_loop(
             f"스캔 ID: {scan_run.run_id}\n"
             f"타겟: {scan_run.target_url}\n\n"
             f"Executor 결과를 검증하고 verdicts(JSON)를 출력하세요:\n```json\n"
-            + json.dumps({"attempts": attempts}, ensure_ascii=False, indent=2)
+            + _compact_json({"attempts": attempts})
             + "\n```"
         )
+        if auth_hint:
+            verifier_user_msg = f"{auth_hint}\n\n" + verifier_user_msg
         verifier_text, _ = await _run_role_phase(
             scan_run, anthropic, "verifier", VERIFIER_PROMPT,
             verifier_tools, tool_router, verifier_user_msg, acc,

@@ -98,6 +98,59 @@ def calculate_priority(param_hits, path_hits):
 
 # 스캔 서비스
 
+SUSPICIOUS_PARAM_TOKENS = {
+    "sqli": {"id", "uid", "pid", "seq", "page", "limit", "offset", "sort", "order", "column"},
+    "xss": {"q", "query", "search", "keyword", "msg", "message", "comment", "text", "content", "redirect", "url", "next", "return", "callback"},
+    "idor": {"id", "uid", "account", "profile", "doc", "file", "order", "invoice", "group", "course", "user"},
+    "ssrf": {"url", "uri", "link", "src", "source", "target", "dest", "redirect", "proxy", "fetch", "load", "request", "path", "file"},
+    "file_upload": {"file", "upload", "attach", "image", "photo", "document", "import"},
+}
+SUSPICIOUS_PATH_PATTERNS = [
+    (r"(?i)/admin", "idor"),
+    (r"(?i)/search", "xss"),
+    (r"(?i)/upload", "file_upload"),
+    (r"(?i)/profile", "idor"),
+    (r"(?i)/user", "idor"),
+    (r"(?i)/redirect", "ssrf"),
+    (r"(?i)/callback", "ssrf"),
+    (r"(?i)/download", "ssrf"),
+    (r"(?i)/export", "ssrf"),
+]
+
+
+def _tokenize_param_name(name: str):
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(name))
+    return [part.lower() for part in re.split(r"[^a-zA-Z0-9]+|_", normalized) if part]
+
+
+def analyze_params(params):
+    """파라미터 이름 분석 후 의심 유형 반환"""
+    hits = []
+    if not params:
+        return hits
+
+    param_names = []
+    if isinstance(params, dict):
+        param_names = list(params.keys())
+    elif isinstance(params, list):
+        param_names = params
+
+    for name in param_names:
+        tokens = set(_tokenize_param_name(name))
+        if not tokens:
+            continue
+        for vuln_type, suspicious_tokens in SUSPICIOUS_PARAM_TOKENS.items():
+            matched = sorted(tokens & suspicious_tokens)
+            if not matched:
+                continue
+            hits.append({
+                "param": name,
+                "vuln_type": vuln_type,
+                "rule": f"token:{','.join(matched[:4])}",
+            })
+    return hits
+
+
 def run_crawl(scan_run: ScanRun):
     """크롤링 실행 → request_catalog에 저장 (SPA 자동 감지)"""
     raise_if_stop_requested(scan_run)
