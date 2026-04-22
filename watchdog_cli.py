@@ -193,6 +193,7 @@ def cmd_push_discovery(p):
     from watchdog_mcp.tools_discovery import (
         _normalize_ep,
         _merge_context,
+        _canonicalize_vuln_type,
         DISCOVERY_MAX_DEPTH,
         DISCOVERY_MAX_NODES,
     )
@@ -206,7 +207,6 @@ def cmd_push_discovery(p):
 
     scan_run_id = p["scan_run_id"]
     ntype = p.get("node_type", "clue")
-    vuln_type = p.get("vuln_type", "") or ""
     raw_ep = p.get("endpoint", "")
 
     parent = None
@@ -218,6 +218,34 @@ def cmd_push_discovery(p):
             depth = parent.depth + 1
         except DiscoveryNode.DoesNotExist:
             _json_out({"error": f"parent {parent_id} not found"})
+            return
+
+    # Stage 1 — taxonomy canonicalize + require vuln_type for vuln /
+    # exploit_step. Mirrors MCP push_discovery so CLI wrapper can't
+    # re-fragment the tree with synonym strings.
+    vuln_type_raw = p.get("vuln_type", "") or ""
+    vuln_type = _canonicalize_vuln_type(vuln_type_raw)
+    if vuln_type and vuln_type != vuln_type_raw and isinstance(ctx, dict):
+        ctx.setdefault("vuln_type_raw", vuln_type_raw)
+    if ntype in ("vuln", "exploit_step") and not vuln_type:
+        if ntype == "exploit_step" and parent and parent.vuln_type:
+            vuln_type = _canonicalize_vuln_type(parent.vuln_type)
+            if isinstance(ctx, dict):
+                ctx.setdefault("vuln_type_inherited_from_parent", True)
+        else:
+            _json_out({
+                "error": "vuln_type is required for vuln/exploit_step nodes",
+                "hint": (
+                    "Pick a canonical type (sqli, idor, xss, ssrf, "
+                    "access_control, auth_bypass, information_disclosure, "
+                    "path_traversal, rce, csrf, xxe, file_upload, "
+                    "logic_flaw, jwt, ssti, open_redirect, nosqli, "
+                    "deserialization). Synonyms (privilege_escalation, "
+                    "user_enum, ...) are auto-canonicalized."
+                ),
+                "node_type": ntype,
+                "summary_seen": (p.get("summary", "") or "")[:160],
+            })
             return
 
     if depth > DISCOVERY_MAX_DEPTH:
@@ -1294,6 +1322,14 @@ def cmd_scan_next(p):
     ).count()
 
     # 후보 N개 — 0번이 BFS 정석(recommend). LLM이 직접 보고 다른 걸 골라도 됨.
+    # slot_hints: endpoint 가 있는 후보에 한해 "이미 시도된 vuln_type /
+    # 아직 안 해본 vuln_type / 과거 scan 에서 dead_end 였던 vuln_type" 을
+    # 첨부 → sub-agent 가 동일 endpoint 에 중복 hypothesis 만드는 것 방지.
+    try:
+        from watchdog_mcp.tools_discovery import _vuln_slot_hints
+    except Exception:
+        _vuln_slot_hints = None
+
     candidates = []
     for idx, n in enumerate(pending_list):
         parent_status = ""
@@ -1305,7 +1341,7 @@ def cmd_scan_next(p):
             reasons.append("(parent is dead_end — 가치 낮을 수 있음)")
         elif parent_status == "confirmed":
             reasons.append("(parent confirmed — chain 후속, 가치 높음)")
-        candidates.append({
+        cand = {
             "rank": idx,
             "node_id": str(n.node_id),
             "node_type": n.node_type,
@@ -1315,7 +1351,13 @@ def cmd_scan_next(p):
             "parent_id": str(n.parent_id)[:8] if n.parent_id else None,
             "parent_status": parent_status,
             "reason": " · ".join(reasons),
-        })
+        }
+        if _vuln_slot_hints and n.endpoint and n.node_type in ("endpoint", "vuln", "exploit_step"):
+            try:
+                cand["slot_hints"] = _vuln_slot_hints(sr, n.endpoint)
+            except Exception:
+                pass
+        candidates.append(cand)
 
     _json_out({
         "action": "EXPLORE",
@@ -1335,7 +1377,12 @@ def cmd_scan_next(p):
         "step_1_init": actions.get("init", []),
         "step_2_work": actions.get("work", []),
         "step_3_finalize": actions.get("finalize", []),
-        "reminder": "Call update_node_status(exploring) FIRST, then do the work, then finalize.",
+        "reminder": (
+            "Call update_node_status(exploring) FIRST, then do the work, then finalize. "
+            "If a candidate has slot_hints, prefer an untested_common_vuln_types value over "
+            "anything in existing_vuln_types_here; avoid prior_dead_end_vuln_types unless "
+            "you have a new payload angle."
+        ),
     })
 
 

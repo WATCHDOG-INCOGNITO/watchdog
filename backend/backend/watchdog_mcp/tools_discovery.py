@@ -21,6 +21,209 @@ DISCOVERY_MAX_NODES = int(os.environ.get("WATCHDOG_DISCOVERY_MAX_NODES", "1000")
 DISCOVERY_STALE_S = int(os.environ.get("WATCHDOG_DISCOVERY_STALE_S", "300"))
 
 
+# ══════════════════════════════════════════════════════════════════════
+# vuln_type taxonomy — sub-agent taxonomy drift 방지
+# ══════════════════════════════════════════════════════════════════════
+# Different sub-agents (hypothesis/exploit/routemap) classify the same
+# attack vector with different strings (e.g. "privilege_escalation" vs
+# "access_control", "user_enum" vs "information_disclosure"). This
+# fragments dedup and inflates the tree with semantic duplicates.
+# Canonicalize at push_discovery time so dedup works on one stable name.
+#
+# Keys: lowercase snake_case synonyms (after strip/lower/dash-to-underscore).
+# Values: canonical vuln_type name used in KB (PayloadPattern, DeadEnd,
+# EndpointSpec.suspected_vuln_types). Unknown values pass through — novel
+# taxonomy still works, only well-known synonyms collapse.
+VULN_TYPE_CANONICAL: dict[str, str] = {
+    # access control family
+    "acl": "access_control", "acl_bypass": "access_control",
+    "authz": "access_control", "authorization": "access_control",
+    "authorization_bypass": "access_control", "authz_bypass": "access_control",
+    "method_bypass": "access_control", "http_method_bypass": "access_control",
+    "options_bypass": "access_control",
+    "privilege_escalation": "access_control", "privesc": "access_control",
+    "forced_browsing": "access_control", "broken_access_control": "access_control",
+    # authentication family
+    "authentication_bypass": "auth_bypass", "authn_bypass": "auth_bypass",
+    "brute_force": "auth_bypass", "credential_stuffing": "auth_bypass",
+    "weak_password": "auth_bypass", "default_credentials": "auth_bypass",
+    "no_rate_limit": "auth_bypass",
+    # information disclosure family
+    "user_enum": "information_disclosure", "user_enumeration": "information_disclosure",
+    "username_enumeration": "information_disclosure",
+    "email_enumeration": "information_disclosure",
+    "info_disclosure": "information_disclosure", "info_leak": "information_disclosure",
+    "data_leak": "information_disclosure", "pii_leak": "information_disclosure",
+    "stack_trace": "information_disclosure", "error_leak": "information_disclosure",
+    "verbose_error": "information_disclosure",
+    "sensitive_data_exposure": "information_disclosure",
+    # injection family
+    "sql_injection": "sqli", "sql": "sqli", "blind_sqli": "sqli",
+    "time_based_sqli": "sqli", "union_sqli": "sqli", "error_based_sqli": "sqli",
+    "nosql_injection": "nosqli", "mongo_injection": "nosqli",
+    "cmd_injection": "rce", "command_injection": "rce",
+    "os_command_injection": "rce", "code_injection": "rce",
+    "remote_code_execution": "rce",
+    "xss_reflected": "xss", "xss_stored": "xss",
+    "reflected_xss": "xss", "stored_xss": "xss", "dom_xss": "xss",
+    "cross_site_scripting": "xss",
+    "template_injection": "ssti", "ssti_injection": "ssti",
+    # idor / direct object reference
+    "direct_object_reference": "idor",
+    "insecure_direct_object_reference": "idor",
+    "broken_object_level_authorization": "idor", "bola": "idor",
+    # logic flaw
+    "business_logic": "logic_flaw", "logic_bug": "logic_flaw",
+    "race_condition": "logic_flaw", "toctou": "logic_flaw",
+    "rate_limit_bypass": "logic_flaw", "otp_bypass": "logic_flaw",
+    "otp_brute_force": "logic_flaw",
+    # csrf / ssrf
+    "cross_site_request_forgery": "csrf",
+    "server_side_request_forgery": "ssrf",
+    # path / file
+    "directory_traversal": "path_traversal",
+    "lfi": "path_traversal", "local_file_inclusion": "path_traversal",
+    "rfi": "path_traversal", "remote_file_inclusion": "path_traversal",
+    # xxe / deserialize
+    "xml_external_entity": "xxe", "xxe_injection": "xxe",
+    "insecure_deserialization": "deserialization",
+    "unsafe_deserialization": "deserialization",
+    # file upload
+    "unrestricted_file_upload": "file_upload",
+    "arbitrary_file_upload": "file_upload",
+    "file_upload_bypass": "file_upload",
+    # open redirect
+    "open_redirect_vuln": "open_redirect",
+    # jwt
+    "jwt_none": "jwt", "jwt_weak_secret": "jwt", "jwt_tampering": "jwt",
+    "jwt_alg_confusion": "jwt",
+}
+
+
+def _canonicalize_vuln_type(vt: str) -> str:
+    """Map synonym vuln_type strings to canonical form.
+
+    Lowercases, converts dashes/spaces to underscores, then looks up
+    VULN_TYPE_CANONICAL. Unknown values pass through normalized (not the
+    alias map output), so novel taxonomy is preserved.
+    """
+    if not vt:
+        return ""
+    key = str(vt).strip().lower().replace("-", "_").replace(" ", "_")
+    return VULN_TYPE_CANONICAL.get(key, key)
+
+
+# Common vuln_types worth attempting against any web endpoint.
+# Used by _vuln_slot_hints to suggest untested attack vectors to
+# sub-agents so they don't re-try vectors already hypothesized.
+COMMON_VULN_TYPES: frozenset[str] = frozenset({
+    "sqli", "idor", "xss", "ssrf", "access_control", "auth_bypass",
+    "path_traversal", "rce", "csrf", "open_redirect", "xxe",
+    "information_disclosure", "file_upload", "deserialization",
+    "nosqli", "logic_flaw", "jwt", "ssti",
+})
+
+
+def _vuln_slot_hints(scan_run, endpoint: str, target_host: str = "") -> dict:
+    """Return "already tried vs untested" vuln_type slots for an endpoint.
+
+    Combines three knowledge sources:
+      - same-scan DiscoveryNode history (vuln/exploit_step children of
+        this endpoint) → existing_vuln_types_here
+      - cross-scan DeadEnd KB → prior_dead_end_vuln_types
+      - EndpointSpec.suspected_vuln_types (from prior entrypoint
+        analysis or confirm_finding auto-push) → kb_suspected_vuln_types
+
+    untested_common_vuln_types = COMMON_VULN_TYPES − existing, excluding
+    known dead ends. Empty dict if endpoint is blank.
+    """
+    from api.models import DiscoveryNode, DeadEnd, EndpointSpec
+    result: dict = {
+        "existing_vuln_types_here": [],
+        "untested_common_vuln_types": [],
+        "prior_dead_end_vuln_types": [],
+        "kb_suspected_vuln_types": [],
+    }
+    if not endpoint:
+        return result
+
+    try:
+        ep_norm = _normalize_ep(endpoint, scan_run.target_url or "")
+    except Exception:
+        ep_norm = endpoint
+    # Match push_discovery dedup policy: path-only fallback ONLY when the
+    # normalized endpoint carries no query string. Otherwise /search?q=
+    # and /search are treated as distinct attack surfaces in storage, and
+    # slot_hints must mirror that — else /search?q= would inherit the
+    # vuln_type set from bare /search and hide untested vectors.
+    ep_variants = {ep_norm, ep_norm.rstrip("/"), ep_norm + "/"}
+    if "?" not in ep_norm:
+        path_only = ep_norm.split("?", 1)[0]
+        ep_variants.add(path_only)
+        ep_variants.add(path_only + "/")
+    ep_variants.discard("")
+
+    try:
+        existing_raw = (
+            DiscoveryNode.objects
+            .filter(
+                scan_run=scan_run,
+                node_type__in=("vuln", "exploit_step"),
+                endpoint__in=ep_variants,
+            )
+            .exclude(vuln_type="")
+            .values_list("vuln_type", flat=True)
+        )
+        existing = {_canonicalize_vuln_type(v) for v in existing_raw if v}
+    except Exception:
+        existing = set()
+    result["existing_vuln_types_here"] = sorted(existing)
+
+    if not target_host:
+        try:
+            from urllib.parse import urlparse as _up
+            target_host = (_up(scan_run.target_url or "").netloc or "").lower()
+        except Exception:
+            target_host = ""
+
+    dead_canon: set = set()
+    if target_host:
+        try:
+            dead_raw = (
+                DeadEnd.objects
+                .filter(target_host=target_host, endpoint__in=ep_variants)
+                .values_list("vuln_type", flat=True)
+            )
+            dead_canon = {_canonicalize_vuln_type(v) for v in dead_raw if v}
+        except Exception:
+            pass
+        try:
+            spec = (
+                EndpointSpec.objects
+                .filter(target_host=target_host, endpoint__in=ep_variants)
+                .order_by("-last_seen_at")
+                .first()
+            )
+            if spec and spec.suspected_vuln_types:
+                svt = spec.suspected_vuln_types
+                if isinstance(svt, str):
+                    try:
+                        svt = json.loads(svt)
+                    except Exception:
+                        svt = []
+                if isinstance(svt, list):
+                    result["kb_suspected_vuln_types"] = sorted(
+                        {_canonicalize_vuln_type(v) for v in svt if v}
+                    )
+        except Exception:
+            pass
+    result["prior_dead_end_vuln_types"] = sorted(dead_canon)
+    result["untested_common_vuln_types"] = sorted(
+        COMMON_VULN_TYPES - existing - dead_canon
+    )
+    return result
+
+
 def _normalize_ep(ep: str, target_url: str = "") -> str:
     """Normalize endpoint for storage and dedup.
 
@@ -209,6 +412,37 @@ def register(mcp):
             except DiscoveryNode.DoesNotExist:
                 return json.dumps({"error": f"parent node {parent_node_id} not found"})
 
+        # Canonicalize vuln_type so taxonomy drift between sub-agents
+        # (privilege_escalation ↔ access_control, user_enum ↔
+        # information_disclosure, ...) collapses to one dedup key.
+        # Preserve the original string in context for traceability.
+        vuln_type_raw = vuln_type or ""
+        vuln_type = _canonicalize_vuln_type(vuln_type_raw)
+        if vuln_type and vuln_type != vuln_type_raw:
+            ctx.setdefault("vuln_type_raw", vuln_type_raw)
+
+        # Require vuln_type for vuln/exploit_step so sub-agents can't push
+        # under-classified nodes that bypass dedup. For exploit_step the
+        # parent is usually a vuln node — inherit if missing.
+        if node_type in ("vuln", "exploit_step") and not vuln_type:
+            if node_type == "exploit_step" and parent and parent.vuln_type:
+                vuln_type = _canonicalize_vuln_type(parent.vuln_type)
+                ctx.setdefault("vuln_type_inherited_from_parent", True)
+            else:
+                return json.dumps({
+                    "error": "vuln_type is required for vuln/exploit_step nodes",
+                    "hint": (
+                        "Pick a canonical type (sqli, idor, xss, ssrf, "
+                        "access_control, auth_bypass, information_disclosure, "
+                        "path_traversal, rce, csrf, xxe, file_upload, "
+                        "logic_flaw, jwt, ssti, open_redirect, nosqli, "
+                        "deserialization). Synonyms (privilege_escalation, "
+                        "user_enum, ...) are auto-canonicalized."
+                    ),
+                    "node_type": node_type,
+                    "summary_seen": (summary or "")[:160],
+                })
+
         if depth > DISCOVERY_MAX_DEPTH:
             return json.dumps({
                 "error": f"max depth {DISCOVERY_MAX_DEPTH} reached",
@@ -386,7 +620,14 @@ def register(mcp):
 
     @mcp.tool()
     def get_siblings(node_id: str) -> str:
-        """Get sibling nodes (same parent) to avoid duplicate exploration."""
+        """Get sibling nodes (same parent) + untested vuln_type slots.
+
+        Siblings answer "what already exists at this branch" so the
+        sub-agent can avoid duplicate work. slot_hints answers "what
+        vuln_types are still untested on this endpoint across scans" so
+        the sub-agent can deliberately pick a different angle instead of
+        re-pushing an already-hypothesized type.
+        """
         try:
             node = DiscoveryNode.objects.get(node_id=node_id)
         except DiscoveryNode.DoesNotExist:
@@ -409,7 +650,36 @@ def register(mcp):
                 "status": s["status"],
             })
 
-        return json.dumps({"count": len(items), "siblings": items})
+        slot_hints = _vuln_slot_hints(node.scan_run, node.endpoint or "")
+
+        return json.dumps({
+            "count": len(items),
+            "siblings": items,
+            "endpoint": node.endpoint or "",
+            "slot_hints": slot_hints,
+        })
+
+    @mcp.tool()
+    def get_vuln_slot_hints(scan_run_id: str, endpoint: str) -> str:
+        """Return already-tried vs untested vuln_type slots for an endpoint.
+
+        Call before pushing a vuln node or picking an exploit angle so
+        you don't duplicate an already-hypothesized vector or re-try a
+        known dead_end from a previous scan.
+
+        Returns JSON with:
+          - existing_vuln_types_here: already on this endpoint this scan
+          - untested_common_vuln_types: COMMON set − existing − dead ends
+          - prior_dead_end_vuln_types: from DeadEnd KB (cross-scan)
+          - kb_suspected_vuln_types: from EndpointSpec.suspected_vuln_types
+        """
+        from api.models import ScanRun
+        try:
+            run = ScanRun.objects.get(run_id=scan_run_id)
+        except ScanRun.DoesNotExist:
+            return json.dumps({"error": "scan run not found"})
+        hints = _vuln_slot_hints(run, endpoint or "")
+        return json.dumps({"endpoint": endpoint or "", **hints})
 
     @mcp.tool()
     def get_exploit_chains(scan_run_id: str) -> str:
