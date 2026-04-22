@@ -967,6 +967,196 @@ button { cursor: pointer; }
 .node-type-dead_end.canvas-node { opacity: 0.55; }
 .node-type-confirmed.canvas-node, .node-type-flag.canvas-node { border-color: rgba(42, 158, 120, 0.3); }
 
+/* ── Agent Working Route — active node / path / recent highlights ─── */
+/* NOTE: selectors are chained (.canvas-node.canvas-node-*) so they win
+   specificity over the theme overrides further down the file that otherwise
+   reset border-color and box-shadow on plain `.canvas-node`. */
+
+.canvas-node.canvas-node-on-path {
+  border-color: var(--accent-strong);
+  box-shadow: 0 0 0 1.5px var(--accent-strong), 0 4px 18px rgba(29, 103, 214, 0.18);
+  z-index: 4;
+}
+.canvas-node.canvas-node-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent), 0 6px 24px rgba(29, 103, 214, 0.32);
+  z-index: 6;
+  /* Base .canvas-node sets overflow:hidden which clips the -8px pulse ring.
+     Active nodes need the ring to spill outside the card. */
+  overflow: visible;
+}
+.canvas-node-pulse {
+  position: absolute;
+  inset: -8px;
+  border-radius: 12px;
+  border: 2px solid var(--accent);
+  pointer-events: none;
+  animation: wr-pulse 1.6s ease-out infinite;
+  z-index: 5;
+}
+@keyframes wr-pulse {
+  0%   { transform: scale(0.92); opacity: 0.75; }
+  70%  { transform: scale(1.18); opacity: 0; }
+  100% { transform: scale(1.18); opacity: 0; }
+}
+.canvas-node-recent-dot {
+  position: absolute;
+  top: 6px; right: 6px;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--accent-strong);
+  box-shadow: 0 0 0 2px rgba(255,255,255,0.85);
+  animation: wr-fadeout 30s linear forwards;
+  z-index: 5;
+}
+@keyframes wr-fadeout {
+  0%   { opacity: 1; transform: scale(1); }
+  80%  { opacity: 0.35; transform: scale(0.85); }
+  100% { opacity: 0; transform: scale(0.7); }
+}
+
+.canvas-edges path.canvas-edge-active {
+  stroke: var(--accent);
+  stroke-width: 2.8;
+  opacity: 0.9;
+}
+
+/* ── Current Activity Banner ─────────────────────────── */
+
+.activity-banner {
+  position: absolute;
+  top: 12px; left: 12px; right: 12px;
+  z-index: 20;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.08);
+  font-size: 0.78rem;
+  max-width: min(720px, calc(100% - 24px));
+  backdrop-filter: blur(4px);
+}
+.activity-banner.is-idle { opacity: 0.7; }
+.activity-banner-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--accent);
+  margin-top: 4px;
+  flex: 0 0 auto;
+}
+.activity-banner-dot.spinning {
+  animation: wr-spin-pulse 1s ease-in-out infinite;
+  box-shadow: 0 0 0 0 rgba(29, 103, 214, 0.45);
+}
+@keyframes wr-spin-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(29, 103, 214, 0.55); }
+  70%  { box-shadow: 0 0 0 8px rgba(29, 103, 214, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(29, 103, 214, 0); }
+}
+.activity-banner-body { flex: 1; min-width: 0; }
+.activity-banner-main { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.activity-banner-main strong { font-weight: 700; color: var(--accent-strong); }
+.activity-banner-tool {
+  background: rgba(29, 103, 214, 0.12);
+  color: var(--accent-strong);
+  padding: 1px 6px; border-radius: 4px;
+  font-size: 0.72rem;
+}
+.activity-banner-detail {
+  color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 520px;
+}
+.activity-banner-sub {
+  margin-top: 3px;
+  display: flex; gap: 12px;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+}
+.activity-banner-link {
+  background: none; border: 0;
+  color: var(--accent); cursor: pointer;
+  text-decoration: underline;
+  font: inherit; padding: 0;
+}
+.activity-banner-age { font-variant-numeric: tabular-nums; }
+
+/* ── Agent Timeline Panel ──────────────────────────── */
+
+.agent-timeline-panel {
+  width: 320px;
+  flex: 0 0 320px;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  min-height: 0;
+}
+.agent-timeline-head {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.agent-timeline-head .section-kicker {
+  font-size: 0.65rem; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text-dim);
+}
+.agent-timeline-head strong { font-size: 0.82rem; }
+.agent-timeline-list {
+  flex: 1; min-height: 0;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+.agent-timeline-empty {
+  padding: 20px 14px;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  text-align: center;
+}
+.agent-timeline-row {
+  display: flex; gap: 8px;
+  width: 100%;
+  padding: 6px 12px;
+  background: transparent; border: 0;
+  border-bottom: 1px dashed rgba(0,0,0,0.06);
+  font: inherit; font-size: 0.74rem;
+  text-align: left;
+  cursor: pointer;
+  color: var(--text);
+  align-items: center;
+}
+.agent-timeline-row:hover { background: rgba(29, 103, 214, 0.06); }
+.agent-timeline-row:disabled { cursor: default; opacity: 0.7; }
+.agent-timeline-row.has-node { }
+.agent-timeline-time {
+  flex: 0 0 64px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  font-size: 0.7rem;
+}
+.agent-timeline-tool {
+  flex: 0 0 auto;
+  background: rgba(29, 103, 214, 0.1);
+  color: var(--accent-strong);
+  padding: 1px 5px; border-radius: 3px;
+  font-size: 0.68rem;
+  max-width: 110px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.agent-timeline-detail {
+  flex: 1; min-width: 0;
+  color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.icon-button.is-on {
+  background: rgba(29, 103, 214, 0.12);
+  color: var(--accent-strong);
+  border-color: var(--accent);
+}
+
 /* ── Canvas Body (viewport + detail panel side by side) ── */
 
 .canvas-body { display: flex; flex: 1; gap: 0; overflow: hidden; border-radius: 10px; border: 1px solid var(--border); }
@@ -2224,6 +2414,21 @@ select:focus-visible {
     flex: 0 0 34vh;
     border-left: 0;
     border-top: 1px solid rgba(37, 45, 42, 0.10);
+  }
+
+  .agent-timeline-panel {
+    width: 100%;
+    flex: 0 0 32vh;
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+
+  .activity-banner {
+    left: 8px;
+    right: 8px;
+    top: 8px;
+    padding: 6px 10px;
+    font-size: 0.75rem;
   }
 
   .discovery-stats {

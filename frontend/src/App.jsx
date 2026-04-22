@@ -1085,8 +1085,9 @@ function collectEdges(roots) {
   return edges;
 }
 
-function CanvasEdges({ edges, positions }) {
-  const paths = [];
+function CanvasEdges({ edges, positions, activePath }) {
+  const normalPaths = [];
+  const activePaths = [];
   for (const { from, to } of edges) {
     const a = positions.get(from);
     const b = positions.get(to);
@@ -1096,16 +1097,26 @@ function CanvasEdges({ edges, positions }) {
     const x2 = b.x;
     const y2 = b.y + CARD_H / 2;
     const cx = Math.min(80, Math.abs(x2 - x1) * 0.4);
-    paths.push(<path key={`${from}-${to}`} d={`M${x1},${y1} C${x1 + cx},${y1} ${x2 - cx},${y2} ${x2},${y2}`} />);
+    const d = `M${x1},${y1} C${x1 + cx},${y1} ${x2 - cx},${y2} ${x2},${y2}`;
+    const onPath = activePath && activePath.has(from) && activePath.has(to);
+    const el = (
+      <path
+        key={`${from}-${to}`}
+        d={d}
+        className={onPath ? "canvas-edge-active" : undefined}
+      />
+    );
+    (onPath ? activePaths : normalPaths).push(el);
   }
   return (
     <svg className="canvas-edges">
-      <g>{paths}</g>
+      <g>{normalPaths}</g>
+      <g>{activePaths}</g>
     </svg>
   );
 }
 
-function CanvasNode({ node, x, y, selected, onSelect }) {
+function CanvasNode({ node, x, y, selected, onSelect, isActive, onActivePath, isRecent }) {
   const meta = NODE_TYPE_META[node.node_type] || NODE_TYPE_META.clue;
   const statusLabel = NODE_STATUS_LABEL[node.status] || node.status;
   const isSelected = selected === node.node_id;
@@ -1114,13 +1125,24 @@ function CanvasNode({ node, x, y, selected, onSelect }) {
   const endpoint = node.endpoint ? node.endpoint.split("?")[0] : "";
   const apiLabel = getDiscoveryApiLabel(node);
 
+  const cls = [
+    "canvas-node",
+    `node-type-${node.node_type}`,
+    isSelected ? "canvas-node-selected" : "",
+    isActive ? "canvas-node-active" : "",
+    onActivePath ? "canvas-node-on-path" : "",
+    isRecent ? "canvas-node-recent" : "",
+  ].filter(Boolean).join(" ");
+
   return (
     <div
-      className={`canvas-node node-type-${node.node_type} ${isSelected ? "canvas-node-selected" : ""}`}
+      className={cls}
       style={{ left: x, top: y }}
       title={`${apiLabel}${node.summary ? ` - ${node.summary}` : ""}`}
       onClick={(e) => { e.stopPropagation(); onSelect(isSelected ? null : node.node_id); }}
     >
+      {isActive ? <span className="canvas-node-pulse" aria-hidden="true" /> : null}
+      {isRecent && !isActive ? <span className="canvas-node-recent-dot" aria-hidden="true" /> : null}
       <div className="node-head">
         <span className="node-icon">{meta.icon}</span>
         <span className="node-api-label">{apiLabel}</span>
@@ -1852,6 +1874,218 @@ function EndpointSpecModal({ runId, targetUrl, onClose }) {
 }
 
 
+// ── Agent Working Route — 실시간 activity hook ────────────────────────
+// 백엔드 SSE(`/activity-stream/`) 를 1차로 시도하고, 브라우저가 EventSource 미지원이거나
+// 연결이 실패/종료되면 `/activity/` 3s polling 으로 graceful fallback. scan 이 종료 상태면
+// SSE 를 자동 닫고 마지막 snapshot 만 유지.
+function useActivityStream(runId, scanStatus) {
+  const [snapshot, setSnapshot] = useState(null);
+  const [isLive, setIsLive] = useState(false);
+  const [error, setError] = useState("");
+  const esRef = useRef(null);
+  const pollRef = useRef(null);
+
+  const applySnapshot = useCallback((s) => {
+    if (!s || typeof s !== "object") return;
+    setSnapshot(s);
+    setError("");
+  }, []);
+
+  useEffect(() => {
+    if (!runId) return undefined;
+
+    let cancelled = false;
+
+    function clearAll() {
+      if (esRef.current) {
+        try { esRef.current.close(); } catch { /* ignore */ }
+        esRef.current = null;
+      }
+      if (pollRef.current) {
+        window.clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+      setIsLive(false);
+    }
+
+    async function pullSnapshot() {
+      try {
+        const s = await apiGet(`/api/scan-runs/${runId}/activity/`);
+        if (!cancelled) applySnapshot(s);
+      } catch (e) {
+        if (!cancelled) setError(e.message || String(e));
+      }
+    }
+
+    function startPollingFallback() {
+      if (pollRef.current) return;
+      pullSnapshot();
+      pollRef.current = window.setInterval(pullSnapshot, 3000);
+    }
+
+    pullSnapshot();
+
+    const terminal = ["finished", "failed", "stopped"].includes(scanStatus);
+    if (terminal) {
+      return () => { cancelled = true; clearAll(); };
+    }
+
+    if (typeof window !== "undefined" && "EventSource" in window) {
+      try {
+        const es = new EventSource(apiUrl(`/api/scan-runs/${runId}/activity-stream/`));
+        esRef.current = es;
+        es.onopen = () => { if (!cancelled) setIsLive(true); };
+        es.onmessage = (ev) => {
+          try {
+            const data = JSON.parse(ev.data);
+            if (!cancelled) applySnapshot(data);
+          } catch { /* ignore malformed frame */ }
+        };
+        es.addEventListener("done", () => {
+          if (!cancelled) { setIsLive(false); try { es.close(); } catch { /* ignore */ } }
+        });
+        es.onerror = () => {
+          if (cancelled) return;
+          setIsLive(false);
+          try { es.close(); } catch { /* ignore */ }
+          esRef.current = null;
+          startPollingFallback();
+        };
+      } catch {
+        startPollingFallback();
+      }
+    } else {
+      startPollingFallback();
+    }
+
+    return () => { cancelled = true; clearAll(); };
+  }, [runId, scanStatus, applySnapshot]);
+
+  const activePath = useMemo(
+    () => new Set(snapshot?.active_path || []),
+    [snapshot]
+  );
+  const recentNodeIds = useMemo(
+    () => new Set(snapshot?.recent_node_ids || []),
+    [snapshot]
+  );
+
+  return {
+    snapshot,
+    isLive,
+    error,
+    activeNodeId: snapshot?.active_node_id || null,
+    activeNodeLabel: snapshot?.active_node_label || "",
+    activePath,
+    recentNodeIds,
+    currentTool: snapshot?.current_tool || "",
+    currentToolDetail: snapshot?.current_tool_detail || "",
+    lastActivityAt: snapshot?.last_activity_at || null,
+    toolHistory: snapshot?.tool_history || [],
+  };
+}
+
+
+// ── 상단 banner — 에이전트가 지금 뭘 하고 있는지 한 줄 요약. ─────────────
+function CurrentActivityBanner({ activity, onJumpToActive, scanStatus }) {
+  const { currentTool, currentToolDetail, activeNodeLabel, lastActivityAt, activeNodeId, isLive } = activity;
+  if (["finished", "failed", "stopped"].includes(scanStatus)) return null;
+  if (!currentTool && !activeNodeId) return null;
+
+  const ageMs = lastActivityAt ? (Date.now() - new Date(lastActivityAt).getTime()) : null;
+  const fresh = ageMs !== null && ageMs < 5000;
+  const idle = ageMs !== null && ageMs > 15000;
+  const ageLabel = ageMs === null
+    ? ""
+    : ageMs < 1000 ? "방금"
+    : ageMs < 60000 ? `${Math.round(ageMs / 1000)}초 전`
+    : `${Math.round(ageMs / 60000)}분 전`;
+
+  return (
+    <div className={`activity-banner ${fresh ? "is-fresh" : ""} ${idle ? "is-idle" : ""}`}>
+      <span className={`activity-banner-dot ${isLive && fresh ? "spinning" : ""}`} />
+      <div className="activity-banner-body">
+        <div className="activity-banner-main">
+          <strong>{fresh ? "Now" : "최근"}</strong>
+          <code className="activity-banner-tool">{currentTool || "idle"}</code>
+          {currentToolDetail ? (
+            <span className="activity-banner-detail">— {currentToolDetail}</span>
+          ) : null}
+        </div>
+        {activeNodeLabel || ageLabel ? (
+          <div className="activity-banner-sub">
+            {activeNodeLabel ? (
+              <span>
+                on <button type="button" className="activity-banner-link" onClick={onJumpToActive}>{activeNodeLabel}</button>
+              </span>
+            ) : null}
+            {ageLabel ? <span className="activity-banner-age">{ageLabel}</span> : null}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+
+// ── 우측 타임라인 패널 — tool-call 역순 리스트. row 클릭시 노드 선택. ──
+function AgentTimelinePanel({ activity, onSelectNode, onClose }) {
+  const { toolHistory } = activity;
+  const listRef = useRef(null);
+  const stickToTopRef = useRef(true);
+
+  // 최신이 위에 오므로, 사용자가 위(최신)에 머물러 있으면 새 이벤트 도착시도 그대로 top 유지.
+  // 스크롤 내렸으면 (stickToTop 해제) auto-scroll 멈춤.
+  const onScroll = useCallback(() => {
+    const el = listRef.current;
+    if (!el) return;
+    stickToTopRef.current = el.scrollTop < 20;
+  }, []);
+
+  useEffect(() => {
+    if (stickToTopRef.current && listRef.current) {
+      listRef.current.scrollTop = 0;
+    }
+  }, [toolHistory]);
+
+  function fmtTime(ts) {
+    if (!ts) return "--:--:--";
+    const d = new Date(ts);
+    return d.toLocaleTimeString("ko-KR", { hour12: false });
+  }
+
+  return (
+    <div className="agent-timeline-panel">
+      <div className="agent-timeline-head">
+        <div>
+          <div className="section-kicker">Timeline</div>
+          <strong>Agent tool-call 히스토리</strong>
+        </div>
+        <button type="button" className="icon-button" onClick={onClose} title="닫기">×</button>
+      </div>
+      <div className="agent-timeline-list" ref={listRef} onScroll={onScroll}>
+        {toolHistory.length === 0 ? (
+          <div className="agent-timeline-empty">아직 기록된 활동이 없습니다.</div>
+        ) : toolHistory.map((row, i) => (
+          <button
+            key={`${row.ts}-${i}`}
+            type="button"
+            className={`agent-timeline-row ${row.node_id ? "has-node" : ""}`}
+            onClick={() => row.node_id && onSelectNode(row.node_id)}
+            disabled={!row.node_id}
+            title={row.node_id ? "이 노드로 이동" : "연결된 노드 없음"}
+          >
+            <span className="agent-timeline-time">{fmtTime(row.ts)}</span>
+            <code className="agent-timeline-tool">{row.tool || "?"}</code>
+            <span className="agent-timeline-detail">{row.detail || ""}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
 function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
   const [nodes, setNodes] = useState([]);
   const [requests, setRequests] = useState([]);
@@ -1861,12 +2095,15 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [selectedNodeId, setSelectedNodeId] = useState(null);
+  const [showTimeline, setShowTimeline] = useState(true);
 
   const [pan, setPan] = useState({ x: 40, y: 40 });
   const [zoom, setZoom] = useState(1);
   const dragRef = useRef(null);
   const wasDragRef = useRef(false);
   const vpRef = useRef(null);
+
+  const activity = useActivityStream(runId, scanStatus);
 
   async function fetchTree() {
     setLoading(true);
@@ -1875,7 +2112,7 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
       // 보여주려면 다 필요. EndpointSpec 은 host KB 자산 (scan 외부에 누적됨).
       const [treeData, reqData, candData, findData, specData] = await Promise.all([
         apiGet(`/api/scan-runs/${runId}/discovery-tree/`),
-        apiGet(`/api/scan-runs/${runId}/request-catalog/?page_size=200`).catch(() => ({})),
+        apiGet(`/api/request-catalog/list/?run_id=${runId}&page_size=200`).catch(() => ({})),
         apiGet(`/api/candidates/list/?run_id=${runId}&page_size=200`).catch(() => ({})),
         apiGet(`/api/findings/?run_id=${runId}&page_size=200`).catch(() => ({})),
         apiGet(`/api/scan-runs/${runId}/endpoint-specs/`).catch(() => ({})),
@@ -2049,6 +2286,12 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
           </div>
           <div className="canvas-head-actions">
             <span className="canvas-zoom-label">{Math.round(zoom * 100)}%</span>
+            <button
+              type="button"
+              className={`icon-button ${showTimeline ? "is-on" : ""}`}
+              title={showTimeline ? "타임라인 숨기기" : "타임라인 보기"}
+              onClick={() => setShowTimeline((v) => !v)}
+            >☰</button>
             <button type="button" className="icon-button" title="화면 맞춤" onClick={fitToView}>⊞</button>
             <button type="button" className="icon-button" title="새로고침" onClick={fetchTree}>↻</button>
             <button type="button" className="ghost-button" onClick={onClose}>닫기</button>
@@ -2106,18 +2349,46 @@ function DiscoveryTreeModal({ runId, scanStatus, onClose }) {
             onPointerUp={onPointerUp}
             onClick={() => { if (!wasDragRef.current) setSelectedNodeId(null); }}
           >
+            <CurrentActivityBanner
+              activity={activity}
+              scanStatus={scanStatus}
+              onJumpToActive={() => activity.activeNodeId && selectAndFocusNode(activity.activeNodeId)}
+            />
             <div className="canvas-world" style={{ transform: `translate(${pan.x}px,${pan.y}px) scale(${zoom})` }}>
-              <CanvasEdges edges={edges} positions={positions} />
+              <CanvasEdges edges={edges} positions={positions} activePath={activity.activePath} />
               {allNodes.map((node) => {
                 const pos = positions.get(node.node_id);
                 if (!pos) return null;
-                return <CanvasNode key={node.node_id} node={node} x={pos.x} y={pos.y} selected={selectedNodeId} onSelect={setSelectedNodeId} />;
+                const isActive = activity.activeNodeId === node.node_id;
+                const onActivePath = activity.activePath.has(node.node_id);
+                const isRecent = activity.recentNodeIds.has(node.node_id);
+                return (
+                  <CanvasNode
+                    key={node.node_id}
+                    node={node}
+                    x={pos.x}
+                    y={pos.y}
+                    selected={selectedNodeId}
+                    onSelect={setSelectedNodeId}
+                    isActive={isActive}
+                    onActivePath={onActivePath}
+                    isRecent={isRecent}
+                  />
+                );
               })}
             </div>
             {!loading && !allNodes.length && !error ? (
               <div className="canvas-empty callout callout-neutral">이 스캔에는 탐색 노드가 없습니다.</div>
             ) : null}
           </div>
+
+          {showTimeline ? (
+            <AgentTimelinePanel
+              activity={activity}
+              onSelectNode={selectAndFocusNode}
+              onClose={() => setShowTimeline(false)}
+            />
+          ) : null}
 
           {selectedNodeId ? (
             <NodeDetailPanel

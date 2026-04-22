@@ -1396,6 +1396,19 @@ async def _execute_tool_calls(
     return results
 
 
+def _lookup_trace_node(scan_run: ScanRun, current_node_id: str):
+    """Resolve a DiscoveryNode for LLMTrace.target_node FK (sync helper)."""
+    if not current_node_id:
+        return None
+    try:
+        from api.models import DiscoveryNode
+        return DiscoveryNode.objects.filter(
+            scan_run=scan_run, node_id=current_node_id
+        ).first()
+    except Exception:
+        return None
+
+
 async def _run_role_phase(
     scan_run: ScanRun,
     anthropic,
@@ -1528,6 +1541,7 @@ async def _run_role_phase(
                 or json.dumps(raw, ensure_ascii=False)
             )
             last_text = "```json\n" + str(inner) + "\n```"
+            trace_node = await sync_to_async(_lookup_trace_node)(scan_run, current_node_id)
             await sync_to_async(record_llm_trace)(
                 scan_run=scan_run,
                 call_index=acc.calls,
@@ -1545,10 +1559,12 @@ async def _run_role_phase(
                     "emitted": emit_block.name,
                     "message_count": len(call_messages),
                 },
+                target_node=trace_node,
             )
             break
 
         if response.stop_reason == "end_turn" or not tool_use_blocks:
+            trace_node = await sync_to_async(_lookup_trace_node)(scan_run, current_node_id)
             await sync_to_async(record_llm_trace)(
                 scan_run=scan_run,
                 call_index=acc.calls,
@@ -1565,6 +1581,7 @@ async def _run_role_phase(
                     "turn": turn + 1,
                     "message_count": len(call_messages),
                 },
+                target_node=trace_node,
             )
             break
 
@@ -1573,6 +1590,7 @@ async def _run_role_phase(
             scan_run, tool_router, tool_use_blocks, current_node_id,
         )
 
+        trace_node = await sync_to_async(_lookup_trace_node)(scan_run, current_node_id)
         await sync_to_async(record_llm_trace)(
             scan_run=scan_run,
             call_index=acc.calls,
@@ -1590,6 +1608,7 @@ async def _run_role_phase(
                 "message_count": len(call_messages),
                 "tool_results": summarize_tool_results(tool_results),
             },
+            target_node=trace_node,
         )
         messages.append({"role": "user", "content": tool_results})
     else:
