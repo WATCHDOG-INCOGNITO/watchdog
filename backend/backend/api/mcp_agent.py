@@ -373,6 +373,21 @@ record_pattern_use.
 - SSRF: oracle_ssrf or OOB hit from victim host.
 - LFI: oracle_lfi signature.
 
+## Reproducibility + severity sizing
+confirm_finding 전 반드시:
+1. 같은 payload 3회 재시도 → 2회 이상 성공해야 confirmed (1/3 → inconclusive).
+2. severity 는 실 영향 기준 —
+   - 데이터 노출 없는 500/405/403 불일치 = `info`
+   - resource ID 예측 가능 (실 데이터 없음) = `low`
+   - 실제 타인 사용자 데이터 1건 이상 노출 = `medium`
+   - 민감 PII/토큰/DB dump = `high`
+   - RCE/admin 세션 탈취 = `critical`
+   "access_control bypass high" 로 올라왔어도 evidence 가 500 error 만이면
+   severity=info 로 downgrade.
+3. Scope ≠ Severity — 같은 증상이 N 개 endpoint 에서 나와도 그건 하나의
+   버그 반복. critical/high 로 올리려면 scope 가 아니라 impact
+   (실 데이터/권한 변경/RCE) 증거가 필요.
+
 ## Exit (emit_verdicts or JSON)
 
 ```json
@@ -2267,6 +2282,41 @@ prior recheck, sink info).
   SPA 기반 타겟에서 HTTP 200 + HTML body 만으로 IDOR confirm 하면 거의 항상
   false positive. 이전 스캔 3건 IDOR findings 가 이 이유로 오판됐음.
 
+## Reproducibility gate — confirm 전 필수
+1회 성공 payload 는 confirmed 증거로 부족. **같은 payload 를 최소 3회 재시도**
+(stateless 라면 multi_http_probe 로 1턴에 묶음) 후:
+- 2회 이상 성공 → confirmed 가능
+- 1회만 성공 + 2회 이상 실패 → `clue` 로 마킹 + summary 에
+  "non-reproducible: 1/3" 기록. confirm_finding 금지.
+- 0회 성공 → dead_end.
+예외: 상태변경 공격 (DELETE 등) 은 첫 시도에서 리소스가 사라지면 재현 불가 —
+이 때는 summary 에 "one-shot destructive, replay N/A" 기록 후 다른 증거
+(timing, log, 다른 리소스로 재시도 성공) 가 뒷받침되어야 confirmed.
+"LATER TESTING PHASE: bypass no longer works" 류 증거는 **절대 not confirmed**
+— 일시적 서버 상태/timing 의존, reliable vuln 이 아님.
+
+## Severity rubric (advisory — confirm_finding 호출 시 참고)
+- critical: RCE, 전체 auth bypass (admin 세션 탈취 성공), 전체 DB dump
+- high: 특정 사용자 PII/민감데이터 실 접근 증거(타인 이름/이메일/토큰 노출),
+  확정된 SQLi 로 데이터 추출 성공, admin panel 에 저장된 XSS
+- medium: reflected XSS, CSRF on sensitive action, IDOR 로 타인 리소스 일부
+  조회 (최소 1건 실 데이터 확인), SSRF 로 내부망 포트 스캔 성공
+- low: rate-limit bypass, security header 누락, low-severity CORS misconfig,
+  예측 가능한 resource ID 노출 (실 데이터 노출 없이 ID 만 숫자 순차)
+- info: 500 internal error (데이터 노출 없음), HTTP method 핸들링 불일치
+  (OPTIONS 500 vs 403 등), 버전 disclosure, SPA fallback 관련 상태코드 이상
+
+"500 Internal Server Error + 에러 메시지만" 은 info — 데이터 노출이 없으면
+access_control bypass / privilege escalation 으로 올리지 말 것.
+
+★ Scope ≠ Severity: 동일한 증상 (같은 500 에러, 같은 response body) 이
+N 개 endpoint 에서 재현돼도 그건 **하나의 버그가 여러 경로에서 보이는
+것**이지 critical 이 되지 않음. severity 결정은 오직 "실제 impact"
+— data exposure / auth state change / code execution 기준. "system-wide"
+라는 이유만으로 critical/high 올리면 거의 항상 과대. 여러 endpoint
+affect 를 강조하려면 summary 에 scope 를 기술하되 severity 는 impact
+기준 그대로 유지.
+
 ## Output contract — TIER A (mandatory data finalize)
 다음 도구 호출 누락 시 노드/KB 가 stuck/incomplete 상태로 끝남:
 
@@ -2407,6 +2457,19 @@ evidence 에 HTTP 200 + HTML body 만 있으면 FP 가능성 매우 높음. reje
   (b) oracle_idor_diff 로 baseline vs variant body diff 재검증.
 verdict in {spa_catch_all, same_shell} → dismiss_candidate 필수.
 verdict=likely_idor + novel_lines 에 실제 사용자 데이터 포함 시에만 confirm.
+
+★ Reproducibility: 기존 candidate 의 oracle 호출이 1회였다면 같은 payload
+를 **독립적으로 2회 더** 보내 총 3회 중 2회 이상 성공해야 verified.
+1/3 성공 → rejected (dismiss_candidate + "non-reproducible" 로 learn_dead_end).
+evidence 에 "LATER TESTING PHASE: bypass no longer works" 류 기록이 있으면
+무조건 rejected — 재현성 없는 signal 은 reliable vuln 이 아님.
+
+★ Severity right-sizing: candidate 가 "access_control high" 로 올라와도
+evidence 가 500 error + 에러 메시지만이면 `info` 로 downgrade 후 confirm
+(또는 dismiss). "실제 데이터 노출 증거" 없이 high/critical 금지.
+동일 증상이 N 개 endpoint 에서 재현된다는 이유로 severity 상향 금지
+(scope ≠ severity — impact 기준 그대로 유지). HYPOTHESIS_PROMPT 의
+Severity rubric 그대로 적용.
 
 ## Output contract
 - IF verified:
@@ -3597,13 +3660,30 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
     # old cand_id → new Candidate (findings 재연결용).
     cand_map: dict = {}
 
+    # seed-time dedup: (norm_endpoint, vuln_type, node_type) 이 이미 seed 된
+    # 노드를 가리키는 경우 신규 create 대신 대표 노드로 매핑 (자식의 parent
+    # 재연결). prev 스캔이 동일 핸들러의 여러 URL variant 를 별개 노드로
+    # 박아둔 상태에서 resume 시 variant 를 하나로 통합.
+    _seeded_key_to_node: dict = {}
+    _target_url_for_norm = scan_run.target_url or ""
+
     for prev in prev_nodes:
         if prev.node_id == prev_root_id:
             continue
 
+        norm_ep = _normalize_endpoint_for_dedup(prev.endpoint or "", _target_url_for_norm)
+        seed_key = (norm_ep, prev.vuln_type or "", prev.node_type)
+
         # 부모 해결 — 이미 매핑된 부모가 있으면 재활용, 아니면 orphan → root.
         new_parent = id_map.get(prev.parent_id, root_node) if prev.parent_id else root_node
         new_depth = (new_parent.depth + 1) if new_parent else 1
+
+        # 같은 key 가 이미 seed 됐으면 대표 노드로 매핑하고 create skip.
+        # 상태 우선순위: confirmed > explored > dead_end > exploring > pending.
+        # 이미 있는 게 상위면 그대로 두고, 새로 들어온 게 상위면 교체.
+        if seed_key in _seeded_key_to_node:
+            id_map[prev.node_id] = _seeded_key_to_node[seed_key]
+            continue
 
         old_status = prev.status or "pending"
         if old_status in ("confirmed", "dead_end", "explored"):
@@ -3623,12 +3703,15 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
         merged_ctx["prev_status"] = old_status
 
         clean_summary = _strip_seed_prefix(prev.summary or "")
+        # endpoint 는 normalize 된 값으로 저장 — push_discovery 의 dedup 과
+        # 일관. prev.endpoint 가 full URL 이어도 path 만 남김.
+        stored_ep = norm_ep or (prev.endpoint or "")
         new_node = DiscoveryNode.objects.create(
             scan_run=scan_run,
             parent=new_parent,
             depth=new_depth,
             node_type=prev.node_type,
-            endpoint=prev.endpoint or "",
+            endpoint=stored_ep,
             vuln_type=prev.vuln_type or "",
             summary=f"{tag} {clean_summary[:250]}",
             context=merged_ctx,
@@ -3636,6 +3719,7 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
             explored_at=explored_at,
         )
         id_map[prev.node_id] = new_node
+        _seeded_key_to_node[seed_key] = new_node
 
         if prev.node_type == "endpoint":
             counts["endpoints"] += 1
