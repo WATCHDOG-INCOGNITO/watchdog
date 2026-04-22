@@ -28,6 +28,10 @@ def _normalize_ep(ep: str, target_url: str = "") -> str:
     - Cross-origin full URLs → scheme://host:port/path + sorted query param names.
       Scheme is preserved because http vs https can expose different attack surfaces.
     - Trailing slash stripped, path lowercased.
+    - target_url 의 path prefix (e.g. /lms) 가 endpoint path 앞에 붙어있으면
+      제거 → /lms/register 와 /register 가 같은 dedup key. False merge 위험
+      낮고 (prefix 가 일치할 때만), 같은 핸들러의 full-path/rel-path 변형
+      (router 기준 rel vs server mounted full) 을 하나로 모음.
     """
     from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
     if not ep:
@@ -35,6 +39,13 @@ def _normalize_ep(ep: str, target_url: str = "") -> str:
     path_part = ep
     host_prefix = ""
     query = ""
+    target_base_prefix = ""
+    if target_url:
+        try:
+            _tp = _urlparse(target_url)
+            target_base_prefix = (_tp.path or "").rstrip("/").lower()
+        except Exception:
+            pass
     if ep.startswith(("http://", "https://")):
         try:
             parsed = _urlparse(ep)
@@ -61,6 +72,17 @@ def _normalize_ep(ep: str, target_url: str = "") -> str:
         path_part, query = ep.split("?", 1)
 
     path_part = path_part.rstrip("/") or "/"
+
+    # target base prefix strip — /lms/register → /register. host_prefix 쓰는
+    # cross-origin 경우에는 적용 안 함 (다른 호스트의 path 를 target base 로
+    # 잘라낼 근거 없음).
+    if not host_prefix and target_base_prefix:
+        pp_lower = path_part.lower()
+        if pp_lower == target_base_prefix:
+            path_part = "/"
+        elif pp_lower.startswith(target_base_prefix + "/"):
+            path_part = path_part[len(target_base_prefix):]
+
     param_suffix = ""
     if query:
         try:

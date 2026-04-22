@@ -62,6 +62,30 @@ _seed_from_previous 가 이전 scan 의 confirmed vuln 을 recheck=True 로 push
      sub_technique) to test incomplete-fix bypass.
    - oracle 성공 → confirmed flow.
 
+## Reproducibility + Severity right-sizing
+
+★ **Reproducibility**: 기존 candidate 의 oracle 호출이 1회였다면 같은
+payload 를 **독립적으로 2회 더** 보내 총 3회 중 2회 이상 성공해야
+verified. 1/3 성공 → rejected (dismiss_candidate + "non-reproducible"
+로 learn_dead_end). evidence 에 "LATER TESTING PHASE: bypass no longer
+works" 류 기록이 있으면 무조건 rejected — 재현성 없는 signal 은
+reliable vuln 이 아님.
+
+★ **Severity right-sizing**: candidate 가 "access_control high" 로
+올라와도 evidence 가 500 error + 에러 메시지만이면 `info` 로 downgrade
+후 confirm (또는 dismiss). 실제 데이터 노출 증거 없이 high/critical
+금지. Rubric:
+- critical: RCE, 전체 auth bypass, DB dump
+- high: 실 PII/토큰 노출, 확정 SQLi 로 데이터 추출
+- medium: reflected XSS, CSRF, IDOR 로 타인 데이터 1건+ 확인
+- low: rate-limit bypass, header 누락, resource ID 예측 (no data)
+- info: 500 + 에러 메시지만, method 핸들링 불일치 (OPTIONS 500), SPA
+  fallback 관련 상태코드 이상
+
+★ **Scope ≠ Severity**: 동일 증상이 N 개 endpoint 에서 재현된다는 이유
+로 severity 상향 금지 (scope ≠ severity — impact 기준 그대로 유지).
+같은 버그가 여러 경로에서 보일 뿐 critical 이 되지 않음.
+
 ## Output contract — TIER A
 
 ### IF verified (oracle 동의)

@@ -80,6 +80,40 @@ multi_http_probe(requests_json='[
    mutation_type="...")` for variants OR craft your own based on observed
    responses (encoding, framework quirk, timing).
 
+## Reproducibility gate — confirm 전 필수
+1회 성공 payload 는 confirmed 증거로 부족. **같은 payload 를 최소 3회 재시도**
+(stateless 면 `multi_http_probe` 로 1턴에 묶음) 후:
+- 2회 이상 성공 → confirmed 가능
+- 1회 성공 + 2회 이상 실패 → `clue` 로 마킹 + summary 에
+  "non-reproducible: 1/3" 기록. `confirm_finding` 금지.
+- 0회 성공 → `dead_end`.
+예외: 상태변경 공격 (DELETE/UPDATE 등) 은 첫 시도에 리소스가 사라져 재현
+불가한 경우 — summary 에 "one-shot destructive, replay N/A" 기록 후 다른
+evidence (timing/log/다른 리소스 재시도 성공) 가 뒷받침되어야 confirmed.
+"LATER TESTING PHASE: bypass no longer works" 류 기록은 **절대 not
+confirmed** — 일시적 서버 상태/timing 의존, reliable vuln 아님.
+
+## Severity rubric (advisory — confirm_finding 시 참고)
+- **critical**: RCE, 전체 auth bypass (admin 세션 탈취 성공), 전체 DB dump
+- **high**: 특정 사용자 PII/민감데이터 실 접근 증거 (타인 이름/이메일/토큰
+  노출), 확정된 SQLi 로 데이터 추출 성공, admin panel 에 저장된 XSS
+- **medium**: reflected XSS, CSRF on sensitive action, IDOR 로 타인
+  리소스 일부 조회 (최소 1건 실 데이터 확인), SSRF 로 내부망 포트 스캔
+- **low**: rate-limit bypass, security header 누락, low-severity CORS
+  misconfig, resource ID 예측 가능 (실 데이터 노출 없이 ID 만)
+- **info**: 500 internal error (데이터 노출 없음), HTTP method 핸들링
+  불일치 (OPTIONS 500 vs 403), 버전 disclosure, SPA fallback 상태코드 이상
+
+"500 Internal Server Error + 에러 메시지만" 은 info — 데이터 노출이
+없으면 access_control bypass / privilege_escalation 으로 올리지 말 것.
+
+★ **Scope ≠ Severity**: 동일한 증상 (같은 500 에러, 같은 response body)
+이 N 개 endpoint 에서 재현돼도 그건 **하나의 버그가 여러 경로에서 보이는
+것**이지 critical 이 되지 않음. severity 결정은 오직 "실제 impact"
+— data exposure / auth state change / code execution 기준. "system-wide"
+라는 이유만으로 critical/high 올리면 거의 항상 과대. 여러 endpoint affect
+를 강조하려면 summary 에 scope 기술, severity 는 impact 기준 유지.
+
 ## Output contract — TIER A FINALIZE (반드시 완주)
 
 ### IF confirmed
