@@ -225,6 +225,7 @@ def run_verification_loop(candidate, scan_run):
     stages = plan.get("stages", [])
     total_tokens = 0
 
+    try:
         usage = plan.get("_usage", {})
         total_tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
 
@@ -257,8 +258,8 @@ def run_verification_loop(candidate, scan_run):
             pl = pending_payloads.pop(0)
             attempt_num += 1
             param_name = pl.get("param", list(params.keys())[0] if params else "q")
-            payload_value = pl.get("value", "")
-            pl_method = pl.get("method", method).upper()
+            payload_value = pl.get("value") or ""
+            pl_method = (pl.get("method") or method).upper()
 
             logger.info(f"[{candidate.cand_id}] attempt {attempt_num}/{MAX_ATTEMPTS}: "
                          f"{param_name}={payload_value[:60]}")
