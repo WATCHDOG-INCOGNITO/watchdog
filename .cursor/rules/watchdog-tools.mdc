@@ -79,6 +79,7 @@ CLI 전용: create_scan, create_root, complete_scan, stop_scan, fail_scan, recor
 
 | 도구 | 용도 |
 |------|------|
+| `browser_set_user_agent` | 브라우저 User-Agent 변경 (버그바운티 식별 등). navigate 전 호출 |
 | `browser_navigate` | URL 이동 |
 | `browser_extract_api_endpoints` | JS에서 API 엔드포인트 추출 |
 | `browser_get_dom` | DOM 트리 조회 |

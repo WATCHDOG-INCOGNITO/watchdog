@@ -7,6 +7,7 @@ _browser = None
 _context = None
 _page = None
 _network_log = []
+_custom_user_agent: str | None = None
 
 def _ensure_browser():
     global _browser, _context, _page, _network_log
@@ -19,8 +20,9 @@ def _ensure_browser():
         headless=True,
         args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
+    ua = _custom_user_agent or "WatchdogBrowser/1.0"
     _context = _browser.new_context(
-        user_agent="WatchdogBrowser/1.0",
+        user_agent=ua,
         ignore_https_errors=True,
         viewport={"width": 1280, "height": 720},
     )
@@ -50,6 +52,32 @@ def _ensure_browser():
     _page.on("response", _on_response)
 
 def register(mcp):
+
+    @mcp.tool()
+    async def browser_set_user_agent(user_agent: str) -> str:
+        """브라우저의 User-Agent를 변경한다. 버그바운티 식별 등에 사용.
+        이미 브라우저가 열려 있으면 새 context 로 재생성한다.
+        browser_navigate 전에 호출해야 효과가 있다.
+        """
+        global _custom_user_agent, _browser, _context, _page, _network_log
+
+        def _sync():
+            global _custom_user_agent, _browser, _context, _page, _network_log
+            _custom_user_agent = user_agent.strip() if user_agent else None
+            if _page is not None:
+                _page.close()
+                _context.close()
+                ua = _custom_user_agent or "WatchdogBrowser/1.0"
+                _context = _browser.new_context(
+                    user_agent=ua,
+                    ignore_https_errors=True,
+                    viewport={"width": 1280, "height": 720},
+                )
+                _page = _context.new_page()
+                _network_log = []
+            return json.dumps({"user_agent": _custom_user_agent or "WatchdogBrowser/1.0", "applied": True})
+
+        return await sync_to_async(_sync, thread_sensitive=False)()
 
     @mcp.tool()
     async def browser_navigate(url: str, wait_until: str = "networkidle") -> str:
@@ -220,26 +248,111 @@ def register(mcp):
 
         return await sync_to_async(_sync, thread_sensitive=False)()
 
+    _STATIC_EXT = frozenset({
+        ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+        ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp", ".avif",
+        ".mp4", ".mp3", ".pdf",
+    })
+
     @mcp.tool()
     async def browser_extract_api_endpoints() -> str:
-        """현재 페이지의 JS 번들에서 API 엔드포인트를 추출한다.
-        네트워크 로그 + DOM 내 스크립트에서 /api/, fetch(), axios 패턴을 찾는다.
-        SPA 사이트의 숨겨진 API를 찾을 때 핵심 도구.
+        """현재 페이지에서 모든 URL/API를 추출한다.
+        네트워크 로그 + DOM 내 스크립트의 API 패턴 + HTML 링크(<a>, <form>, <iframe>, <link>)를 모두 수집.
+        api_endpoints (JS/API), page_links (HTML DOM), network_urls (실제 요청) 세 카테고리로 반환.
         """
         def _sync():
             _ensure_browser()
             import re
+            from urllib.parse import urlparse
 
-            endpoints = set()
+            api_endpoints = set()
+            page_links = set()
+            network_urls = set()
 
+            # 1. Network log — all requests (not just /api/ patterns)
             api_patterns = ["/api/", "/v1/", "/v2/", "/rest/", "/graphql"]
             for log in _network_log:
                 url = log.get("url", "")
-                if any(p in url for p in api_patterns):
-                    from urllib.parse import urlparse
+                if not url:
+                    continue
+                try:
                     parsed = urlparse(url)
-                    endpoints.add(f"{log.get('method', 'GET')} {parsed.path}")
+                    path = parsed.path
+                    ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path.rsplit("/", 1)[-1] else ""
+                    if ext in _STATIC_EXT:
+                        continue
+                    method = log.get("method", "GET")
+                    entry = f"{method} {path}"
+                    if any(p in url for p in api_patterns):
+                        api_endpoints.add(entry)
+                    else:
+                        network_urls.add(entry)
+                except Exception:
+                    pass
 
+            # 2. DOM: <a href>, <form action>, <iframe src>
+            # Resolve all relative URLs to absolute via new URL(val, location.href),
+            # then convert same-origin to path+query for consistent endpoint format.
+            # SPA hash routes (#/admin, /#/settings) collected separately.
+            hash_routes = set()
+            try:
+                dom_result = _page.evaluate("""() => {
+                    const base = location.href;
+                    const origin = location.origin;
+                    const links = new Set();
+                    const hashes = new Set();
+                    function resolve(raw, method) {
+                        if (!raw || raw.startsWith('javascript:')
+                            || raw.startsWith('mailto:') || raw.startsWith('data:')
+                            || raw.startsWith('tel:')) return;
+                        if (raw.startsWith('#/') || raw.startsWith('/#')) {
+                            const route = raw.replace(/^[/#]+/, '');
+                            if (route.length > 1) hashes.add('#/' + route);
+                            return;
+                        }
+                        if (raw.startsWith('#')) return;
+                        try {
+                            const u = new URL(raw, base);
+                            let path;
+                            if (u.origin === origin) {
+                                path = u.pathname + u.search;
+                            } else {
+                                path = u.href;
+                            }
+                            links.add(method + ' ' + path);
+                        } catch(e) {}
+                    }
+                    document.querySelectorAll('a[href]').forEach(el =>
+                        resolve(el.getAttribute('href'), 'GET'));
+                    document.querySelectorAll('form[action]').forEach(el =>
+                        resolve(el.getAttribute('action'),
+                                (el.getAttribute('method') || 'GET').toUpperCase()));
+                    document.querySelectorAll('iframe[src]').forEach(el =>
+                        resolve(el.getAttribute('src'), 'GET'));
+                    return {
+                        links: Array.from(links).slice(0, 200),
+                        hashes: Array.from(hashes).slice(0, 50)
+                    };
+                }""")
+                for entry in dom_result.get("links", []):
+                    parts = entry.split(" ", 1)
+                    if len(parts) == 2:
+                        url_part = parts[1]
+                        try:
+                            parsed = urlparse(url_part) if url_part.startswith("http") else None
+                            path = parsed.path if parsed else url_part.split("?")[0]
+                            ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path.rsplit("/", 1)[-1] else ""
+                            if ext in _STATIC_EXT:
+                                continue
+                        except Exception:
+                            pass
+                    page_links.add(entry)
+                for h in dom_result.get("hashes", []):
+                    hash_routes.add(h)
+            except Exception:
+                pass
+
+            # 3. Inline scripts — API/fetch patterns
             try:
                 scripts = _page.eval_on_selector_all(
                     "script:not([src])", "els => els.map(e => e.textContent)"
@@ -256,10 +369,11 @@ def register(mcp):
                         continue
                     for pattern in js_patterns:
                         for match in pattern.findall(script):
-                            endpoints.add(f"GET {match}")
+                            api_endpoints.add(f"GET {match}")
             except Exception:
                 pass
 
+            # 4. External bundles
             try:
                 src_urls = _page.eval_on_selector_all("script[src]", "els => els.map(e => e.src)")
                 for url in src_urls:
@@ -270,17 +384,21 @@ def register(mcp):
                                 js = resp.text()
                                 for pattern in js_patterns:
                                     for match in pattern.findall(js):
-                                        endpoints.add(f"GET {match}")
+                                        api_endpoints.add(f"GET {match}")
                         except Exception:
                             pass
             except Exception:
                 pass
 
             return json.dumps({
-                "endpoints": sorted(endpoints),
-                "count": len(endpoints),
+                "api_endpoints": sorted(api_endpoints),
+                "page_links": sorted(page_links)[:100],
+                "network_urls": sorted(network_urls)[:50],
+                "hash_routes": sorted(hash_routes)[:30],
+                "total_count": len(api_endpoints) + len(page_links) + len(network_urls) + len(hash_routes),
                 "sources": {
                     "network_log": len([l for l in _network_log if l.get("type") == "request"]),
+                    "dom_links": "parsed (a[href], form[action], iframe[src])",
                     "inline_scripts": "parsed",
                     "external_bundles": "parsed",
                 }
