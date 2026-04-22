@@ -1,11 +1,16 @@
 import threading
 import json as json_mod
+import time
+import hashlib
+from datetime import timedelta
 
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status, viewsets
 from rest_framework.pagination import PageNumberPagination
 from django.db import connection
+from django.http import StreamingHttpResponse
+from django.utils import timezone
 
 from .models import (
     ScanRun, LLMTrace, RequestCatalog, Candidate, Finding, EvidenceBlob,
@@ -470,6 +475,179 @@ def discovery_tree(request, run_id):
         .order_by("depth", "created_at")
     )
     return Response(DiscoveryNodeSerializer(nodes, many=True).data)
+
+
+# ── Agent Working Route (real-time activity) ─────────────────────────────
+# LLMTrace.target_node FK 덕분에 "지금 뭘 하고 있나"를 빠르게 조회할 수 있다.
+# snapshot: 첫 paint / SSE reconnect 복구 용.
+# activity_stream: text/event-stream SSE — 2초 폴링 + dedup push.
+
+_ACTIVE_WINDOW_SEC = 30
+_TIMELINE_LIMIT = 50
+
+
+def _extract_tool_detail(tool_calls):
+    """tool_calls JSON payload 에서 사람 읽기 쉬운 한 줄 요약 뽑기."""
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return "", ""
+    first = tool_calls[0] if isinstance(tool_calls[0], dict) else {}
+    tool_name = first.get("tool") or first.get("name") or ""
+    params = first.get("params") or first.get("input") or {}
+    if isinstance(params, dict):
+        method = params.get("method") or ""
+        url = params.get("url") or params.get("endpoint") or params.get("target_url") or ""
+        if method and url:
+            detail = f"{method} {url}"
+        elif url:
+            detail = url
+        else:
+            # fallback: first couple of string values
+            bits = []
+            for k, v in list(params.items())[:3]:
+                if isinstance(v, (str, int, float, bool)):
+                    bits.append(f"{k}={v}")
+            detail = ", ".join(bits)
+    else:
+        detail = str(params)[:200]
+    return tool_name, detail[:500]
+
+
+def _compute_activity_snapshot(run_id):
+    """최근 traces 기반으로 activity snapshot 생성.
+
+    Returns None if scan_run 자체가 없음.
+    """
+    from .models import ScanRun, LLMTrace, DiscoveryNode
+
+    try:
+        scan_run = ScanRun.objects.get(run_id=run_id)
+    except ScanRun.DoesNotExist:
+        return None
+
+    traces = list(
+        LLMTrace.objects
+        .filter(scan_run_id=run_id)
+        .select_related("target_node")
+        .order_by("-created_at")[:_TIMELINE_LIMIT]
+    )
+
+    active_node = None
+    active_path = []
+    current_tool = ""
+    current_tool_detail = ""
+    last_activity_at = None
+
+    # 가장 최근에 target_node 가 채워진 trace 하나를 찾는다.
+    for tr in traces:
+        if tr.target_node_id and active_node is None:
+            active_node = tr.target_node
+            t_name, t_detail = _extract_tool_detail(tr.tool_calls)
+            current_tool = t_name
+            current_tool_detail = t_detail
+            last_activity_at = tr.created_at
+            break
+
+    if last_activity_at is None and traces:
+        # target_node 없어도 최근 tool 이름은 보여준다 (banner 에 idle-like 로)
+        top = traces[0]
+        t_name, t_detail = _extract_tool_detail(top.tool_calls)
+        current_tool = t_name
+        current_tool_detail = t_detail
+        last_activity_at = top.created_at
+
+    if active_node is not None:
+        path_ids = []
+        cursor = active_node
+        safety = 0
+        while cursor is not None and safety < 64:
+            path_ids.append(str(cursor.node_id))
+            cursor = cursor.parent
+            safety += 1
+        active_path = list(reversed(path_ids))
+
+    # 최근 N초간 trace 의 node_id set
+    cutoff = timezone.now() - timedelta(seconds=_ACTIVE_WINDOW_SEC)
+    recent_node_ids = {
+        str(tr.target_node_id) for tr in traces
+        if tr.target_node_id and tr.created_at >= cutoff
+    }
+
+    tool_history = []
+    for tr in traces:
+        t_name, t_detail = _extract_tool_detail(tr.tool_calls)
+        tool_history.append({
+            "ts": tr.created_at.isoformat() if tr.created_at else None,
+            "tool": t_name,
+            "stage": tr.stage or "",
+            "node_id": str(tr.target_node_id) if tr.target_node_id else None,
+            "detail": t_detail,
+        })
+
+    return {
+        "scan_status": scan_run.status,
+        "active_node_id": str(active_node.node_id) if active_node else None,
+        "active_node_label": (
+            f"{active_node.node_type}:{active_node.endpoint or active_node.summary[:60]}"
+            if active_node else ""
+        ),
+        "active_path": active_path,
+        "current_tool": current_tool,
+        "current_tool_detail": current_tool_detail,
+        "last_activity_at": last_activity_at.isoformat() if last_activity_at else None,
+        "recent_node_ids": sorted(recent_node_ids),
+        "tool_history": tool_history,
+    }
+
+
+@api_view(["GET"])
+def activity_snapshot(request, run_id):
+    snap = _compute_activity_snapshot(run_id)
+    if snap is None:
+        return Response({"error": "scan run not found"}, status=status.HTTP_404_NOT_FOUND)
+    return Response(snap)
+
+
+_SSE_POLL_INTERVAL_SEC = 2
+_SSE_MAX_DURATION_SEC = 60 * 30  # 30분 안전 상한 — 아주 긴 세션은 클라이언트가 재연결.
+
+
+async def activity_stream(request, run_id):
+    """Server-Sent Events: 2초마다 snapshot 계산 → hash 바뀔 때만 push.
+
+    scan 이 finished/failed/stopped 로 바뀌면 `event: done` 후 종료.
+    async view — Daphne ASGI 에서 proper flush. DB 액세스는 sync_to_async 로 래핑.
+    """
+    import asyncio
+    from asgiref.sync import sync_to_async
+    compute = sync_to_async(_compute_activity_snapshot, thread_sensitive=True)
+
+    async def gen():
+        last_hash = None
+        started = time.time()
+        yield "retry: 3000\n\n"
+        while True:
+            if time.time() - started > _SSE_MAX_DURATION_SEC:
+                yield "event: timeout\ndata: {}\n\n"
+                return
+            snap = await compute(run_id)
+            if snap is None:
+                yield "event: error\ndata: {\"error\": \"run not found\"}\n\n"
+                return
+            payload = json_mod.dumps(snap, default=str)
+            h = hashlib.md5(payload.encode("utf-8")).hexdigest()
+            if h != last_hash:
+                yield f"data: {payload}\n\n"
+                last_hash = h
+            if snap["scan_status"] in ("finished", "failed", "stopped", "completed"):
+                yield "event: done\ndata: {}\n\n"
+                return
+            await asyncio.sleep(_SSE_POLL_INTERVAL_SEC)
+
+    resp = StreamingHttpResponse(gen(), content_type="text/event-stream")
+    resp["Cache-Control"] = "no-cache"
+    resp["X-Accel-Buffering"] = "no"
+    resp["Connection"] = "keep-alive"
+    return resp
 
 
 @api_view(["GET"])

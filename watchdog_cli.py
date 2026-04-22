@@ -481,9 +481,6 @@ def cmd_create_scan(p):
     )
     result = {"scan_id": str(run.run_id), "status": run.status}
 
-    # Resume: load prior knowledge (tree + findings + candidates) if requested.
-    # `_prev_run_id` is persisted in config so cmd_create_root can pick it up
-    # after the root node is materialized, mirroring mcp_agent startup.
     resume_from = cfg.get("resume_from", "auto")
     try:
         prev = _gather_previous_knowledge(
@@ -491,6 +488,7 @@ def cmd_create_scan(p):
         )
     except Exception:
         prev = None
+
     if prev:
         new_cfg = dict(run.config or {})
         new_cfg["_prev_run_id"] = prev.get("prev_run_id", "")
@@ -499,6 +497,7 @@ def cmd_create_scan(p):
         result["resume_from"] = prev.get("prev_run_id", "")
         result["prev_nodes"] = len(prev.get("nodes") or [])
         result["prev_findings"] = len(prev.get("findings") or [])
+
     _json_out(result)
 
 
@@ -514,13 +513,16 @@ def cmd_create_root(p):
         context={"target_url": p["target_url"]},
         status="pending",
     )
+
     cfg = dict(run.config or {})
     cfg["_root_node_id"] = str(node.node_id)
+
     prev_run_id = cfg.pop("_prev_run_id", None)
     run.config = cfg
     run.save(update_fields=["config"])
 
     result = {"root_id": str(node.node_id)}
+
     if prev_run_id:
         try:
             prev = _gather_previous_knowledge(
@@ -531,6 +533,7 @@ def cmd_create_root(p):
                 result["seeded"] = seeded
         except Exception as e:
             result["seed_error"] = str(e)
+
     _json_out(result)
 
 
@@ -700,12 +703,11 @@ def cmd_list_nodes(p):
 
 
 # ═══════════════════════════════════════════════════════
-# MCP parity helpers (auto-push discovery, UA/auth header injection)
+# MCP parity helpers (auto-push, UA/auth injection)
 # ═══════════════════════════════════════════════════════
 
 def _cli_auto_push(scan_run_id, result_dict, tool_name, current_node_id=""):
-    """Reuse mcp_agent._auto_push_discovered_links to auto-create child nodes
-    from HTTP response links/hashes — same behavior as the MCP agent path."""
+    """Reuse mcp_agent._auto_push_discovered_links to auto-create child nodes."""
     try:
         scan_run = ScanRun.objects.get(run_id=scan_run_id)
         raw_text = json.dumps(result_dict, default=str)
@@ -715,8 +717,7 @@ def _cli_auto_push(scan_run_id, result_dict, tool_name, current_node_id=""):
 
 
 def _maybe_inject_headers(p):
-    """Inject Bug Bounty UA and auto-auth headers when scan_run_id is present.
-    Mirrors _maybe_inject_bug_bounty_ua + credentials wiring in mcp_agent."""
+    """Inject Bug Bounty UA and auto-auth headers when scan_run_id is present."""
     scan_run_id = p.get("scan_run_id")
     if not scan_run_id:
         return
@@ -724,11 +725,14 @@ def _maybe_inject_headers(p):
         run = ScanRun.objects.get(run_id=scan_run_id)
     except ScanRun.DoesNotExist:
         return
+
     headers = p.get("headers") or {}
     cfg = run.config or {}
+
     ua_id = cfg.get("bug_bounty_ua")
     if ua_id and "User-Agent" not in headers:
         headers["User-Agent"] = f"WatchdogMCP/1.0 (BugBounty: {ua_id})"
+
     if "Authorization" not in headers and "Cookie" not in headers:
         creds = cfg.get("credentials")
         if creds and isinstance(creds, list):
@@ -736,6 +740,7 @@ def _maybe_inject_headers(p):
                 if cred.get("type") == "bearer" and cred.get("token"):
                     headers["Authorization"] = f"Bearer {cred['token']}"
                     break
+
     p["headers"] = headers
 
 
@@ -747,6 +752,7 @@ _SESSIONS = {}
 
 def cmd_http_request(p):
     _maybe_inject_headers(p)
+
     method = p.get("method", "GET").upper()
     url = p["url"]
     headers = p.get("headers", {})
@@ -798,12 +804,14 @@ def cmd_http_request(p):
         "discovered_links": links,
         "hash_routes": hashes,
     }
+
     scan_run_id = p.get("scan_run_id")
     if scan_run_id:
         _cli_auto_push(
             scan_run_id, result, "http_request",
             p.get("current_node_id", ""),
         )
+
     _json_out(result)
 
 
@@ -1079,6 +1087,9 @@ def cmd_oob_wait_for_hit(p):
 def cmd_record_trace(p):
     try:
         run = ScanRun.objects.get(run_id=p["scan_run_id"])
+        # Use the same resolver the auto-trace path uses — checks
+        # target_node_id / current_node_id / node_id / parent_node_id in order.
+        target_node = _resolve_trace_node(run, p)
         _record_llm_trace(
             scan_run=run,
             call_index=int(p.get("call_index", 0)),
@@ -1092,6 +1103,7 @@ def cmd_record_trace(p):
             output_tokens=int(p.get("output_tokens", 0)),
             metadata=p.get("metadata"),
             error=p.get("error", ""),
+            target_node=target_node,
         )
         _json_out({"recorded": True, "stage": p.get("stage", "cursor_agent")})
     except Exception as e:
@@ -1589,6 +1601,53 @@ def cmd_list_tools(_):
     })
 
 
+_TRACE_SKIP_TOOLS = frozenset({
+    "record_trace", "scan_next", "scan_selfcheck", "list_tools",
+    "export_learned", "validate_node",
+})
+
+
+def _resolve_trace_node(scan_run, params):
+    """Pick the most relevant DiscoveryNode from a tool's params for trace FK."""
+    if not isinstance(params, dict):
+        return None
+    # Priority order: explicit target_node_id > current_node_id > node_id > parent_node_id.
+    # parent_node_id is last because tools that push a child node usually care
+    # about their own current node, not the parent they were rooted under.
+    for key in ("target_node_id", "current_node_id", "node_id", "parent_node_id"):
+        raw = params.get(key)
+        if not raw:
+            continue
+        try:
+            return DiscoveryNode.objects.filter(scan_run=scan_run, node_id=raw).first()
+        except Exception:
+            continue
+    return None
+
+
+def _auto_record_trace(scan_run_id, tool_name, params):
+    """Silently record an LLM trace entry for the tool call."""
+    try:
+        run = ScanRun.objects.get(run_id=scan_run_id)
+        latest_idx = LLMTrace.objects.filter(scan_run=run).count()
+        target_node = _resolve_trace_node(run, params)
+        _record_llm_trace(
+            scan_run=run,
+            call_index=latest_idx + 1,
+            stage="cli_auto",
+            model="cursor-cli",
+            prompt_preview=json.dumps(params, default=str)[:3000],
+            response_preview="",
+            tool_calls=[{"tool": tool_name, "params": params}],
+            stop_reason="tool_use",
+            input_tokens=0,
+            output_tokens=0,
+            target_node=target_node,
+        )
+    except Exception:
+        pass
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: echo '{...}' | python watchdog_cli.py <tool_name>")
@@ -1617,6 +1676,10 @@ def main():
         params = {}
 
     TOOLS[tool_name](params)
+
+    scan_run_id = params.get("scan_run_id")
+    if scan_run_id and tool_name not in _TRACE_SKIP_TOOLS:
+        _auto_record_trace(scan_run_id, tool_name, params)
 
 
 if __name__ == "__main__":

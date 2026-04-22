@@ -76,6 +76,12 @@ class LLMTrace(models.Model):
     metadata = models.JSONField(default=dict, blank=True)
     error = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
+    target_node = models.ForeignKey(
+        "DiscoveryNode",
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="traces",
+    )
 
     class Meta:
         db_table = "llm_traces"

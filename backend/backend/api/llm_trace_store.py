@@ -129,6 +129,7 @@ def record_llm_trace(
     output_tokens: int = 0,
     metadata=None,
     error: str = "",
+    target_node=None,
 ):
     LLMTrace.objects.create(
         scan_run=scan_run,
@@ -143,4 +144,5 @@ def record_llm_trace(
         output_tokens=int(output_tokens or 0),
         metadata=metadata or {},
         error=_truncate(error, 4000),
+        target_node=target_node,
     )

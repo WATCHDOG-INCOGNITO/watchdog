@@ -29,6 +29,8 @@ urlpatterns = [
     path("api/scan-runs/<str:run_id>/report/", views.scan_run_report),
     path("api/scan-runs/<str:run_id>/discovery-tree/", views.discovery_tree),
     path("api/scan-runs/<str:run_id>/endpoint-specs/", views.scan_run_endpoint_specs),
+    path("api/scan-runs/<str:run_id>/activity/", views.activity_snapshot),
+    path("api/scan-runs/<str:run_id>/activity-stream/", views.activity_stream),
 
     path("api/request-catalog/", views.create_request_catalog_item),
     path("api/request-catalog/list/", views.list_request_catalog),
