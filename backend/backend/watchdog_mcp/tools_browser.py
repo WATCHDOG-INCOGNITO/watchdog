@@ -1,3 +1,4 @@
+import base64
 import json
 import time
 import hashlib
@@ -8,27 +9,15 @@ _context = None
 _page = None
 _network_log = []
 _custom_user_agent: str | None = None
+_pw_handle = None  # sync_playwright().start() handle — kept alive across calls
+# Loaded storage_state (cookies + origin localStorage). Set by
+# browser_load_storage_state and re-applied on context recreation so
+# authenticated session survives UA changes / context resets.
+_loaded_storage_state: dict | None = None
 
-def _ensure_browser():
-    global _browser, _context, _page, _network_log
-    if _page is not None:
-        return
 
-    from playwright.sync_api import sync_playwright
-    pw = sync_playwright().start()
-    _browser = pw.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage"],
-    )
-    ua = _custom_user_agent or "WatchdogBrowser/1.0"
-    _context = _browser.new_context(
-        user_agent=ua,
-        ignore_https_errors=True,
-        viewport={"width": 1280, "height": 720},
-    )
-    _page = _context.new_page()
-    _network_log = []
-
+def _install_event_hooks(page):
+    """Attach request/response listeners to a Playwright Page."""
     def _on_request(req):
         _network_log.append({
             "type": "request",
@@ -48,34 +37,225 @@ def _ensure_browser():
             "timestamp": time.time(),
         })
 
-    _page.on("request", _on_request)
-    _page.on("response", _on_response)
+    page.on("request", _on_request)
+    page.on("response", _on_response)
+
+
+def _recreate_context(storage_state: dict | None = None):
+    """Close existing context/page and create a fresh one, optionally seeded
+    with a Playwright storage_state (cookies + localStorage). Keeps the
+    underlying _browser alive so repeated reloads stay cheap."""
+    global _context, _page, _network_log
+    if _page is not None:
+        try:
+            _page.close()
+        except Exception:
+            pass
+    if _context is not None:
+        try:
+            _context.close()
+        except Exception:
+            pass
+    ua = _custom_user_agent or "WatchdogBrowser/1.0"
+    kwargs = {
+        "user_agent": ua,
+        "ignore_https_errors": True,
+        "viewport": {"width": 1280, "height": 720},
+    }
+    if storage_state:
+        kwargs["storage_state"] = storage_state
+    _context = _browser.new_context(**kwargs)
+    _page = _context.new_page()
+    _network_log = []
+    _install_event_hooks(_page)
+
+
+def _ensure_browser():
+    global _browser, _pw_handle
+    if _page is not None:
+        return
+
+    from playwright.sync_api import sync_playwright
+    _pw_handle = sync_playwright().start()
+    _browser = _pw_handle.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage"],
+    )
+    _recreate_context(storage_state=_loaded_storage_state)
 
 def register(mcp):
 
     @mcp.tool()
     async def browser_set_user_agent(user_agent: str) -> str:
         """브라우저의 User-Agent를 변경한다. 버그바운티 식별 등에 사용.
-        이미 브라우저가 열려 있으면 새 context 로 재생성한다.
+        이미 브라우저가 열려 있으면 새 context 로 재생성한다 (로드된
+        storage_state 가 있으면 authed 상태 유지).
         browser_navigate 전에 호출해야 효과가 있다.
         """
-        global _custom_user_agent, _browser, _context, _page, _network_log
+        global _custom_user_agent
 
         def _sync():
-            global _custom_user_agent, _browser, _context, _page, _network_log
+            global _custom_user_agent
             _custom_user_agent = user_agent.strip() if user_agent else None
             if _page is not None:
-                _page.close()
-                _context.close()
-                ua = _custom_user_agent or "WatchdogBrowser/1.0"
-                _context = _browser.new_context(
-                    user_agent=ua,
-                    ignore_https_errors=True,
-                    viewport={"width": 1280, "height": 720},
-                )
-                _page = _context.new_page()
-                _network_log = []
+                _recreate_context(storage_state=_loaded_storage_state)
             return json.dumps({"user_agent": _custom_user_agent or "WatchdogBrowser/1.0", "applied": True})
+
+        return await sync_to_async(_sync, thread_sensitive=False)()
+
+    @mcp.tool()
+    async def browser_load_storage_state(state_json: str, profile_name: str = "") -> str:
+        """Playwright storage_state (cookies + localStorage) 를 브라우저에
+        적용한다. SSO 로그인된 세션을 headless 브라우저로 주입해 authed
+        상태로 탐색 가능하게 하는 핵심 bridge.
+
+        state_json: Playwright `context.storage_state()` 형식의 JSON
+          문자열. base64 인코딩도 허용 (자동 감지). 스키마:
+          {"cookies":[{name,value,domain,path,expires,httpOnly,secure,sameSite}],
+           "origins":[{origin,localStorage:[{name,value}]}]}
+        profile_name: optional 식별자 — 로그/에러에 쓰임.
+
+        동작: 기존 context 닫고 storage_state 가 주입된 새 context 생성.
+        이후 `browser_navigate` 부터 authed 상태. session state 는 내부에
+        캐시돼 UA 변경 등 context 재생성 시에도 유지된다.
+
+        로컬 helper: `python tools/browser_profile_login.py login --target
+        <URL> --profile <NAME>` 로 수동 로그인 후 나온 JSON 파일 내용을
+        그대로 넘기면 된다.
+        """
+        global _loaded_storage_state
+
+        def _sync():
+            global _loaded_storage_state
+            raw = (state_json or "").strip()
+            if not raw:
+                return json.dumps({"error": "empty state_json"})
+            # base64 자동 감지 (JSON 은 '{' 로 시작)
+            if not raw.startswith("{"):
+                try:
+                    raw = base64.b64decode(raw).decode("utf-8")
+                except Exception as e:
+                    return json.dumps({"error": f"state_json is not JSON nor base64: {e}"})
+            try:
+                state = json.loads(raw)
+            except Exception as e:
+                return json.dumps({"error": f"json parse failed: {e}"})
+            if not isinstance(state, dict) or "cookies" not in state:
+                return json.dumps({"error": "missing 'cookies' key — not a valid Playwright storage_state"})
+
+            _loaded_storage_state = state
+            cookies = state.get("cookies") or []
+            origins = state.get("origins") or []
+
+            _ensure_browser()
+            _recreate_context(storage_state=state)
+
+            return json.dumps({
+                "loaded": True,
+                "profile": profile_name or "",
+                "cookie_count": len(cookies),
+                "origin_count": len(origins),
+                "cookie_hosts": sorted({c.get("domain", "").lstrip(".") for c in cookies if c.get("domain")}),
+                "hint": "context rebuilt with storage_state. browser_navigate is now authed.",
+            })
+
+        return await sync_to_async(_sync, thread_sensitive=False)()
+
+    @mcp.tool()
+    async def browser_export_storage_state() -> str:
+        """현재 브라우저 context 의 storage_state 를 JSON 으로 반환한다.
+        refresh 된 쿠키/localStorage 를 수거해 profile 파일을 업데이트하거나
+        `browser_sync_cookies_to_secrets` 로 DB 에 박을 때 사용.
+
+        주의: Access-Token 같은 민감 값 포함. 저장 시 gitignored 경로만.
+        """
+        def _sync():
+            _ensure_browser()
+            try:
+                state = _context.storage_state()
+                cookies = state.get("cookies", [])
+                origins = state.get("origins", [])
+                return json.dumps({
+                    "cookie_count": len(cookies),
+                    "origin_count": len(origins),
+                    "cookie_hosts": sorted({c.get("domain", "").lstrip(".") for c in cookies if c.get("domain")}),
+                    "state": state,
+                })
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+
+        return await sync_to_async(_sync, thread_sensitive=False)()
+
+    @mcp.tool()
+    async def browser_sync_cookies_to_secrets(scan_run_id: str, host: str = "") -> str:
+        """현재 브라우저 context 의 쿠키를 ScanRun.config._secrets 에 저장.
+
+        http_request / multi_http_probe 같은 stateless HTTP 도구가 이 값을
+        자동 주입해 브라우저와 curl 이 같은 세션을 공유하게 된다.
+
+        host 필터 — 공백이면 모든 호스트 쿠키를 하나의 Cookie 문자열로
+        직렬화해 `cookie_<host>` key 로 각각 저장. 특정 host 만 원하면
+        그 값만 필터.
+
+        반환: 저장된 호스트 목록 + per-host cookie count.
+        """
+        from api.models import ScanRun
+        from django.utils import timezone as _tz
+
+        def _sync():
+            _ensure_browser()
+            try:
+                state = _context.storage_state()
+            except Exception as e:
+                return json.dumps({"error": f"storage_state failed: {e}"})
+
+            cookies = state.get("cookies", [])
+            if host:
+                host_norm = host.lstrip(".").lower()
+                cookies = [c for c in cookies if (c.get("domain") or "").lstrip(".").lower() == host_norm]
+
+            # host 별로 Cookie 문자열 조립
+            by_host: dict[str, list[str]] = {}
+            for c in cookies:
+                h = (c.get("domain") or "").lstrip(".").lower()
+                if not h:
+                    continue
+                name = c.get("name") or ""
+                val = c.get("value") or ""
+                if name:
+                    by_host.setdefault(h, []).append(f"{name}={val}")
+
+            try:
+                sr = ScanRun.objects.get(run_id=scan_run_id)
+            except ScanRun.DoesNotExist:
+                return json.dumps({"error": f"scan_run {scan_run_id} not found"})
+
+            cfg = dict(sr.config or {})
+            secrets = dict(cfg.get("_secrets") or {})
+            now = _tz.now().isoformat()
+            written = {}
+            for h, parts in by_host.items():
+                cookie_str = "; ".join(parts)
+                key = f"cookie_{h}"
+                secrets[key] = {
+                    "value": cookie_str,
+                    "category": "cookie",
+                    "stored_at": now,
+                    "source": "browser_sync",
+                    "host": h,
+                    "cookie_count": len(parts),
+                }
+                written[h] = len(parts)
+            cfg["_secrets"] = secrets
+            sr.config = cfg
+            sr.save(update_fields=["config"])
+
+            return json.dumps({
+                "synced": True,
+                "scan_run_id": scan_run_id,
+                "hosts": written,
+                "total_secrets": len(secrets),
+            })
 
         return await sync_to_async(_sync, thread_sensitive=False)()
 
@@ -84,8 +264,15 @@ def register(mcp):
         """브라우저로 URL에 접속한다. JS가 실행된 후 상태를 반환한다.
         wait_until: load, domcontentloaded, networkidle
         접속 후 네트워크 탭 캡처가 자동으로 시작된다.
+
+        Side effect: navigate 후 현재 storage_state 를 in-memory 에
+        snapshot — refresh XHR 로 쿠키가 갱신되면 여기서 자동 수거,
+        다음 context 재생성 시 최신 auth 상태로 복원.
         """
+        global _loaded_storage_state
+
         def _sync():
+            global _loaded_storage_state
             _ensure_browser()
             _network_log.clear()
 
@@ -95,10 +282,20 @@ def register(mcp):
                 title = _page.title()
                 current_url = _page.url
 
+                state_updated = False
+                try:
+                    new_state = _context.storage_state()
+                    if new_state != _loaded_storage_state:
+                        _loaded_storage_state = new_state
+                        state_updated = True
+                except Exception:
+                    pass
+
                 return json.dumps({
                     "url": current_url,
                     "title": title,
                     "network_requests": len(_network_log),
+                    "storage_state_refreshed": state_updated,
                 })
             except Exception as e:
                 return json.dumps({"url": url, "error": str(e)})
