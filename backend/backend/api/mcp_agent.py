@@ -807,15 +807,67 @@ def _dump_curl_headers(headers: dict) -> str:
     return "\n".join(f"{key}: {value}" for key, value in headers.items())
 
 
+def _select_browser_cookie_for_host(scan_run: ScanRun, url: str) -> dict | None:
+    """browser_sync_cookies_to_secrets 가 박은 `cookie_<host>` 를 URL 의
+    host 기준으로 매칭해 Cookie 헤더 형태로 반환. Playwright browser
+    session 과 stateless HTTP tool (http_request, curl_request,
+    multi_http_probe) 이 같은 auth state 를 공유하게 한다.
+
+    target host (또는 subdomain) 과 URL host 가 같아야 적용 — cross-host
+    호출에는 주입 안 함 (쿠키 유출 방지).
+    """
+    try:
+        url_host = urlparse(url).netloc.lower()
+    except Exception:
+        return None
+    if not url_host:
+        return None
+    try:
+        target_host = urlparse(scan_run.target_url or "").netloc.lower()
+    except Exception:
+        target_host = ""
+    # same host OR url is a subdomain of target (or vice versa)
+    def _host_match(a: str, b: str) -> bool:
+        if not a or not b:
+            return False
+        return a == b or a.endswith("." + b) or b.endswith("." + a)
+    if not _host_match(url_host, target_host):
+        return None
+
+    secrets = (scan_run.config or {}).get("_secrets") or {}
+    # exact url_host → target_host → any parent domain
+    candidates = [url_host, target_host]
+    # also try stripping leading subdomain chunks
+    parts = url_host.split(".")
+    for i in range(1, len(parts) - 1):
+        candidates.append(".".join(parts[i:]))
+    for host in candidates:
+        key = f"cookie_{host}"
+        entry = secrets.get(key)
+        if entry and entry.get("value"):
+            return {
+                "label": f"browser:{host}",
+                "type": "cookie",
+                "headers": {"Cookie": str(entry["value"])},
+            }
+    return None
+
+
 def _maybe_inject_auto_auth(scan_run: ScanRun, tool_name: str, tool_args: dict) -> dict:
     if tool_name not in AUTO_AUTH_TOOLS:
         return tool_args
 
-    auth = _select_auto_auth(scan_run)
+    url = str(tool_args.get("url") or "")
+
+    # Browser-bridge 먼저 — Playwright session 의 쿠키가 있으면 credential
+    # 1개 규칙보다 우선. browser_sync_cookies_to_secrets 로 박힌 실제
+    # 세션 상태가 더 정확.
+    auth = _select_browser_cookie_for_host(scan_run, url) if url else None
+    if not auth:
+        auth = _select_auto_auth(scan_run)
     if not auth or not auth.get("headers"):
         return tool_args
 
-    url = str(tool_args.get("url") or "")
     if not url or _should_skip_auto_auth(scan_run, url):
         return tool_args
 

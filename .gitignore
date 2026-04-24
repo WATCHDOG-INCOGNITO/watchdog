@@ -59,3 +59,8 @@ agent/eval/PROGRESS.md
 agent/eval/HANDOFF.md
 agent/eval/targets.yaml
 agent/eval/history.jsonl
+
+# Playwright storage_state profiles (SSO 쿠키 — 절대 커밋 금지)
+# tools/browser_profile_login.py login 으로 생성
+profiles/*
+!profiles/.gitkeep
