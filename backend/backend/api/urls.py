@@ -54,5 +54,14 @@ urlpatterns = [
 
     path("api/llm/analyze/", views.llm_analyze_single),
 
+    # Browser profile bridge — SSO storage_state import/list/delete/attach.
+    # browser agent 가 headful chromium 세션을 완료한 뒤 여기로 POST.
+    path("api/profiles/", views.profiles_collection),
+    path("api/profiles/import/", views.profiles_import),
+    path("api/profiles/<str:name>/", views.profile_detail),
+    path("api/profiles/<str:name>/attach/", views.profile_attach_to_scan),
+    path("api/browser-login/", views.browser_login_proxy),
+    path("api/browser-login/<str:task_id>/", views.browser_login_status),
+
     path("api/v1/", include(router.urls)),
 ]

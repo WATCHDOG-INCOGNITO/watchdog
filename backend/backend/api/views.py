@@ -696,3 +696,202 @@ def scan_run_endpoint_specs(request, run_id):
             for s in specs
         ],
     })
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Browser profile bridge — SSO storage_state 파일 관리 + scan 첨부.
+# `docker/browser/browser_agent.py` 가 headful chromium 로그인 완료 시
+# POST /api/profiles/import/ 로 결과를 밀어넣고, frontend 는 /api/profiles/
+# 와 /attach/ 로 scan 에 연결한다.
+# ═══════════════════════════════════════════════════════════════════════
+
+import os as _os_pb
+import json as _json_pb
+from pathlib import Path as _Path_pb
+
+_PROFILE_DIR = _Path_pb(_os_pb.environ.get("PROFILES_DIR", "/app/profiles"))
+_BROWSER_AGENT_URL = _os_pb.environ.get("BROWSER_AGENT_URL", "http://browser:8891")
+
+
+def _profile_file_path(name: str) -> _Path_pb:
+    safe = "".join(c for c in (name or "") if c.isalnum() or c in ("-", "_"))[:64]
+    if not safe:
+        raise ValueError("invalid profile name")
+    return _PROFILE_DIR / f"{safe}.json"
+
+
+def _profile_summary(path: _Path_pb) -> dict:
+    try:
+        data = _json_pb.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"name": path.stem, "error": f"parse_failed: {e}"}
+    meta = data.get("_meta") or {}
+    cookies = data.get("cookies") or []
+    hosts = sorted({(c.get("domain") or "").lstrip(".") for c in cookies if c.get("domain")})
+    return {
+        "name": path.stem,
+        "target": meta.get("target"),
+        "saved_at": meta.get("saved_at") or meta.get("refreshed_at"),
+        "detected_via": meta.get("detected_via"),
+        "cookie_count": len(cookies),
+        "cookie_hosts": hosts,
+        "origin_count": len(data.get("origins") or []),
+    }
+
+
+@api_view(["GET"])
+def profiles_collection(request):
+    """List saved SSO profiles (storage_state files under /app/profiles)."""
+    _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for p in sorted(_PROFILE_DIR.glob("*.json")):
+        if p.name.startswith("."):
+            continue
+        rows.append(_profile_summary(p))
+    return Response({"profiles": rows, "dir": str(_PROFILE_DIR)})
+
+
+@api_view(["POST"])
+def profiles_import(request):
+    """Accept a storage_state blob (from browser_agent or manual upload) and
+    persist it to disk. Payload:
+      { "profile_name": "...", "state": {cookies, origins}, "target": "...", "detected_via": "..." }
+    """
+    body = request.data or {}
+    name = (body.get("profile_name") or "").strip()
+    state = body.get("state") or {}
+    target = body.get("target") or ""
+    detected_via = body.get("detected_via") or "manual"
+    if not name:
+        return Response({"error": "profile_name required"}, status=status.HTTP_400_BAD_REQUEST)
+    if not isinstance(state, dict) or "cookies" not in state:
+        return Response({"error": "state.cookies missing — not a Playwright storage_state"},
+                        status=status.HTTP_400_BAD_REQUEST)
+    try:
+        path = _profile_file_path(name)
+    except ValueError as e:
+        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wrapper = {
+        "_meta": {
+            "target": target,
+            "profile": path.stem,
+            "saved_at": timezone.now().isoformat(),
+            "detected_via": detected_via,
+        },
+        **state,
+    }
+    path.write_text(_json_pb.dumps(wrapper, ensure_ascii=False, indent=2), encoding="utf-8")
+    return Response({
+        "saved": str(path),
+        "summary": _profile_summary(path),
+    }, status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET", "DELETE"])
+def profile_detail(request, name):
+    try:
+        path = _profile_file_path(name)
+    except ValueError as e:
+        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    if not path.exists():
+        return Response({"error": "profile not found"}, status=status.HTTP_404_NOT_FOUND)
+    if request.method == "DELETE":
+        path.unlink()
+        return Response({"deleted": str(path)})
+    # GET
+    summary = _profile_summary(path)
+    if request.query_params.get("include_state") == "1":
+        try:
+            data = _json_pb.loads(path.read_text(encoding="utf-8"))
+            state = {k: v for k, v in data.items() if k != "_meta"}
+            summary["state"] = state
+        except Exception as e:
+            summary["state_error"] = str(e)
+    return Response(summary)
+
+
+@api_view(["POST"])
+def profile_attach_to_scan(request, name):
+    """Bind a saved profile to a ScanRun — reads the JSON file, writes it
+    into ScanRun.config for the discovery/manual agent to consume, and syncs
+    cookies as per-host _secrets entries so stateless HTTP tools auto-inject
+    Cookie headers (see mcp_agent._select_browser_cookie_for_host).
+    """
+    run_id = (request.data or {}).get("scan_run_id") or request.query_params.get("scan_run_id")
+    if not run_id:
+        return Response({"error": "scan_run_id required"}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        sr = ScanRun.objects.get(run_id=run_id)
+    except ScanRun.DoesNotExist:
+        return Response({"error": "scan_run not found"}, status=status.HTTP_404_NOT_FOUND)
+    try:
+        path = _profile_file_path(name)
+    except ValueError as e:
+        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    if not path.exists():
+        return Response({"error": "profile not found"}, status=status.HTTP_404_NOT_FOUND)
+    try:
+        data = _json_pb.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return Response({"error": f"profile parse failed: {e}"}, status=500)
+
+    cookies = data.get("cookies") or []
+    # build per-host cookie strings
+    by_host: dict[str, list[str]] = {}
+    for c in cookies:
+        h = (c.get("domain") or "").lstrip(".").lower()
+        if not h:
+            continue
+        n = c.get("name") or ""
+        v = c.get("value") or ""
+        if n:
+            by_host.setdefault(h, []).append(f"{n}={v}")
+
+    cfg = dict(sr.config or {})
+    secrets = dict(cfg.get("_secrets") or {})
+    now = timezone.now().isoformat()
+    for h, parts in by_host.items():
+        secrets[f"cookie_{h}"] = {
+            "value": "; ".join(parts),
+            "category": "cookie",
+            "stored_at": now,
+            "source": f"profile:{name}",
+            "host": h,
+            "cookie_count": len(parts),
+        }
+    cfg["_secrets"] = secrets
+    cfg["browser_profile"] = name
+    cfg["browser_profile_attached_at"] = now
+    sr.config = cfg
+    sr.save(update_fields=["config"])
+    return Response({
+        "attached": name,
+        "scan_run_id": run_id,
+        "hosts": list(by_host.keys()),
+        "total_secrets": len(secrets),
+    })
+
+
+@api_view(["POST"])
+def browser_login_proxy(request):
+    """Relay a login request to the browser agent (so the frontend doesn't
+    need to speak to http://localhost:8891 directly — same-origin via
+    nginx). Body: {target_url, profile_name}."""
+    import requests as _rq
+    body = request.data or {}
+    try:
+        r = _rq.post(f"{_BROWSER_AGENT_URL}/login", json=body, timeout=10)
+        return Response(r.json(), status=r.status_code)
+    except Exception as e:
+        return Response({"error": f"browser agent unreachable: {e}"}, status=502)
+
+
+@api_view(["GET"])
+def browser_login_status(request, task_id):
+    import requests as _rq
+    try:
+        r = _rq.get(f"{_BROWSER_AGENT_URL}/status/{task_id}", timeout=5)
+        return Response(r.json(), status=r.status_code)
+    except Exception as e:
+        return Response({"error": f"browser agent unreachable: {e}"}, status=502)
