@@ -54,6 +54,7 @@ from .scan_control import (  # noqa: E402
     mark_scan_stopped,
     raise_if_stop_requested,
     register_scan,
+    request_scan_stop,
     stop_sleep,
     unregister_scan,
 )
@@ -3169,6 +3170,28 @@ async def _explorer_worker(
                 current_node_id=str(node.node_id),
             )
         except Exception as e:
+            err_text = str(e).lower()
+            # Anthropic credit balance 고갈 — 더 돌려봐야 모든 워커가 400 만 받는
+            # 무한 재시도 상태. 즉시 scan 을 stop 해서 로그·respawn 낭비를 막고
+            # DB 상태를 정상 stopped 로 정리 (다음 번 resume 할 때 findings 살아있음).
+            if (
+                "credit balance is too low" in err_text
+                or "credit_balance_too_low" in err_text
+            ):
+                logger.error(
+                    f"[{scan_run.run_id}] {sub_role}[{name}] Anthropic credit "
+                    f"exhausted on node {node.node_id}; auto-stopping scan"
+                )
+                try:
+                    await sync_to_async(request_scan_stop)(
+                        scan_run,
+                        message="Anthropic credit balance exhausted; scan auto-stopped",
+                    )
+                except Exception:
+                    logger.exception(
+                        f"[{scan_run.run_id}] failed to mark scan stopped after credit error"
+                    )
+                raise ScanStopped("anthropic credit balance exhausted") from e
             logger.error(
                 f"[{scan_run.run_id}] {sub_role}[{name}] error on node "
                 f"{node.node_id}: {e}", exc_info=True,
@@ -3180,7 +3203,7 @@ async def _explorer_worker(
         # 위반이 있어도 fix_phase로 LLM에 재작업을 강제하지 않는다 — 그렇게 하면
         # 진짜 막힌 상황(404/WAF/SPA로 endpoint 부재 등)에서 가짜 노드를 만들도록
         # 잘못된 인센티브를 준다. warnings는 selfcheck/replan 신호로만 활용.
-        node.refresh_from_db()
+        await sync_to_async(node.refresh_from_db)()
         passed, violations = await sync_to_async(
             lambda: _validate_node_compliance(node)
         )()
@@ -3654,12 +3677,17 @@ def _gather_previous_knowledge(
         if not prev_run:
             return None
     else:
+        from django.db.models import Count
         normalized = _normalize_target_url(target_url)
+        # `stopped` 도 후보에 포함 — docker 강제종료/credit 고갈로 stopped 상태에
+        # 남은 고가치 scan 을 무시하지 말 것. findings 많은 쪽이 resume 가치가 훨씬
+        # 크므로 fcount desc → created_at desc 순으로 정렬해서 최우선 선택.
         recent = (
             ScanRun.objects
-            .filter(status__in=["finished", "failed"])
+            .filter(status__in=["finished", "failed", "stopped"])
             .exclude(run_id=current_run_id)
-            .order_by("-created_at")[:10]
+            .annotate(fcount=Count("findings"))
+            .order_by("-fcount", "-created_at")[:20]
         )
         for run in recent:
             if _normalize_target_url(run.target_url) == normalized:
@@ -3999,17 +4027,18 @@ async def _run_discovery_loop(
     done_event = asyncio.Event()
     last_activity = [_t.time()]
 
-    workers = [
-        asyncio.create_task(
+    def _spawn_explorer(worker_name: str) -> asyncio.Task:
+        suffix = worker_name[1:] if worker_name.startswith("W") else worker_name
+        return asyncio.create_task(
             _explorer_worker(
-                f"W{i+1}", scan_run, anthropic, explorer_tools, tool_router,
+                worker_name, scan_run, anthropic, explorer_tools, tool_router,
                 acc, last_activity, done_event,
                 root_node_id=str(root_node.node_id),
             ),
-            name=f"explorer-{i+1}",
+            name=f"explorer-{suffix}",
         )
-        for i in range(DISCOVERY_WORKER_COUNT)
-    ]
+
+    workers = [_spawn_explorer(f"W{i+1}") for i in range(DISCOVERY_WORKER_COUNT)]
 
     while True:
         await asyncio.sleep(3)
@@ -4027,13 +4056,6 @@ async def _run_discovery_loop(
             logger.info(f"[{scan_run.run_id}] discovery hard cap: cost=${scan_run.llm_cost_usd} >= ${DISCOVERY_MAX_COST_USD}")
             break
 
-        all_done = all(w.done() for w in workers)
-        idle_for = _t.time() - last_activity[0]
-
-        if all_done:
-            logger.info(f"[{scan_run.run_id}] all discovery workers finished")
-            break
-
         pending_count = await sync_to_async(
             lambda: DiscoveryNode.objects.filter(
                 scan_run=scan_run, status="pending",
@@ -4044,6 +4066,49 @@ async def _run_discovery_loop(
                 scan_run=scan_run, status="exploring",
             ).count()
         )()
+        active_nodes = pending_count + exploring_count
+        idle_for = _t.time() - last_activity[0]
+
+        for idx, worker in enumerate(workers):
+            if not worker.done():
+                continue
+            if active_nodes == 0:
+                continue
+
+            worker_name = f"W{idx+1}"
+            try:
+                worker.result()
+            except asyncio.CancelledError:
+                logger.warning(
+                    f"[{scan_run.run_id}] explorer[{worker_name}] cancelled while "
+                    f"{active_nodes} nodes remained; respawning"
+                )
+            except ScanStopped:
+                raise
+            except Exception:
+                logger.exception(
+                    f"[{scan_run.run_id}] explorer[{worker_name}] crashed while "
+                    f"{active_nodes} nodes remained; respawning"
+                )
+            else:
+                logger.warning(
+                    f"[{scan_run.run_id}] explorer[{worker_name}] exited while "
+                    f"{active_nodes} nodes remained; respawning"
+                )
+
+            workers[idx] = _spawn_explorer(worker_name)
+            last_activity[0] = _t.time()
+
+        all_done = all(w.done() for w in workers)
+        if all_done:
+            logger.info(f"[{scan_run.run_id}] all discovery workers finished")
+            if active_nodes == 0:
+                break
+            logger.warning(
+                f"[{scan_run.run_id}] all workers finished but queue remains "
+                f"(pending={pending_count}, exploring={exploring_count}); waiting for respawn/stale recovery"
+            )
+            continue
 
         if pending_count == 0 and exploring_count == 0 and idle_for > DISCOVERY_QUIESCENCE_S:
             logger.info(
