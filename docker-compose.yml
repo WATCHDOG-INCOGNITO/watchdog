@@ -49,6 +49,9 @@ services:
       WATCHDOG_DISCOVERY_CLUE_BUDGET: "${WATCHDOG_DISCOVERY_CLUE_BUDGET:-25}"
       WATCHDOG_DISCOVERY_MAX_CALLS: "${WATCHDOG_DISCOVERY_MAX_CALLS:-500}"
       WATCHDOG_DISCOVERY_MAX_COST_USD: "${WATCHDOG_DISCOVERY_MAX_COST_USD:-10.0}"
+      # Browser profile bridge
+      BROWSER_AGENT_URL: "http://browser:8891"
+      PROFILES_DIR: "/app/profiles"
       SOURCE_ROOTS: "/sources"
     volumes:
       - ./secrets:/run/secrets:ro
@@ -60,6 +63,9 @@ services:
       # Living KB 영속화 — confirm된 learned 패턴이 즉시 host의 techniques/<vuln_type>/*.md
       # 로 dump되어 git commit 가능. 컨테이너 재빌드/볼륨 초기화에도 살아남음.
       - ./backend/backend/api/management/commands/techniques:/app/api/management/commands/techniques
+      # Browser bridge profile 공유 — browser 컨테이너가 /profiles 에 쓰면
+      # backend 가 /app/profiles 에서 읽어 browser_load_storage_state 호출.
+      - ./profiles:/app/profiles
     depends_on:
       db:
         condition: service_healthy
@@ -99,6 +105,28 @@ services:
     restart: unless-stopped
     ports:
       - "3000:80"
+    depends_on:
+      - backend
+
+  # ── Browser bridge — SSO/OAuth 세션을 Watchdog UI 안에서 완결 ──────
+  # noVNC 로 headful chromium 을 UI iframe 에 표시. 사용자가 로그인하면
+  # browser_agent 가 자동으로 storage_state 추출 → backend /api/profiles/
+  # import 호출. Google ToS 때문에 automated login 은 불가 — 사용자가
+  # 직접 VNC 화면에서 로그인해야 한다.
+  browser:
+    build: ./docker/browser
+    restart: unless-stopped
+    ports:
+      - "6080:6080"   # noVNC web client
+      - "8891:8891"   # browser_agent Flask API
+    environment:
+      WATCHDOG_API: "http://backend:8000"
+      PROFILES_DIR: "/profiles"
+      LOGIN_TIMEOUT_SEC: "${BROWSER_LOGIN_TIMEOUT_SEC:-600}"
+    volumes:
+      # 저장된 storage_state JSON 은 host ./profiles 에 mirror — backend 와
+      # 공유되어야 browser_load_storage_state 도구가 그대로 접근 가능.
+      - ./profiles:/profiles
     depends_on:
       - backend
 

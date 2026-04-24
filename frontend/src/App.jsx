@@ -506,6 +506,157 @@ function LlmTraceModal({ scan, traces, loading, error, onRefresh, onClose }) {
   );
 }
 
+function BrowserLoginModal({ initialTarget, onClose, onImported }) {
+  const [targetUrl, setTargetUrl] = useState(initialTarget || "");
+  const [profileName, setProfileName] = useState("");
+  const [taskId, setTaskId] = useState("");
+  const [status, setStatus] = useState("idle"); // idle|pending|waiting|detected|done|timeout|error
+  const [statusMsg, setStatusMsg] = useState("");
+  const [detail, setDetail] = useState(null);
+
+  async function start() {
+    if (!targetUrl.trim() || !profileName.trim()) return;
+    setStatus("pending");
+    setStatusMsg("Starting browser session...");
+    try {
+      const r = await apiPost("/api/browser-login/", {
+        target_url: targetUrl.trim(),
+        profile_name: profileName.trim(),
+      });
+      setTaskId(r.task_id);
+      setStatus(r.state || "pending");
+    } catch (e) {
+      setStatus("error");
+      setStatusMsg(e.message);
+    }
+  }
+
+  async function markDone() {
+    if (!taskId) return;
+    try {
+      await apiPost(`/api/browser-login/${taskId}/complete/`, {});
+    } catch { /* agent polls manual_done flag; ignore response failures */ }
+  }
+
+  useEffect(() => {
+    if (!taskId || status === "done" || status === "error" || status === "timeout") return;
+    const t = setInterval(async () => {
+      try {
+        const r = await apiGet(`/api/browser-login/${taskId}/`);
+        setStatus(r.state || "pending");
+        setStatusMsg(r.message || "");
+        setDetail(r);
+        if (r.state === "done") {
+          clearInterval(t);
+          onImported && onImported(r.profile_name || profileName);
+        } else if (r.state === "error" || r.state === "timeout" || r.state === "stopped") {
+          clearInterval(t);
+        }
+      } catch (e) { /* ignore transient */ }
+    }, 2000);
+    return () => clearInterval(t);
+  }, [taskId, status]);
+
+  // vnc.html (full UI) → 사이드바에서 Shift/Ctrl 키 전송 모드, 키보드
+  // 레이아웃, 품질 조정 가능. resize=scale → iframe 크기에 맞춰 client-side
+  // 스케일. show_dot=false → 커서 점 숨김. reconnect=1 → 드롭 시 자동 재연결.
+  const vncUrl = "http://localhost:6080/vnc.html?autoconnect=1&resize=scale&reconnect=1&show_dot=false&quality=9&compression=3";
+  const canStart = status === "idle" || status === "error" || status === "timeout";
+
+  function openInPopup() {
+    // iframe 안 focus 꼬임 (키 이벤트가 부모 document 에 잡혀 Shift 대소문자
+    // 전달 실패 등) 을 우회 — 별도 window 에서 열면 키보드가 VNC canvas 에
+    // 전적으로 전달된다. 로그인 끝나면 창 닫으면 됨 (agent 가 자동 감지 or
+    // 이 모달의 "로그인 완료" 버튼으로 확정).
+    window.open(vncUrl, "watchdog-vnc", "width=1920,height=1100");
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal-card"
+        onClick={(e) => e.stopPropagation()}
+        style={{ maxWidth: 1100, width: "92vw", maxHeight: "92vh", overflowY: "auto" }}
+      >
+        <div className="modal-head">
+          <div>
+            <div className="section-kicker">SSO Bridge</div>
+            <h2>브라우저에서 로그인</h2>
+          </div>
+          <button type="button" className="ghost-button" onClick={onClose}>닫기</button>
+        </div>
+        <p className="modal-copy">
+          Google / SAML 등 SSO 로 로그인 후 쿠키·localStorage 를 profile 로 자동 추출.
+          헤드리스 Playwright context 에 주입되어 모든 browser_* / http_request 도구가
+          같은 세션을 공유함.
+        </p>
+
+        <div className="auth-two-column">
+          <label className="field">
+            <span>대상 URL</span>
+            <input value={targetUrl} onChange={(e) => setTargetUrl(e.target.value)}
+              placeholder="https://forge.hspace.io" disabled={!canStart} />
+          </label>
+          <label className="field">
+            <span>profile 이름</span>
+            <input value={profileName} onChange={(e) => setProfileName(e.target.value)}
+              placeholder="hspace" disabled={!canStart} />
+          </label>
+        </div>
+
+        <div className="modal-actions" style={{ marginTop: 10, flexWrap: "wrap" }}>
+          <button type="button" className="primary-button" onClick={start}
+            disabled={!canStart || !targetUrl.trim() || !profileName.trim()}>
+            {status === "idle" ? "브라우저 시작" : "다시 시작"}
+          </button>
+          {taskId ? (
+            <button type="button" className="ghost-button" onClick={openInPopup}
+              title="별도 창으로 VNC 열기 — 키보드 focus/대소문자 문제 회피">
+              🗔 새 창으로 열기
+            </button>
+          ) : null}
+          {taskId && status !== "done" ? (
+            <button type="button" className="ghost-button" onClick={markDone}>
+              로그인 완료 (수동 확인)
+            </button>
+          ) : null}
+        </div>
+
+        {taskId ? (
+          <div className="callout" style={{ marginTop: 12 }}>
+            <b>task:</b> {taskId} · <b>state:</b> {status}
+            {statusMsg ? <> · {statusMsg}</> : null}
+            {detail?.cookie_count != null ? <> · cookies: {detail.cookie_count}</> : null}
+            {detail?.cookie_hosts?.length ? <> · hosts: {detail.cookie_hosts.join(", ")}</> : null}
+            {status === "done" ? <> · ✅ profile saved & imported</> : null}
+          </div>
+        ) : null}
+
+        {taskId ? (
+          <div style={{ marginTop: 12, border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, overflow: "hidden" }}>
+            <iframe
+              title="novnc"
+              src={vncUrl}
+              // 16:9 ratio + 큰 높이. 한글 IME / Shift 등이 불편하면 위의
+              // "새 창으로 열기" 버튼 사용 (iframe 의 focus 제약 우회).
+              style={{ width: "100%", aspectRatio: "16 / 9", height: "auto", minHeight: "70vh", border: 0, background: "#000", display: "block" }}
+              allow="clipboard-read; clipboard-write"
+              tabIndex={0}
+            />
+            <div style={{ padding: 8, fontSize: 12, opacity: 0.7, lineHeight: 1.5 }}>
+              VNC 화면에서 직접 로그인. 완료되면 auth 쿠키 감지되거나 "로그인 완료" 버튼을 눌러 알리면
+              profile 이 자동 저장·임포트됨.<br />
+              키 입력이 안 먹히거나 대소문자가 섞이면 위 <b>🗔 새 창으로 열기</b> 사용 — iframe 의 focus 제약 없이 키보드가 제대로 전달된다.
+              noVNC 설정(▼ 좌측 상단 메뉴) 에서 키보드 레이아웃·Shift 처리 모드 변경 가능.
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+
 function NewScanModal({ onClose, onCreated }) {
   const [targetUrl, setTargetUrl] = useState("");
   const [requestBudget, setRequestBudget] = useState(10);
@@ -513,6 +664,9 @@ function NewScanModal({ onClose, onCreated }) {
   const [bugBountyUA, setBugBountyUA] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  // SSO profile (Playwright storage_state) — created via BrowserLoginModal
+  const [ssoProfile, setSsoProfile] = useState("");
+  const [showBrowserLogin, setShowBrowserLogin] = useState(false);
 
   // 로그인 정보 (선택) — multi-persona dynamic list. 각 entry 가 별도 credential.
   const [showAuth, setShowAuth] = useState(false);
@@ -599,6 +753,12 @@ function NewScanModal({ onClose, onCreated }) {
         config,
       });
 
+      // SSO profile → scan 에 attach (쿠키를 _secrets 에 박음)
+      if (ssoProfile) {
+        try {
+          await apiPost(`/api/profiles/${ssoProfile}/attach/`, { scan_run_id: created.run_id });
+        } catch (e) { console.warn("profile attach failed:", e); }
+      }
       await apiPost(`/api/scan-runs/${created.run_id}/start/`);
       onCreated(created.run_id);
     } catch (submitError) {
@@ -653,6 +813,26 @@ function NewScanModal({ onClose, onCreated }) {
             예: <code>WatchdogMCP/1.0 (BugBounty: yourname-h1program)</code>
           </span>
         </label>
+
+        <div className="callout" style={{ marginTop: 6 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <b>SSO / OAuth:</b>
+            {ssoProfile ? (
+              <>
+                <span>attached profile → <code>{ssoProfile}</code></span>
+                <button type="button" className="ghost-button" onClick={() => setSsoProfile("")}>해제</button>
+                <button type="button" className="ghost-button" onClick={() => setShowBrowserLogin(true)}>교체</button>
+              </>
+            ) : (
+              <>
+                <span style={{ opacity: 0.8 }}>Google 등 SSO 타겟은 브라우저로 로그인한 뒤 쿠키를 자동 import</span>
+                <button type="button" className="primary-button" onClick={() => setShowBrowserLogin(true)}>
+                  브라우저에서 로그인
+                </button>
+              </>
+            )}
+          </div>
+        </div>
 
         <label className="checkbox-row">
           <input type="checkbox" checked={showAuth} onChange={(e) => setShowAuth(e.target.checked)} />
@@ -770,6 +950,16 @@ function NewScanModal({ onClose, onCreated }) {
           </button>
         </div>
       </div>
+      {showBrowserLogin ? (
+        <BrowserLoginModal
+          initialTarget={targetUrl}
+          onClose={() => setShowBrowserLogin(false)}
+          onImported={(name) => {
+            setSsoProfile(name);
+            // keep modal open so user can verify; they'll close manually
+          }}
+        />
+      ) : null}
     </div>
   );
 }
