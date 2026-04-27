@@ -160,6 +160,21 @@ async function fetchLlmTraces(runId) {
   return { traces: normalizePaginatedList(payload), count: payload.count ?? normalizePaginatedList(payload).length };
 }
 
+async function fetchScanDeveloperReport(runId, format = "md") {
+  return apiGet(`/api/scan-runs/${runId}/report/?kind=developer&format=${format}`);
+}
+
+function useLockBodyScroll(active) {
+  useEffect(() => {
+    if (!active) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [active]);
+}
+
 function EmptyState({ title, body, className = "" }) {
   return (
     <div className={`empty-state ${className}`.trim()}>
@@ -167,6 +182,58 @@ function EmptyState({ title, body, className = "" }) {
       <p>{body}</p>
     </div>
   );
+}
+
+function SimpleMarkdown({ content }) {
+  const lines = String(content || "").split(/\r?\n/);
+  const elements = [];
+  let listItems = [];
+
+  const flushList = (keyPrefix) => {
+    if (!listItems.length) return;
+    elements.push(
+      <ul key={`${keyPrefix}-list`} className="markdown-list">
+        {listItems.map((item, index) => <li key={`${keyPrefix}-${index}`}>{item}</li>)}
+      </ul>
+    );
+    listItems = [];
+  };
+
+  lines.forEach((rawLine, index) => {
+    const line = rawLine.trimEnd();
+    const key = `md-${index}`;
+
+    if (!line.trim()) {
+      flushList(key);
+      return;
+    }
+
+    if (line.startsWith("- ")) {
+      listItems.push(line.slice(2));
+      return;
+    }
+
+    flushList(key);
+
+    if (line.startsWith("###")) {
+      elements.push(<h4 key={key} className="markdown-h4">{line.replace(/^###\s*/, "")}</h4>);
+      return;
+    }
+    if (line.startsWith("##")) {
+      elements.push(<h3 key={key} className="markdown-h3">{line.replace(/^##\s*/, "")}</h3>);
+      return;
+    }
+    if (line.startsWith("#")) {
+      elements.push(<h2 key={key} className="markdown-h2">{line.replace(/^#\s*/, "")}</h2>);
+      return;
+    }
+
+    elements.push(<p key={key} className="markdown-p">{line}</p>);
+  });
+
+  flushList("final");
+
+  return <div className="markdown-renderer">{elements}</div>;
 }
 
 function StatusPill({ scan, now }) {
@@ -297,8 +364,14 @@ function FindingDetailPanel({ finding, detail }) {
       {reportLoading ? <div className="callout callout-neutral">리포트를 생성하는 중입니다...</div> : null}
       {reportContent ? (
         <div className="detail-summary">
-          <strong>리포트 ({reportFormat})</strong>
-          <pre className="detail-steps">{reportContent}</pre>
+          <strong>보고서 ({reportFormat})</strong>
+          {reportFormat === "md" ? (
+            <div className="detail-steps markdown-surface">
+              <SimpleMarkdown content={reportContent} />
+            </div>
+          ) : (
+            <pre className="detail-steps">{reportContent}</pre>
+          )}
         </div>
       ) : null}
 
@@ -336,6 +409,8 @@ function FindingDetailPanel({ finding, detail }) {
 }
 
 function FindingsModal({ findings, detail, loading, error, selectedFindingId, onSelect, onClose }) {
+  useLockBodyScroll(true);
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal-card modal-card-wide" onClick={(event) => event.stopPropagation()}>
@@ -387,6 +462,8 @@ function FindingsModal({ findings, detail, loading, error, selectedFindingId, on
 }
 
 function CandidatesModal({ candidates, onClose }) {
+  useLockBodyScroll(true);
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal-card modal-card-wide" onClick={(event) => event.stopPropagation()}>
@@ -411,7 +488,48 @@ function CandidatesModal({ candidates, onClose }) {
 }
 
 function RunDetailsModal({ scan, requestCount, candidateCount, onClose }) {
+  const [reportFormat, setReportFormat] = useState("md");
+  const [reportContent, setReportContent] = useState("");
+  const [reportLoading, setReportLoading] = useState(false);
+  const [reportError, setReportError] = useState("");
+
+  useLockBodyScroll(true);
+
+  useEffect(() => {
+    setReportFormat("md");
+    setReportContent("");
+    setReportError("");
+    setReportLoading(false);
+  }, [scan?.run_id]);
+
   if (!scan) return null;
+
+  const loadDeveloperReport = async (format) => {
+    setReportLoading(true);
+    setReportError("");
+    try {
+      const payload = await fetchScanDeveloperReport(scan.run_id, format);
+      const content = payload?.content;
+      setReportFormat(payload?.format || format);
+      setReportContent(
+        typeof content === "string" ? content : JSON.stringify(content, null, 2)
+      );
+    } catch (error) {
+      setReportError(error.message || "전체 보고서를 생성하지 못했습니다.");
+      setReportContent("");
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
+  const copyDeveloperReport = async () => {
+    if (!reportContent) return;
+    try {
+      await navigator.clipboard.writeText(reportContent);
+    } catch {
+      setReportError("클립보드 복사에 실패했습니다.");
+    }
+  };
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -424,27 +542,56 @@ function RunDetailsModal({ scan, requestCount, candidateCount, onClose }) {
           <button type="button" className="ghost-button" onClick={onClose}>닫기</button>
         </div>
 
-        <div className="detail-grid detail-grid-compact">
-          <div><span>Run ID</span><strong>{scan.run_id}</strong></div>
-          <div><span>상태</span><strong>{scan.status}</strong></div>
-          <div><span>엔진</span><strong>{getScanEngine(scan)}</strong></div>
-          <div><span>생성 시각</span><strong>{formatDateTime(scan.created_at)}</strong></div>
-          <div><span>최근 갱신</span><strong>{formatDateTime(scan.updated_at)}</strong></div>
-          <div><span>종료 시각</span><strong>{formatDateTime(scan.finished_at)}</strong></div>
-          <div><span>요청 예산</span><strong>{formatCount(scan.request_budget_used)} / {formatCount(scan.request_budget_total)}</strong></div>
-          <div><span>요청 수</span><strong>{formatCount(requestCount)}</strong></div>
-          <div><span>가설 수</span><strong>{formatCount(candidateCount)}</strong></div>
-          <div><span>LLM 호출</span><strong>{formatCount(scan.llm_calls_count)}</strong></div>
-          <div><span>토큰</span><strong>{formatCount(scan.llm_tokens_used)}</strong></div>
-          <div><span>비용</span><strong>{formatCurrency(scan.llm_cost_usd)}</strong></div>
-        </div>
+        <div className="modal-scroll-body">
+          <div className="detail-grid detail-grid-compact">
+            <div><span>Run ID</span><strong>{scan.run_id}</strong></div>
+            <div><span>상태</span><strong>{scan.status}</strong></div>
+            <div><span>엔진</span><strong>{getScanEngine(scan)}</strong></div>
+            <div><span>생성 시각</span><strong>{formatDateTime(scan.created_at)}</strong></div>
+            <div><span>최근 갱신</span><strong>{formatDateTime(scan.updated_at)}</strong></div>
+            <div><span>종료 시각</span><strong>{formatDateTime(scan.finished_at)}</strong></div>
+            <div><span>요청 예산</span><strong>{formatCount(scan.request_budget_used)} / {formatCount(scan.request_budget_total)}</strong></div>
+            <div><span>요청 수</span><strong>{formatCount(requestCount)}</strong></div>
+            <div><span>가설 수</span><strong>{formatCount(candidateCount)}</strong></div>
+            <div><span>LLM 호출</span><strong>{formatCount(scan.llm_calls_count)}</strong></div>
+            <div><span>토큰</span><strong>{formatCount(scan.llm_tokens_used)}</strong></div>
+            <div><span>비용</span><strong>{formatCurrency(scan.llm_cost_usd)}</strong></div>
+          </div>
 
-        {scan.error_log ? (
-          <div className="failure-panel">
-            <strong>실패 로그</strong>
-            <pre className="failure-log">{scan.error_log}</pre>
+        <div className="section-actions" style={{ marginTop: 16 }}>
+          <button type="button" className="ghost-button" onClick={() => loadDeveloperReport("md")} disabled={reportLoading}>
+            보고서(MD)
+          </button>
+          <button type="button" className="ghost-button" onClick={() => loadDeveloperReport("json")} disabled={reportLoading}>
+            보고서(JSON)
+          </button>
+          <button type="button" className="ghost-button" onClick={copyDeveloperReport} disabled={!reportContent}>
+            복사
+          </button>
+          </div>
+
+          {reportError ? <div className="callout callout-error">{reportError}</div> : null}
+          {reportLoading ? <div className="callout callout-neutral">전체 보고서를 생성하는 중입니다...</div> : null}
+        {reportContent ? (
+          <div className="detail-summary" style={{ marginTop: 16 }}>
+            <strong>보고서 ({reportFormat})</strong>
+            {reportFormat === "md" ? (
+              <div className="detail-steps markdown-surface">
+                <SimpleMarkdown content={reportContent} />
+              </div>
+            ) : (
+              <pre className="detail-steps">{reportContent}</pre>
+            )}
           </div>
         ) : null}
+
+          {scan.error_log ? (
+            <div className="failure-panel">
+              <strong>실패 로그</strong>
+              <pre className="failure-log">{scan.error_log}</pre>
+            </div>
+          ) : null}
+        </div>
       </div>
     </div>
   );

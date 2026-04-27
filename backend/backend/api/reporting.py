@@ -20,6 +20,13 @@ class FindingReportResult:
     md_text: str
     json_obj: Dict[str, Any]
 
+
+@dataclass
+class DeveloperReportResult:
+    run_id: str
+    md_text: str
+    json_obj: Dict[str, Any]
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -38,6 +45,130 @@ def _severity_label(severity: str | None) -> str:
 def _safe_join_lines(lines: List[str]) -> str:
     cleaned = [line.strip() for line in lines if str(line or "").strip()]
     return "\n".join(cleaned)
+
+
+def _developer_finding_item(finding: Any) -> Dict[str, Any]:
+    candidate = getattr(finding, "candidate", None)
+    request = getattr(candidate, "request", None) if candidate else None
+    endpoint = (
+        getattr(request, "endpoint", None)
+        or ((candidate.features or {}).get("endpoint") if candidate else None)
+        or "unknown-endpoint"
+    )
+    method = (getattr(request, "method", None) or "GET").upper()
+    affected_products = []
+    parsed = urlparse(finding.scan_run.target_url or "")
+    host = (parsed.netloc or parsed.hostname or "").strip()
+    if host:
+        affected_products.append(host)
+    if endpoint and endpoint != "unknown-endpoint":
+        affected_products.append(endpoint)
+    return {
+        "title": finding.title,
+        "summary": (finding.summary or "").strip(),
+        "details": _safe_join_lines(
+            [
+                f"Endpoint: `{method} {endpoint}`",
+                f"Vulnerability type: {(finding.vuln_type or 'unknown').lower()}",
+                f"Confidence: {finding.confidence}",
+            ]
+        ),
+        "poc": (finding.reproduction_steps or "").strip(),
+        "impact": _safe_join_lines(
+            [
+                f"Type: {(finding.vuln_type or 'unknown').lower()}",
+                f"Severity: {_severity_label(finding.severity)}",
+                f"Potentially impacted surface: {host or 'unknown-host'}{endpoint if endpoint.startswith('/') else '/' + endpoint}",
+            ]
+        ),
+        "affected_products": affected_products,
+        "severity": _severity_label(finding.severity),
+        "endpoint": endpoint,
+        "method": method,
+        "vuln_type": (finding.vuln_type or "unknown").lower(),
+        "confidence": finding.confidence,
+    }
+
+
+def build_developer_report(run_id: str) -> DeveloperReportResult:
+    from django.db.models import Count
+    from .models import ScanRun, Finding
+
+    scan_run = ScanRun.objects.get(run_id=run_id)
+    findings_qs = Finding.objects.filter(scan_run_id=run_id).select_related("candidate__request")
+
+    severity_counts_map = {k: 0 for k, _ in Finding.Severity.choices}
+    for row in findings_qs.values("severity").annotate(c=Count("finding_id")):
+        sev = str(row.get("severity") or "info")
+        severity_counts_map[sev] = int(row.get("c") or 0)
+
+    finding_items = [_developer_finding_item(f) for f in findings_qs.order_by("-created_at")]
+    parsed = urlparse(scan_run.target_url or "")
+    host = (parsed.netloc or parsed.hostname or "").strip() or "unknown-host"
+
+    if finding_items:
+        executive_summary = (
+            f"This report summarizes {len(finding_items)} finding(s) observed on {host}. "
+            f"The highest reported severity is "
+            f"{next((item['severity'] for item in finding_items if item['severity'] in ('Critical', 'High', 'Moderate', 'Low')), 'Unknown')}."
+        )
+    else:
+        executive_summary = (
+            f"No confirmed findings were stored for {host} in this run. "
+            f"The report is provided for developer review and verification only."
+        )
+
+    json_obj: Dict[str, Any] = {
+        "target_url": scan_run.target_url,
+        "status": scan_run.status,
+        "generated_at": _now_iso(),
+        "executive_summary": executive_summary,
+        "findings_count": len(finding_items),
+        "findings_by_severity": severity_counts_map,
+        "findings": finding_items,
+    }
+
+    findings_md = []
+    for idx, item in enumerate(finding_items, start=1):
+        findings_md.append(
+            f"""## Finding {idx}: {item['title']}
+
+### Summary
+{item['summary'] or 'No summary provided.'}
+
+### Details
+{item['details']}
+
+### PoC
+{item['poc'] or 'No reproduction steps stored.'}
+
+### Impact
+{item['impact']}
+
+### Affected products
+{_safe_join_lines([f"- {value}" for value in item['affected_products']]) or '- unknown'}
+
+### Severity
+{item['severity']}
+"""
+        )
+
+    md_text = f"""# Developer Vulnerability Report
+
+## Executive Summary
+{executive_summary}
+
+## Target
+- {scan_run.target_url}
+
+## Findings Overview
+- Total findings: {len(finding_items)}
+{_safe_join_lines([f"- {k}: {v}" for k, v in severity_counts_map.items()])}
+
+{_safe_join_lines(findings_md) if findings_md else '## Findings\nNo confirmed findings were included in this report.'}
+"""
+
+    return DeveloperReportResult(run_id=str(scan_run.run_id), md_text=md_text, json_obj=json_obj)
 
 
 def build_finding_report(finding_id: str) -> FindingReportResult:
@@ -350,4 +481,12 @@ def serialize_finding_report_json(report: FindingReportResult) -> str:
 
 
 def serialize_finding_report_md(report: FindingReportResult) -> str:
+    return report.md_text
+
+
+def serialize_developer_report_json(report: DeveloperReportResult) -> str:
+    return json.dumps(report.json_obj, ensure_ascii=False, indent=2)
+
+
+def serialize_developer_report_md(report: DeveloperReportResult) -> str:
     return report.md_text
