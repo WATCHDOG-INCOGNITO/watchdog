@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List
+from urllib.parse import urlparse
 
 @dataclass
 class ReportResult:
@@ -12,8 +13,176 @@ class ReportResult:
     md_text: str
     json_obj: Dict[str, Any]
 
+
+@dataclass
+class FindingReportResult:
+    finding_id: str
+    md_text: str
+    json_obj: Dict[str, Any]
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _severity_label(severity: str | None) -> str:
+    sev = (severity or "").lower().strip()
+    return {
+        "info": "Informational",
+        "low": "Low",
+        "medium": "Moderate",
+        "high": "High",
+        "critical": "Critical",
+    }.get(sev, "Unknown")
+
+
+def _safe_join_lines(lines: List[str]) -> str:
+    cleaned = [line.strip() for line in lines if str(line or "").strip()]
+    return "\n".join(cleaned)
+
+
+def build_finding_report(finding_id: str) -> FindingReportResult:
+    from .models import Finding, FindingEvidenceLink
+
+    finding = (
+        Finding.objects.select_related("scan_run", "candidate__request")
+        .get(finding_id=finding_id)
+    )
+    candidate = finding.candidate
+    request = getattr(candidate, "request", None)
+    parsed = urlparse(finding.scan_run.target_url or "")
+    host = (parsed.netloc or parsed.hostname or "").strip() or "unknown-host"
+    endpoint = (
+        getattr(request, "endpoint", None)
+        or ((candidate.features or {}).get("endpoint") if candidate else None)
+        or "unknown-endpoint"
+    )
+    method = (getattr(request, "method", None) or "GET").upper()
+    vuln_type = (finding.vuln_type or getattr(candidate, "vuln_type", None) or "unknown").lower()
+    candidate_hypothesis = getattr(candidate, "hypothesis", None) if candidate else None
+    severity_label = _severity_label(finding.severity)
+
+    evidence_links = list(
+        FindingEvidenceLink.objects.filter(finding=finding).select_related("blob").order_by("created_at")
+    )
+    evidence_items: List[Dict[str, Any]] = []
+    evidence_lines: List[str] = []
+    for link in evidence_links:
+        blob = link.blob
+        preview = (blob.content or "").strip()
+        if len(preview) > 240:
+            preview = preview[:240] + "..."
+        evidence_items.append(
+            {
+                "blob_id": str(blob.blob_id),
+                "kind": blob.kind,
+                "role": link.role,
+                "storage_ref": blob.storage_ref,
+                "sha256": blob.sha256,
+                "byte_size": blob.byte_size,
+                "content_preview": preview,
+                "metadata": blob.metadata,
+            }
+        )
+        evidence_lines.append(
+            f"- {blob.kind} / {link.role}: {preview or blob.storage_ref or 'stored evidence'}"
+        )
+
+    if finding.summary:
+        summary_text = finding.summary.strip()
+    else:
+        summary_text = (
+            f"A {vuln_type} issue may affect {endpoint} on {host}. "
+            f"Severity is currently assessed as {severity_label}."
+        )
+
+    details_lines = [
+        f"Target host: `{host}`",
+        f"Endpoint: `{method} {endpoint}`",
+        f"Run ID: `{finding.scan_run_id}`",
+        f"Finding ID: `{finding.finding_id}`",
+    ]
+    if candidate_hypothesis:
+        details_lines.append(f"Candidate hypothesis: {candidate_hypothesis}")
+    if finding.summary:
+        details_lines.append(f"Observed summary: {finding.summary.strip()}")
+    if evidence_lines:
+        details_lines.append("")
+        details_lines.append("Supporting evidence:")
+        details_lines.extend(evidence_lines[:8])
+    else:
+        details_lines.append("No linked evidence blobs are currently stored for this finding.")
+
+    if finding.reproduction_steps:
+        poc_text = finding.reproduction_steps.strip()
+    else:
+        poc_text = _safe_join_lines(
+            [
+                f"1. Send a `{method}` request to `{endpoint}` on `{host}`.",
+                "2. Replay the observed request flow with the same authentication context used during the scan.",
+                "3. Compare the returned status code, response body, and any linked evidence against the stored finding.",
+                "4. Verify whether the suspicious behavior can be reproduced consistently.",
+            ]
+        )
+
+    impact_lines = [
+        f"Vulnerability type: {vuln_type}",
+        f"Impacted surface: {host}{endpoint if endpoint.startswith('/') else '/' + endpoint}",
+        f"Current finding severity: {severity_label}",
+    ]
+    if finding.confidence is not None:
+        impact_lines.append(f"Confidence score: {finding.confidence}")
+
+    affected_products = [host]
+    if endpoint and endpoint != "unknown-endpoint":
+        affected_products.append(endpoint)
+
+    json_obj: Dict[str, Any] = {
+        "finding_id": str(finding.finding_id),
+        "run_id": str(finding.scan_run_id),
+        "generated_at": _now_iso(),
+        "summary": summary_text,
+        "details": _safe_join_lines(details_lines),
+        "poc": poc_text,
+        "impact": _safe_join_lines(impact_lines),
+        "affected_products": affected_products,
+        "severity": severity_label,
+        "metadata": {
+            "title": finding.title,
+            "vuln_type": vuln_type,
+            "confidence": finding.confidence,
+            "host": host,
+            "endpoint": endpoint,
+            "method": method,
+            "candidate_id": str(finding.candidate_id) if finding.candidate_id else None,
+            "evidence_count": len(evidence_items),
+            "evidence": evidence_items,
+        },
+    }
+
+    md_text = f"""## Summary
+{json_obj['summary']}
+
+## Details
+{json_obj['details']}
+
+## PoC
+{json_obj['poc']}
+
+## Impact
+{json_obj['impact']}
+
+###Affected products
+{_safe_join_lines([f"- {item}" for item in affected_products])}
+
+###Severity(Low, Moderate, High, Critical)
+{severity_label}
+"""
+
+    return FindingReportResult(
+        finding_id=str(finding.finding_id),
+        md_text=md_text,
+        json_obj=json_obj,
+    )
 
 def build_report(run_id: str) -> ReportResult:
     """
@@ -173,4 +342,12 @@ def serialize_report_json(report: ReportResult) -> str:
     return json.dumps(report.json_obj, ensure_ascii=False, indent=2)
 
 def serialize_report_md(report: ReportResult) -> str:
+    return report.md_text
+
+
+def serialize_finding_report_json(report: FindingReportResult) -> str:
+    return json.dumps(report.json_obj, ensure_ascii=False, indent=2)
+
+
+def serialize_finding_report_md(report: FindingReportResult) -> str:
     return report.md_text
