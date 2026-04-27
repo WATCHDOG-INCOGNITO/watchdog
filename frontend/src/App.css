@@ -440,7 +440,15 @@ button { cursor: pointer; }
 .checkbox-row input { width: 18px; height: 18px; }
 
 .modal-backdrop { position: fixed; inset: 0; background: rgba(15, 42, 74, 0.22); display: grid; place-items: center; padding: 24px; z-index: 1000; }
-.modal-card { width: min(720px, 100%); padding: 24px; background: rgba(250, 252, 255, 0.98); }
+.modal-card {
+  width: min(720px, 100%);
+  max-height: calc(100vh - 48px);
+  padding: 24px;
+  background: rgba(250, 252, 255, 0.98);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
 .modal-card-wide { width: min(960px, 100%); }
 .modal-copy { margin-top: 12px; line-height: 1.6; }
 .artifact-modal-grid, .status-grid {
@@ -461,6 +469,9 @@ button { cursor: pointer; }
 }
 .artifact-modal-detail {
   min-width: 0;
+  max-height: 68vh;
+  overflow: auto;
+  padding-right: 6px;
 }
 .modal-list-stack {
   margin-top: 16px;

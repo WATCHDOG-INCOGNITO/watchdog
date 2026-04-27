@@ -151,6 +151,10 @@ async function fetchFindingDetail(findingId) {
   return apiGet(`/api/findings/${findingId}/detail/`);
 }
 
+async function fetchFindingReport(findingId, format = "md") {
+  return apiGet(`/api/findings/${findingId}/report/?format=${format}`);
+}
+
 async function fetchLlmTraces(runId) {
   const payload = await apiGet(`/api/scan-runs/${runId}/llm-traces/?page_size=100`);
   return { traces: normalizePaginatedList(payload), count: payload.count ?? normalizePaginatedList(payload).length };
@@ -225,9 +229,48 @@ function CandidateItem({ candidate }) {
 }
 
 function FindingDetailPanel({ finding, detail }) {
+  const [reportFormat, setReportFormat] = useState("md");
+  const [reportContent, setReportContent] = useState("");
+  const [reportLoading, setReportLoading] = useState(false);
+  const [reportError, setReportError] = useState("");
+
+  useEffect(() => {
+    setReportFormat("md");
+    setReportContent("");
+    setReportError("");
+    setReportLoading(false);
+  }, [finding?.finding_id]);
+
   if (!finding) {
     return <EmptyState title="취약점을 선택하세요" body="왼쪽 목록에서 항목을 선택하면 상세 설명과 증거를 확인할 수 있습니다." />;
   }
+
+  const loadFindingReport = async (format) => {
+    setReportLoading(true);
+    setReportError("");
+    try {
+      const payload = await fetchFindingReport(finding.finding_id, format);
+      const content = payload?.content;
+      setReportFormat(payload?.format || format);
+      setReportContent(
+        typeof content === "string" ? content : JSON.stringify(content, null, 2)
+      );
+    } catch (error) {
+      setReportError(error.message || "리포트를 생성하지 못했습니다.");
+      setReportContent("");
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
+  const copyReport = async () => {
+    if (!reportContent) return;
+    try {
+      await navigator.clipboard.writeText(reportContent);
+    } catch {
+      setReportError("클립보드 복사에 실패했습니다.");
+    }
+  };
 
   return (
     <div className="artifact-modal-detail">
@@ -237,6 +280,27 @@ function FindingDetailPanel({ finding, detail }) {
         <h3>{finding.title}</h3>
       </div>
       <p className="finding-subtitle">신뢰도 {finding.confidence} | 증거 {finding.evidence_count || 0}건</p>
+
+      <div className="section-actions" style={{ marginBottom: 12 }}>
+        <button type="button" className="ghost-button" onClick={() => loadFindingReport("md")} disabled={reportLoading}>
+          Markdown 리포트
+        </button>
+        <button type="button" className="ghost-button" onClick={() => loadFindingReport("json")} disabled={reportLoading}>
+          JSON 리포트
+        </button>
+        <button type="button" className="ghost-button" onClick={copyReport} disabled={!reportContent}>
+          복사
+        </button>
+      </div>
+
+      {reportError ? <div className="callout callout-error">{reportError}</div> : null}
+      {reportLoading ? <div className="callout callout-neutral">리포트를 생성하는 중입니다...</div> : null}
+      {reportContent ? (
+        <div className="detail-summary">
+          <strong>리포트 ({reportFormat})</strong>
+          <pre className="detail-steps">{reportContent}</pre>
+        </div>
+      ) : null}
 
       {detail?.summary ? (
         <div className="llm-analysis">

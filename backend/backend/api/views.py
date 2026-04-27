@@ -26,7 +26,12 @@ from .serializers import (
     VisualAnalysisSerializer, IDORTestSessionSerializer, WAFBypassAttemptSerializer,
     VulnerabilityEntrySerializer, PayloadPatternSerializer, ReportArchiveSerializer,
 )
-from .reporting import build_report, serialize_report_json, serialize_report_md
+from .reporting import (
+    build_report,
+    build_finding_report,
+    serialize_report_json,
+    serialize_report_md,
+)
 from .scan_control import request_scan_stop
 
 class StandardPagination(PageNumberPagination):
@@ -460,6 +465,19 @@ def scan_run_report(request, run_id):
     if fmt in ("md", "markdown"):
         return Response({"run_id": run_id, "format": "md", "content": rr.markdown})
     return Response({"run_id": run_id, "format": "json", "content": json_mod.loads(rr.json)})
+
+
+@api_view(["GET", "POST"])
+def finding_report(request, finding_id):
+    finding_id = str(finding_id)
+    try:
+        report = build_finding_report(finding_id)
+    except Finding.DoesNotExist:
+        return Response({"detail": "finding not found"}, status=status.HTTP_404_NOT_FOUND)
+    fmt = (request.query_params.get("format") or request.data.get("format") or "md").lower().strip()
+    if fmt in ("json",):
+        return Response({"finding_id": finding_id, "format": "json", "content": report.json_obj})
+    return Response({"finding_id": finding_id, "format": "md", "content": report.md_text})
 
 
 @api_view(["GET"])
