@@ -102,6 +102,13 @@ curl -X POST http://localhost:8000/api/scan-runs/ \
 
 ---
 
+### Scan option
+- `Low Cost`: Uses lighter models for mapping and reporting, while keeping core security reasoning on Sonnet.
+- `Balanced`: Uses Sonnet for most discovery and verification steps, with lighter models for support roles.
+- `High Performance`: Uses stronger models for complex hypotheses, exploit execution, and confirmation.
+- `Advanced Settings`: You can customize the model for each discovery role individually.
+
+
 ## Knowledge Base
 
 27 vulnerability categories with sub-technique classification:
