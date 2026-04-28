@@ -1881,6 +1881,82 @@ select:focus-visible {
   background: #f7f5ef;
 }
 
+.model-config-panel {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid rgba(37, 45, 42, 0.12);
+  border-radius: 8px;
+  background: #f7f5ef;
+}
+
+.model-config-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.model-config-title {
+  display: block;
+  color: var(--text);
+  font-weight: 800;
+}
+
+.model-config-head p {
+  margin: 4px 0 0;
+  color: var(--text-dim);
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+
+.model-profile-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.model-profile-button {
+  display: grid;
+  gap: 5px;
+  min-height: 96px;
+  padding: 12px;
+  border: 1px solid rgba(37, 45, 42, 0.12);
+  border-radius: 6px;
+  background: #fffefa;
+  color: var(--text);
+  text-align: left;
+  transition: border-color 180ms ease, transform 180ms ease, box-shadow 180ms ease;
+}
+
+.model-profile-button:hover,
+.model-profile-button.active {
+  transform: translateY(-1px);
+  border-color: rgba(15, 139, 124, 0.45);
+  box-shadow: 0 8px 24px rgba(15, 139, 124, 0.10);
+}
+
+.model-profile-button span {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.model-role-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.model-role-field em {
+  margin-left: 4px;
+  color: var(--text-dim);
+  font-size: 0.74rem;
+  font-style: normal;
+  font-weight: 600;
+}
+
 .auth-config-note,
 .auth-config-warning {
   color: var(--text-dim);
@@ -2436,8 +2512,14 @@ select:focus-visible {
   }
 
   .auth-persona-head,
-  .auth-two-column {
+  .auth-two-column,
+  .model-profile-grid,
+  .model-role-grid {
     grid-template-columns: 1fr;
+  }
+
+  .model-config-head {
+    flex-direction: column;
   }
 
   .endpoint-spec-toolbar {
