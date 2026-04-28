@@ -113,6 +113,81 @@ MAX_PLAN_ITERATIONS = 2  # planner→executor→verifier 사이클 반복 횟수
 MODEL = os.environ.get("WATCHDOG_AGENT_MODEL", "claude-sonnet-4-20250514")
 AGENT_MODE_DEFAULT = os.environ.get("WATCHDOG_AGENT_MODE", "multi").lower()
 
+ROLE_MODEL_ENV = {
+    "single": "WATCHDOG_AGENT_MODEL",
+    "planner": "WATCHDOG_MODEL_PLANNER",
+    "executor": "WATCHDOG_MODEL_EXECUTOR",
+    "verifier": "WATCHDOG_MODEL_VERIFIER",
+    "reporter": "WATCHDOG_MODEL_REPORTER",
+    "routemap": "WATCHDOG_MODEL_ROUTEMAP",
+    "entrypoint": "WATCHDOG_MODEL_ENTRYPOINT",
+    "hypothesis": "WATCHDOG_MODEL_HYPOTHESIS",
+    "exploit": "WATCHDOG_MODEL_EXPLOIT",
+    "confirmer": "WATCHDOG_MODEL_CONFIRMER",
+    "critic": "WATCHDOG_MODEL_CRITIC",
+    "explorer": "WATCHDOG_MODEL_EXPLORER",
+}
+
+ROLE_MODEL_ALIASES = {
+    "route_map": "routemap",
+    "route-map": "routemap",
+    "routeMap": "routemap",
+    "entry_point": "entrypoint",
+    "entry-point": "entrypoint",
+    "entryPoint": "entrypoint",
+    "confirm": "confirmer",
+    "pre-exploit": "critic",
+}
+
+
+def _normalize_model_role(role: str) -> str:
+    """Map runtime role labels like 'exploit:W2' to config keys like 'exploit'."""
+    base = str(role or "").split(":", 1)[0].strip()
+    return ROLE_MODEL_ALIASES.get(base, base) or "single"
+
+
+def _model_for_role(scan_run: ScanRun | None, role: str) -> str:
+    """Resolve model precedence: scan config -> role env -> global env -> code default."""
+    role_key = _normalize_model_role(role)
+    try:
+        cfg = scan_run.config or {} if scan_run is not None else {}
+    except Exception:
+        cfg = {}
+
+    configured = cfg.get("models") if isinstance(cfg, dict) else {}
+    if isinstance(configured, dict):
+        candidates = [
+            role_key,
+            ROLE_MODEL_ALIASES.get(role_key, role_key),
+            role,
+        ]
+        for key in candidates:
+            value = configured.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    env_name = ROLE_MODEL_ENV.get(role_key)
+    if env_name:
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return value
+    return MODEL
+
+
+def _int_from_config(
+    config: dict,
+    key: str,
+    default: int,
+    *,
+    min_value: int = 1,
+    max_value: int = 50,
+) -> int:
+    try:
+        value = int(config.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(min_value, min(max_value, value))
+
 # Sonnet 4 pricing: input $3/MTok, output $15/MTok
 INPUT_COST_PER_TOKEN = Decimal("0.000003")
 OUTPUT_COST_PER_TOKEN = Decimal("0.000015")
@@ -1520,8 +1595,9 @@ async def _run_role_phase(
             "cache_control": {"type": "ephemeral"},
         }]
         call_messages = _compact_messages_for_call(messages, role)
+        selected_model = _model_for_role(scan_run, role)
         call_kwargs = dict(
-            model=MODEL,
+            model=selected_model,
             max_tokens=ROLE_OUTPUT_TOKEN_BUDGET.get(role, 4096),
             system=cached_system,
             messages=call_messages,
@@ -1599,7 +1675,7 @@ async def _run_role_phase(
                 scan_run=scan_run,
                 call_index=acc.calls,
                 stage=f"multi:{role}",
-                model=MODEL,
+                model=selected_model,
                 prompt_preview=prompt_preview,
                 response_preview=response_preview,
                 tool_calls=tool_calls,
@@ -1622,7 +1698,7 @@ async def _run_role_phase(
                 scan_run=scan_run,
                 call_index=acc.calls,
                 stage=f"multi:{role}",
-                model=MODEL,
+                model=selected_model,
                 prompt_preview=prompt_preview,
                 response_preview=response_preview,
                 tool_calls=tool_calls,
@@ -1648,7 +1724,7 @@ async def _run_role_phase(
             scan_run=scan_run,
             call_index=acc.calls,
             stage=f"multi:{role}",
-            model=MODEL,
+            model=selected_model,
             prompt_preview=prompt_preview,
             response_preview=response_preview,
             tool_calls=tool_calls,
@@ -3916,14 +3992,21 @@ async def _run_discovery_loop(
     acc = _Accumulator()
     explorer_tools = _filter_tools(anthropic_tools, EXPLORER_TOOLS)
     reporter_tools = _filter_tools(anthropic_tools, REPORTER_TOOLS)
+    scan_config = scan_run.config or {}
+    worker_count = _int_from_config(
+        scan_config,
+        "discovery_workers",
+        DISCOVERY_WORKER_COUNT,
+        min_value=1,
+        max_value=20,
+    )
 
     logger.info(
-        f"[{scan_run.run_id}] discovery mode: workers={DISCOVERY_WORKER_COUNT}, "
+        f"[{scan_run.run_id}] discovery mode: workers={worker_count}, "
         f"worker_budget={DISCOVERY_WORKER_BUDGET}, "
         f"quiescence={DISCOVERY_QUIESCENCE_S}s"
     )
 
-    scan_config = scan_run.config or {}
     root_context = {"target_url": scan_run.target_url}
     if scan_config.get("source_root"):
         root_context["source_root"] = scan_config["source_root"]
@@ -4038,7 +4121,7 @@ async def _run_discovery_loop(
             name=f"explorer-{suffix}",
         )
 
-    workers = [_spawn_explorer(f"W{i+1}") for i in range(DISCOVERY_WORKER_COUNT)]
+    workers = [_spawn_explorer(f"W{i+1}") for i in range(worker_count)]
 
     while True:
         await asyncio.sleep(3)
@@ -4281,9 +4364,10 @@ async def _run_single_agent_loop(
     for turn in range(MAX_TURNS):
         raise_if_stop_requested(scan_run)
         logger.info(f"[{scan_run.run_id}] single turn {turn + 1}/{MAX_TURNS}")
+        selected_model = _model_for_role(scan_run, "single")
         response = _call_llm_with_retry(
             anthropic, scan_run,
-            model=MODEL, max_tokens=4096,
+            model=selected_model, max_tokens=4096,
             system=SYSTEM_PROMPT, tools=anthropic_tools, messages=messages,
         )
 
@@ -4321,7 +4405,12 @@ def run_mcp_scan(scan_run: ScanRun):
         scan_run.error_log = None
         scan_run.save(update_fields=["status", "finished_at", "error_log"])
 
-        mode = AGENT_MODE_DEFAULT if AGENT_MODE_DEFAULT in ("discovery", "swarm", "multi", "single") else "multi"
+        scan_config = scan_run.config or {}
+        requested_mode = str(scan_config.get("agent_mode") or "").strip().lower()
+        if requested_mode in ("discovery", "swarm", "multi", "single"):
+            mode = requested_mode
+        else:
+            mode = AGENT_MODE_DEFAULT if AGENT_MODE_DEFAULT in ("discovery", "swarm", "multi", "single") else "multi"
         logger.info(f"[{scan_run.run_id}] starting MCP scan (mode={mode})")
         asyncio.run(_connect_mcp_and_run(scan_run, mode=mode))
 

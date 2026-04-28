@@ -14,6 +14,67 @@ const STATUS_META = {
   stale: { label: "응답 없음", tone: "stale", copy: "최근 백엔드 활동이 없어 현재 상태를 신뢰하기 어렵습니다." },
 };
 
+const MODEL_OPTIONS = [
+  { id: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
+  { id: "claude-sonnet-4-5-20250929", label: "Sonnet 4.5" },
+  { id: "claude-sonnet-4-6", label: "Sonnet 4.6" },
+  { id: "claude-3-opus-20240229", label: "Opus 3" },
+  { id: "claude-opus-4-6", label: "Opus 4.6" },
+  { id: "claude-opus-4-7", label: "Opus 4.7" },
+];
+
+const DISCOVERY_MODEL_ROLES = [
+  { key: "routemap", label: "전체 지도 작성", role: "RouteMap" },
+  { key: "entrypoint", label: "엔드포인트 분석", role: "EntryPoint" },
+  { key: "hypothesis", label: "취약점 가설 수립", role: "Hypothesis" },
+  { key: "exploit", label: "익스플로잇 시도", role: "Exploit" },
+  { key: "confirmer", label: "결과 확정", role: "Confirmer" },
+  { key: "critic", label: "사전 검토", role: "Critic" },
+  { key: "reporter", label: "보고서 작성", role: "Reporter" },
+];
+
+const MODEL_PROFILES = {
+  low: {
+    label: "저비용",
+    copy: "정찰과 보고는 경량 모델, 핵심 판단은 Sonnet으로 유지합니다.",
+    models: {
+      routemap: "claude-haiku-4-5-20251001",
+      entrypoint: "claude-sonnet-4-5-20250929",
+      hypothesis: "claude-sonnet-4-5-20250929",
+      exploit: "claude-sonnet-4-5-20250929",
+      confirmer: "claude-sonnet-4-5-20250929",
+      critic: "claude-haiku-4-5-20251001",
+      reporter: "claude-haiku-4-5-20251001",
+    },
+  },
+  balanced: {
+    label: "균형",
+    copy: "탐색과 검증은 Sonnet, 보조 역할은 Haiku로 비용을 조절합니다.",
+    models: {
+      routemap: "claude-sonnet-4-5-20250929",
+      entrypoint: "claude-sonnet-4-5-20250929",
+      hypothesis: "claude-sonnet-4-6",
+      exploit: "claude-sonnet-4-6",
+      confirmer: "claude-sonnet-4-6",
+      critic: "claude-haiku-4-5-20251001",
+      reporter: "claude-haiku-4-5-20251001",
+    },
+  },
+  high: {
+    label: "고성능",
+    copy: "복잡한 가설, 익스플로잇, 확정 판단에 Opus를 배치합니다.",
+    models: {
+      routemap: "claude-sonnet-4-6",
+      entrypoint: "claude-sonnet-4-6",
+      hypothesis: "claude-opus-4-6",
+      exploit: "claude-opus-4-7",
+      confirmer: "claude-opus-4-7",
+      critic: "claude-sonnet-4-6",
+      reporter: "claude-sonnet-4-5-20250929",
+    },
+  },
+};
+
 function apiUrl(path) {
   return `${API_BASE}${path}`;
 }
@@ -109,7 +170,11 @@ function normalizePaginatedList(payload) {
 }
 
 function getScanEngine(scan) {
-  return scan?.config?.mode === "mcp" ? "MCP 에이전트" : "구조화 파이프라인";
+  if (scan?.config?.mode !== "mcp") return "구조화 파이프라인";
+  const agentMode = scan.config.agent_mode || "env";
+  const profile = scan.config.model_profile;
+  const profileLabel = MODEL_PROFILES[profile]?.label || (profile === "custom" ? "사용자 지정" : "");
+  return profileLabel ? `MCP ${agentMode} · ${profileLabel}` : `MCP ${agentMode}`;
 }
 
 function isScanStale(scan, now) {
@@ -660,10 +725,14 @@ function BrowserLoginModal({ initialTarget, onClose, onImported }) {
 function NewScanModal({ onClose, onCreated }) {
   const [targetUrl, setTargetUrl] = useState("");
   const [requestBudget, setRequestBudget] = useState(10);
+  const [discoveryWorkers, setDiscoveryWorkers] = useState(3);
   const [forceSpa, setForceSpa] = useState(false);
   const [bugBountyUA, setBugBountyUA] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const [modelProfile, setModelProfile] = useState("balanced");
+  const [showModelAdvanced, setShowModelAdvanced] = useState(false);
+  const [roleModels, setRoleModels] = useState({ ...MODEL_PROFILES.balanced.models });
   // SSO profile (Playwright storage_state) — created via BrowserLoginModal
   const [ssoProfile, setSsoProfile] = useState("");
   const [showBrowserLogin, setShowBrowserLogin] = useState(false);
@@ -733,13 +802,29 @@ function NewScanModal({ onClose, onCreated }) {
     return list;
   }
 
+  function selectModelProfile(profileKey) {
+    setModelProfile(profileKey);
+    setRoleModels({ ...MODEL_PROFILES[profileKey].models });
+  }
+
+  function updateRoleModel(roleKey, modelId) {
+    setModelProfile("custom");
+    setRoleModels((prev) => ({ ...prev, [roleKey]: modelId }));
+  }
+
   async function handleSubmit() {
     if (!targetUrl.trim()) return;
     setSubmitting(true);
     setError("");
 
     try {
-      const config = { mode: "mcp" };
+      const config = {
+        mode: "mcp",
+        agent_mode: "discovery",
+        discovery_workers: Math.max(1, Math.min(20, Number(discoveryWorkers) || 3)),
+        model_profile: modelProfile,
+        models: { ...roleModels },
+      };
       if (forceSpa) config.force_spa = true;
       if (bugBountyUA.trim()) config.bug_bounty_ua = bugBountyUA.trim();
 
@@ -795,6 +880,61 @@ function NewScanModal({ onClose, onCreated }) {
           <span>요청 예산</span>
           <input type="number" min="1" value={requestBudget} onChange={(event) => setRequestBudget(event.target.value)} />
         </label>
+
+        <label className="field">
+          <span>Discovery 워커 수</span>
+          <input
+            type="number"
+            min="1"
+            max="20"
+            value={discoveryWorkers}
+            onChange={(event) => setDiscoveryWorkers(event.target.value)}
+          />
+          <span style={{ fontSize: "0.8em", opacity: 0.6, marginTop: 2 }}>
+            전체 탐색 큐를 동시에 처리할 worker 수입니다. 처음에는 3, 빠른 탐색은 5 정도를 권장합니다.
+          </span>
+        </label>
+
+        <div className="model-config-panel">
+          <div className="model-config-head">
+            <div>
+              <span className="model-config-title">모델 전략</span>
+              <p>{modelProfile === "custom" ? "역할별 모델을 직접 조정했습니다." : MODEL_PROFILES[modelProfile].copy}</p>
+            </div>
+            <button type="button" className="ghost-button" onClick={() => setShowModelAdvanced((v) => !v)}>
+              {showModelAdvanced ? "고급 닫기" : "고급 설정"}
+            </button>
+          </div>
+
+          <div className="model-profile-grid">
+            {Object.entries(MODEL_PROFILES).map(([key, profile]) => (
+              <button
+                key={key}
+                type="button"
+                className={`model-profile-button ${modelProfile === key ? "active" : ""}`}
+                onClick={() => selectModelProfile(key)}
+              >
+                <strong>{profile.label}</strong>
+                <span>{profile.copy}</span>
+              </button>
+            ))}
+          </div>
+
+          {showModelAdvanced ? (
+            <div className="model-role-grid">
+              {DISCOVERY_MODEL_ROLES.map((item) => (
+                <label key={item.key} className="field field-compact model-role-field">
+                  <span>{item.label} <em>{item.role}</em></span>
+                  <select value={roleModels[item.key]} onChange={(e) => updateRoleModel(item.key, e.target.value)}>
+                    {MODEL_OPTIONS.map((model) => (
+                      <option key={model.id} value={model.id}>{model.label}</option>
+                    ))}
+                  </select>
+                </label>
+              ))}
+            </div>
+          ) : null}
+        </div>
 
         <label className="checkbox-row">
           <input type="checkbox" checked={forceSpa} onChange={(event) => setForceSpa(event.target.checked)} />
