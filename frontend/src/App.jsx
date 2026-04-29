@@ -4,6 +4,8 @@ import "./App.css";
 const API_BASE = process.env.REACT_APP_API_BASE || "";
 const WS_BASE = API_BASE.replace(/^http/i, "ws");
 const STALE_AFTER_MS = 20000;
+let bodyScrollLockCount = 0;
+let bodyScrollPreviousOverflow = "";
 
 const STATUS_META = {
   queued: { label: "대기 중", tone: "queued", copy: "시작 요청을 기다리는 상태입니다." },
@@ -166,11 +168,17 @@ async function fetchScanDeveloperReport(runId, format = "md") {
 
 function useLockBodyScroll(active) {
   useEffect(() => {
-    if (!active) return undefined;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
+    if (!active || typeof document === "undefined") return undefined;
+    if (bodyScrollLockCount === 0) {
+      bodyScrollPreviousOverflow = document.body.style.overflow;
+      document.body.style.overflow = "hidden";
+    }
+    bodyScrollLockCount += 1;
     return () => {
-      document.body.style.overflow = previousOverflow;
+      bodyScrollLockCount = Math.max(0, bodyScrollLockCount - 1);
+      if (bodyScrollLockCount === 0) {
+        document.body.style.overflow = bodyScrollPreviousOverflow;
+      }
     };
   }, [active]);
 }
@@ -184,24 +192,90 @@ function EmptyState({ title, body, className = "" }) {
   );
 }
 
+function renderInlineMarkdown(text, keyPrefix) {
+  const source = String(text ?? "");
+  const nodes = [];
+  const pattern = /(`[^`]*`|\*\*[^*]+?\*\*)/g;
+  let lastIndex = 0;
+  let match;
+  let tokenIndex = 0;
+
+  while ((match = pattern.exec(source)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(source.slice(lastIndex, match.index));
+    }
+    const token = match[0];
+    const key = `${keyPrefix}-inline-${tokenIndex}`;
+    if (token.startsWith("`")) {
+      nodes.push(<code key={key} className="markdown-code">{token.slice(1, -1)}</code>);
+    } else {
+      nodes.push(<strong key={key}>{token.slice(2, -2)}</strong>);
+    }
+    lastIndex = pattern.lastIndex;
+    tokenIndex += 1;
+  }
+
+  if (lastIndex < source.length) {
+    nodes.push(source.slice(lastIndex));
+  }
+
+  return nodes.length ? nodes : source;
+}
+
 function SimpleMarkdown({ content }) {
   const lines = String(content || "").split(/\r?\n/);
   const elements = [];
   let listItems = [];
+  let listType = "ul";
+  let codeLines = null;
+  let codeBlockLanguage = "";
 
   const flushList = (keyPrefix) => {
     if (!listItems.length) return;
+    const ListTag = listType === "ol" ? "ol" : "ul";
     elements.push(
-      <ul key={`${keyPrefix}-list`} className="markdown-list">
-        {listItems.map((item, index) => <li key={`${keyPrefix}-${index}`}>{item}</li>)}
-      </ul>
+      <ListTag key={`${keyPrefix}-list`} className="markdown-list">
+        {listItems.map((item, index) => (
+          <li key={`${keyPrefix}-${index}`}>{renderInlineMarkdown(item, `${keyPrefix}-${index}`)}</li>
+        ))}
+      </ListTag>
     );
     listItems = [];
+  };
+
+  const flushCodeBlock = (keyPrefix) => {
+    if (codeLines === null) return;
+    elements.push(
+      <pre key={`${keyPrefix}-code`} className="markdown-pre">
+        <code className={codeBlockLanguage ? `language-${codeBlockLanguage}` : undefined}>
+          {codeLines.join("\n")}
+        </code>
+      </pre>
+    );
+    codeLines = null;
+    codeBlockLanguage = "";
   };
 
   lines.forEach((rawLine, index) => {
     const line = rawLine.trimEnd();
     const key = `md-${index}`;
+    const fenceMatch = line.match(/^```\s*([\w-]+)?\s*$/);
+
+    if (codeLines !== null) {
+      if (fenceMatch) {
+        flushCodeBlock(key);
+      } else {
+        codeLines.push(line);
+      }
+      return;
+    }
+
+    if (fenceMatch) {
+      flushList(key);
+      codeLines = [];
+      codeBlockLanguage = fenceMatch[1] || "";
+      return;
+    }
 
     if (!line.trim()) {
       flushList(key);
@@ -209,29 +283,43 @@ function SimpleMarkdown({ content }) {
     }
 
     if (line.startsWith("- ")) {
+      if (listItems.length && listType !== "ul") flushList(key);
+      listType = "ul";
       listItems.push(line.slice(2));
+      return;
+    }
+
+    const orderedMatch = line.match(/^\d+\.\s+(.+)$/);
+    if (orderedMatch) {
+      if (listItems.length && listType !== "ol") flushList(key);
+      listType = "ol";
+      listItems.push(orderedMatch[1]);
       return;
     }
 
     flushList(key);
 
-    if (line.startsWith("###")) {
-      elements.push(<h4 key={key} className="markdown-h4">{line.replace(/^###\s*/, "")}</h4>);
+    const h4Match = line.match(/^###\s+(.+)$/);
+    if (h4Match) {
+      elements.push(<h4 key={key} className="markdown-h4">{renderInlineMarkdown(h4Match[1], key)}</h4>);
       return;
     }
-    if (line.startsWith("##")) {
-      elements.push(<h3 key={key} className="markdown-h3">{line.replace(/^##\s*/, "")}</h3>);
+    const h3Match = line.match(/^##\s+(.+)$/);
+    if (h3Match) {
+      elements.push(<h3 key={key} className="markdown-h3">{renderInlineMarkdown(h3Match[1], key)}</h3>);
       return;
     }
-    if (line.startsWith("#")) {
-      elements.push(<h2 key={key} className="markdown-h2">{line.replace(/^#\s*/, "")}</h2>);
+    const h2Match = line.match(/^#\s+(.+)$/);
+    if (h2Match) {
+      elements.push(<h2 key={key} className="markdown-h2">{renderInlineMarkdown(h2Match[1], key)}</h2>);
       return;
     }
 
-    elements.push(<p key={key} className="markdown-p">{line}</p>);
+    elements.push(<p key={key} className="markdown-p">{renderInlineMarkdown(line, key)}</p>);
   });
 
   flushList("final");
+  flushCodeBlock("final");
 
   return <div className="markdown-renderer">{elements}</div>;
 }
@@ -558,32 +646,32 @@ function RunDetailsModal({ scan, requestCount, candidateCount, onClose }) {
             <div><span>비용</span><strong>{formatCurrency(scan.llm_cost_usd)}</strong></div>
           </div>
 
-        <div className="section-actions" style={{ marginTop: 16 }}>
-          <button type="button" className="ghost-button" onClick={() => loadDeveloperReport("md")} disabled={reportLoading}>
-            보고서(MD)
-          </button>
-          <button type="button" className="ghost-button" onClick={() => loadDeveloperReport("json")} disabled={reportLoading}>
-            보고서(JSON)
-          </button>
-          <button type="button" className="ghost-button" onClick={copyDeveloperReport} disabled={!reportContent}>
-            복사
-          </button>
+          <div className="section-actions" style={{ marginTop: 16 }}>
+            <button type="button" className="ghost-button" onClick={() => loadDeveloperReport("md")} disabled={reportLoading}>
+              보고서(MD)
+            </button>
+            <button type="button" className="ghost-button" onClick={() => loadDeveloperReport("json")} disabled={reportLoading}>
+              보고서(JSON)
+            </button>
+            <button type="button" className="ghost-button" onClick={copyDeveloperReport} disabled={!reportContent}>
+              복사
+            </button>
           </div>
 
           {reportError ? <div className="callout callout-error">{reportError}</div> : null}
           {reportLoading ? <div className="callout callout-neutral">전체 보고서를 생성하는 중입니다...</div> : null}
-        {reportContent ? (
-          <div className="detail-summary" style={{ marginTop: 16 }}>
-            <strong>보고서 ({reportFormat})</strong>
-            {reportFormat === "md" ? (
-              <div className="detail-steps markdown-surface">
-                <SimpleMarkdown content={reportContent} />
-              </div>
-            ) : (
-              <pre className="detail-steps">{reportContent}</pre>
-            )}
-          </div>
-        ) : null}
+          {reportContent ? (
+            <div className="detail-summary" style={{ marginTop: 16 }}>
+              <strong>보고서 ({reportFormat})</strong>
+              {reportFormat === "md" ? (
+                <div className="detail-steps markdown-surface">
+                  <SimpleMarkdown content={reportContent} />
+                </div>
+              ) : (
+                <pre className="detail-steps">{reportContent}</pre>
+              )}
+            </div>
+          ) : null}
 
           {scan.error_log ? (
             <div className="failure-panel">
