@@ -89,23 +89,6 @@ def _run_login_task(task_id: str, target_url: str, profile_name: str):
                         state["state"] = "waiting"
                         state["message"] = "navigate to target"
 
-                        auth_marker_hit = {"v": False}
-
-                        def _on_response(resp):
-                            try:
-                                raw = resp.headers.get("set-cookie") or ""
-                                if not raw:
-                                    return
-                                low = raw.lower()
-                                for m in AUTH_COOKIE_MARKERS:
-                                    if m in low:
-                                        auth_marker_hit["v"] = True
-                                        return
-                            except Exception:
-                                pass
-
-                        page.on("response", _on_response)
-
                         try:
                             page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
                         except Exception as e:
@@ -117,6 +100,46 @@ def _run_login_task(task_id: str, target_url: str, profile_name: str):
                             target_host = _urlparse(target_url).netloc.lower()
                         except Exception:
                             pass
+
+                        # Cookie names that indicate successful auth. Match
+                        # both exact (session) and common-prefix (access_token
+                        # → accesstoken / access-token / accessToken).
+                        _AUTH_NAMES = (
+                            "access-token", "access_token", "accesstoken", "accesstoken",
+                            "refresh-token", "refresh_token", "refreshtoken",
+                            "session", "sessionid", "session_id",
+                            "jsessionid", "phpsessid",
+                            "auth", "authtoken", "token",
+                            "connect.sid", "sid",
+                            "authorization",
+                        )
+
+                        def _has_target_auth_cookie() -> bool:
+                            """Poll context cookies for any auth-like cookie
+                            bound to target_host (or its parent). More robust
+                            than response.headers.set-cookie which only
+                            exposes the first Set-Cookie per response in
+                            Playwright Python."""
+                            if not target_host:
+                                return False
+                            try:
+                                cookies = context.cookies()
+                            except Exception:
+                                return False
+                            for c in cookies:
+                                dom = (c.get("domain") or "").lstrip(".").lower()
+                                if not dom:
+                                    continue
+                                # match target host or its immediate parent
+                                if not (dom == target_host
+                                        or target_host.endswith("." + dom)
+                                        or dom.endswith("." + target_host)):
+                                    continue
+                                name = (c.get("name") or "").lower().replace("-", "").replace("_", "")
+                                for marker in _AUTH_NAMES:
+                                    if marker.replace("-", "").replace("_", "") in name or name in marker.replace("-", "").replace("_", ""):
+                                        return True
+                            return False
 
                         def _is_interstitial(u: str) -> bool:
                             """True if URL is still in the middle of an auth
@@ -147,11 +170,38 @@ def _run_login_task(task_id: str, target_url: str, profile_name: str):
                                     return True
                             return False
 
+                        def _any_page_on_target():
+                            """User may open a new tab or OAuth may use a
+                            popup — initial `page` is not the only surface.
+                            Walk all context.pages and return the one on
+                            target_host if any, else the most-recently-active
+                            page's url."""
+                            try:
+                                pages = list(context.pages)
+                            except Exception:
+                                pages = [page]
+                            chosen_url = ""
+                            for p in pages:
+                                try:
+                                    u = p.url
+                                    h = _urlparse(u).netloc.lower()
+                                except Exception:
+                                    continue
+                                if target_host and h == target_host:
+                                    return u, h
+                                chosen_url = u
+                            try:
+                                return chosen_url or page.url, _urlparse(chosen_url or page.url).netloc.lower()
+                            except Exception:
+                                return chosen_url, ""
+
                         cookie_settle_deadline = 0.0
                         start = time.time()
                         last_url = page.url
+                        tick = 0
                         while time.time() - start < LOGIN_TIMEOUT_SEC:
                             time.sleep(1)
+                            tick += 1
                             if state.get("stop"):
                                 state["state"] = "stopped"
                                 break
@@ -159,25 +209,55 @@ def _run_login_task(task_id: str, target_url: str, profile_name: str):
                                 state["state"] = "detected"
                                 state["detected_via"] = "manual"
                                 break
-                            try:
-                                cur_url = page.url
-                            except Exception:
-                                cur_url = last_url
-                            try:
-                                cur_host = _urlparse(cur_url).netloc.lower()
-                            except Exception:
-                                cur_host = ""
+
+                            cur_url, cur_host = _any_page_on_target()
                             on_target = bool(target_host) and cur_host == target_host
-                            # Auto-detect: auth cookie seen AND we're back on
-                            # the target host AND URL is not an interstitial.
-                            # Arm a 3s settle timer before committing so any
-                            # post-callback Set-Cookie (refresh tokens etc.)
-                            # lands.
-                            if (
-                                auth_marker_hit["v"]
-                                and on_target
-                                and not _is_interstitial(cur_url)
-                            ):
+                            # Always poll cookies — auth may arrive via
+                            # OAuth popup into the shared context even when
+                            # the focused page URL is still google.com.
+                            has_auth = _has_target_auth_cookie()
+                            is_inter = _is_interstitial(cur_url)
+
+                            # periodic cookie dump for diagnostics
+                            if tick % 5 == 0 or has_auth:
+                                try:
+                                    ck = context.cookies()
+                                    state["debug_cookies"] = {
+                                        "count": len(ck),
+                                        "domains": sorted({(c.get("domain") or "").lstrip(".") for c in ck})[:20],
+                                        "target_names": sorted({
+                                            c.get("name", "") for c in ck
+                                            if target_host and (
+                                                (c.get("domain") or "").lstrip(".").lower() == target_host
+                                                or target_host.endswith("." + (c.get("domain") or "").lstrip(".").lower())
+                                            )
+                                        }),
+                                    }
+                                except Exception as e:
+                                    state["debug_cookies"] = {"error": str(e)}
+
+                            state["debug"] = {
+                                "tick": tick,
+                                "cur_url": cur_url[:180],
+                                "cur_host": cur_host,
+                                "on_target": on_target,
+                                "has_auth_cookie": has_auth,
+                                "is_interstitial": is_inter,
+                                "page_count": len(context.pages) if context else 0,
+                                "cookie_settle_deadline_in": (
+                                    round(cookie_settle_deadline - time.time(), 1)
+                                    if cookie_settle_deadline > 0 else None
+                                ),
+                            }
+                            # log every 10s to keep container logs useful
+                            if tick % 10 == 0:
+                                logger.info(
+                                    f"task {task_id[:8]} tick={tick} host={cur_host} "
+                                    f"on_target={on_target} has_auth={has_auth} "
+                                    f"interstitial={is_inter}"
+                                )
+
+                            if on_target and has_auth and not is_inter:
                                 if cookie_settle_deadline == 0.0:
                                     cookie_settle_deadline = time.time() + 3.0
                                 elif time.time() >= cookie_settle_deadline:
