@@ -7,6 +7,18 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
+UNKNOWN_ENDPOINT = "unknown-endpoint"
+UNKNOWN_HOST = "unknown-host"
+SEVERITY_RANK = {
+    "Critical": 4,
+    "High": 3,
+    "Moderate": 2,
+    "Low": 1,
+    "Informational": 0,
+    "Unknown": -1,
+}
+
+
 @dataclass
 class ReportResult:
     run_id: str
@@ -47,22 +59,62 @@ def _safe_join_lines(lines: List[str]) -> str:
     return "\n".join(cleaned)
 
 
+def _target_host(target_url: str | None) -> str:
+    parsed = urlparse(target_url or "")
+    host = (parsed.netloc or parsed.hostname or "").strip()
+    if not host:
+        raw_target = (target_url or "").strip()
+        if raw_target and "://" not in raw_target:
+            host = raw_target.split("/", 1)[0].strip()
+    return host or UNKNOWN_HOST
+
+
+def _format_impacted_surface(host: str | None, endpoint: str | None) -> str:
+    host_value = (host or "").strip()
+    endpoint_value = str(endpoint or "").strip()
+    if endpoint_value and endpoint_value != UNKNOWN_ENDPOINT:
+        parsed_endpoint = urlparse(endpoint_value)
+        if (parsed_endpoint.scheme and parsed_endpoint.netloc) or endpoint_value.startswith("//"):
+            return endpoint_value
+        if host_value and host_value != UNKNOWN_HOST:
+            separator = "" if endpoint_value.startswith(("/", "?", "#")) else "/"
+            return f"{host_value}{separator}{endpoint_value}"
+        return endpoint_value
+    if host_value and host_value != UNKNOWN_HOST:
+        return host_value
+    return "unknown"
+
+
+def _affected_assets(host: str | None, endpoint: str | None) -> List[str]:
+    assets: List[str] = []
+    host_value = (host or "").strip()
+    endpoint_value = str(endpoint or "").strip()
+    if host_value and host_value != UNKNOWN_HOST:
+        assets.append(host_value)
+    if endpoint_value and endpoint_value != UNKNOWN_ENDPOINT:
+        assets.append(endpoint_value)
+    return assets
+
+
+def _highest_severity(items: List[Dict[str, Any]]) -> str:
+    return max(
+        (item.get("severity", "Unknown") for item in items),
+        key=lambda severity: SEVERITY_RANK.get(str(severity), -1),
+        default="Unknown",
+    )
+
+
 def _developer_finding_item(finding: Any) -> Dict[str, Any]:
     candidate = getattr(finding, "candidate", None)
     request = getattr(candidate, "request", None) if candidate else None
     endpoint = (
         getattr(request, "endpoint", None)
         or ((candidate.features or {}).get("endpoint") if candidate else None)
-        or "unknown-endpoint"
+        or UNKNOWN_ENDPOINT
     )
     method = (getattr(request, "method", None) or "GET").upper()
-    affected_products = []
-    parsed = urlparse(finding.scan_run.target_url or "")
-    host = (parsed.netloc or parsed.hostname or "").strip()
-    if host:
-        affected_products.append(host)
-    if endpoint and endpoint != "unknown-endpoint":
-        affected_products.append(endpoint)
+    host = _target_host(finding.scan_run.target_url)
+    affected_products = _affected_assets(host, endpoint)
     return {
         "title": finding.title,
         "summary": (finding.summary or "").strip(),
@@ -78,7 +130,7 @@ def _developer_finding_item(finding: Any) -> Dict[str, Any]:
             [
                 f"Type: {(finding.vuln_type or 'unknown').lower()}",
                 f"Severity: {_severity_label(finding.severity)}",
-                f"Potentially impacted surface: {host or 'unknown-host'}{endpoint if endpoint.startswith('/') else '/' + endpoint}",
+                f"Potentially impacted surface: {_format_impacted_surface(host, endpoint)}",
             ]
         ),
         "affected_products": affected_products,
@@ -103,14 +155,13 @@ def build_developer_report(run_id: str) -> DeveloperReportResult:
         severity_counts_map[sev] = int(row.get("c") or 0)
 
     finding_items = [_developer_finding_item(f) for f in findings_qs.order_by("-created_at")]
-    parsed = urlparse(scan_run.target_url or "")
-    host = (parsed.netloc or parsed.hostname or "").strip() or "unknown-host"
+    host = _target_host(scan_run.target_url)
 
     if finding_items:
+        highest_severity = _highest_severity(finding_items)
         executive_summary = (
             f"This report summarizes {len(finding_items)} finding(s) observed on {host}. "
-            f"The highest reported severity is "
-            f"{next((item['severity'] for item in finding_items if item['severity'] in ('Critical', 'High', 'Moderate', 'Low')), 'Unknown')}."
+            f"The highest reported severity is {highest_severity}."
         )
     else:
         executive_summary = (
@@ -153,6 +204,12 @@ def build_developer_report(run_id: str) -> DeveloperReportResult:
 """
         )
 
+    findings_md_text = (
+        "\n\n".join(block.strip() for block in findings_md)
+        if findings_md
+        else "## Findings\nNo confirmed findings were included in this report."
+    )
+
     md_text = f"""# Developer Vulnerability Report
 
 ## Executive Summary
@@ -165,7 +222,7 @@ def build_developer_report(run_id: str) -> DeveloperReportResult:
 - Total findings: {len(finding_items)}
 {_safe_join_lines([f"- {k}: {v}" for k, v in severity_counts_map.items()])}
 
-{_safe_join_lines(findings_md) if findings_md else '## Findings\nNo confirmed findings were included in this report.'}
+{findings_md_text}
 """
 
     return DeveloperReportResult(run_id=str(scan_run.run_id), md_text=md_text, json_obj=json_obj)
@@ -180,12 +237,11 @@ def build_finding_report(finding_id: str) -> FindingReportResult:
     )
     candidate = finding.candidate
     request = getattr(candidate, "request", None)
-    parsed = urlparse(finding.scan_run.target_url or "")
-    host = (parsed.netloc or parsed.hostname or "").strip() or "unknown-host"
+    host = _target_host(finding.scan_run.target_url)
     endpoint = (
         getattr(request, "endpoint", None)
         or ((candidate.features or {}).get("endpoint") if candidate else None)
-        or "unknown-endpoint"
+        or UNKNOWN_ENDPOINT
     )
     method = (getattr(request, "method", None) or "GET").upper()
     vuln_type = (finding.vuln_type or getattr(candidate, "vuln_type", None) or "unknown").lower()
@@ -257,15 +313,13 @@ def build_finding_report(finding_id: str) -> FindingReportResult:
 
     impact_lines = [
         f"Vulnerability type: {vuln_type}",
-        f"Impacted surface: {host}{endpoint if endpoint.startswith('/') else '/' + endpoint}",
+        f"Impacted surface: {_format_impacted_surface(host, endpoint)}",
         f"Current finding severity: {severity_label}",
     ]
     if finding.confidence is not None:
         impact_lines.append(f"Confidence score: {finding.confidence}")
 
-    affected_products = [host]
-    if endpoint and endpoint != "unknown-endpoint":
-        affected_products.append(endpoint)
+    affected_products = _affected_assets(host, endpoint)
 
     json_obj: Dict[str, Any] = {
         "finding_id": str(finding.finding_id),
@@ -276,6 +330,7 @@ def build_finding_report(finding_id: str) -> FindingReportResult:
         "poc": poc_text,
         "impact": _safe_join_lines(impact_lines),
         "affected_products": affected_products,
+        "affected_assets": affected_products,
         "severity": severity_label,
         "metadata": {
             "title": finding.title,
@@ -302,10 +357,10 @@ def build_finding_report(finding_id: str) -> FindingReportResult:
 ## Impact
 {json_obj['impact']}
 
-###Affected products
-{_safe_join_lines([f"- {item}" for item in affected_products])}
+### Affected products
+{_safe_join_lines([f"- {item}" for item in affected_products]) or '- unknown'}
 
-###Severity(Low, Moderate, High, Critical)
+### Severity (Low, Moderate, High, Critical)
 {severity_label}
 """
 
