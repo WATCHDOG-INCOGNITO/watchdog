@@ -46,6 +46,7 @@ urlpatterns = [
     path("api/findings/", views.list_findings),
     path("api/findings/<str:finding_id>/", views.get_finding),
     path("api/findings/<str:finding_id>/detail/", views.finding_detail),
+    path("api/findings/<str:finding_id>/report/", views.finding_report),
     path("api/findings/<str:finding_id>/evidence/", views.attach_evidence),
 
     path("api/evidence-blobs/", views.create_evidence_blob),
