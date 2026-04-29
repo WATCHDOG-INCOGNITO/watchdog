@@ -4,6 +4,8 @@ import "./App.css";
 const API_BASE = process.env.REACT_APP_API_BASE || "";
 const WS_BASE = API_BASE.replace(/^http/i, "ws");
 const STALE_AFTER_MS = 20000;
+let bodyScrollLockCount = 0;
+let bodyScrollPreviousOverflow = "";
 
 const STATUS_META = {
   queued: { label: "대기 중", tone: "queued", copy: "시작 요청을 기다리는 상태입니다." },
@@ -216,9 +218,34 @@ async function fetchFindingDetail(findingId) {
   return apiGet(`/api/findings/${findingId}/detail/`);
 }
 
+async function fetchFindingReport(findingId, format = "md") {
+  return apiGet(`/api/findings/${findingId}/report/?format=${format}`);
+}
+
 async function fetchLlmTraces(runId) {
   const payload = await apiGet(`/api/scan-runs/${runId}/llm-traces/?page_size=100`);
   return { traces: normalizePaginatedList(payload), count: payload.count ?? normalizePaginatedList(payload).length };
+}
+
+async function fetchScanDeveloperReport(runId, format = "md") {
+  return apiGet(`/api/scan-runs/${runId}/report/?kind=developer&format=${format}`);
+}
+
+function useLockBodyScroll(active) {
+  useEffect(() => {
+    if (!active || typeof document === "undefined") return undefined;
+    if (bodyScrollLockCount === 0) {
+      bodyScrollPreviousOverflow = document.body.style.overflow;
+      document.body.style.overflow = "hidden";
+    }
+    bodyScrollLockCount += 1;
+    return () => {
+      bodyScrollLockCount = Math.max(0, bodyScrollLockCount - 1);
+      if (bodyScrollLockCount === 0) {
+        document.body.style.overflow = bodyScrollPreviousOverflow;
+      }
+    };
+  }, [active]);
 }
 
 function EmptyState({ title, body, className = "" }) {
@@ -228,6 +255,138 @@ function EmptyState({ title, body, className = "" }) {
       <p>{body}</p>
     </div>
   );
+}
+
+function renderInlineMarkdown(text, keyPrefix) {
+  const source = String(text ?? "");
+  const nodes = [];
+  const pattern = /(`[^`]*`|\*\*[^*]+?\*\*)/g;
+  let lastIndex = 0;
+  let match;
+  let tokenIndex = 0;
+
+  while ((match = pattern.exec(source)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(source.slice(lastIndex, match.index));
+    }
+    const token = match[0];
+    const key = `${keyPrefix}-inline-${tokenIndex}`;
+    if (token.startsWith("`")) {
+      nodes.push(<code key={key} className="markdown-code">{token.slice(1, -1)}</code>);
+    } else {
+      nodes.push(<strong key={key}>{token.slice(2, -2)}</strong>);
+    }
+    lastIndex = pattern.lastIndex;
+    tokenIndex += 1;
+  }
+
+  if (lastIndex < source.length) {
+    nodes.push(source.slice(lastIndex));
+  }
+
+  return nodes.length ? nodes : source;
+}
+
+function SimpleMarkdown({ content }) {
+  const lines = String(content || "").split(/\r?\n/);
+  const elements = [];
+  let listItems = [];
+  let listType = "ul";
+  let codeLines = null;
+  let codeBlockLanguage = "";
+
+  const flushList = (keyPrefix) => {
+    if (!listItems.length) return;
+    const ListTag = listType === "ol" ? "ol" : "ul";
+    elements.push(
+      <ListTag key={`${keyPrefix}-list`} className="markdown-list">
+        {listItems.map((item, index) => (
+          <li key={`${keyPrefix}-${index}`}>{renderInlineMarkdown(item, `${keyPrefix}-${index}`)}</li>
+        ))}
+      </ListTag>
+    );
+    listItems = [];
+  };
+
+  const flushCodeBlock = (keyPrefix) => {
+    if (codeLines === null) return;
+    elements.push(
+      <pre key={`${keyPrefix}-code`} className="markdown-pre">
+        <code className={codeBlockLanguage ? `language-${codeBlockLanguage}` : undefined}>
+          {codeLines.join("\n")}
+        </code>
+      </pre>
+    );
+    codeLines = null;
+    codeBlockLanguage = "";
+  };
+
+  lines.forEach((rawLine, index) => {
+    const line = rawLine.trimEnd();
+    const key = `md-${index}`;
+    const fenceMatch = line.match(/^```\s*([\w-]+)?\s*$/);
+
+    if (codeLines !== null) {
+      if (fenceMatch) {
+        flushCodeBlock(key);
+      } else {
+        codeLines.push(line);
+      }
+      return;
+    }
+
+    if (fenceMatch) {
+      flushList(key);
+      codeLines = [];
+      codeBlockLanguage = fenceMatch[1] || "";
+      return;
+    }
+
+    if (!line.trim()) {
+      flushList(key);
+      return;
+    }
+
+    if (line.startsWith("- ")) {
+      if (listItems.length && listType !== "ul") flushList(key);
+      listType = "ul";
+      listItems.push(line.slice(2));
+      return;
+    }
+
+    const orderedMatch = line.match(/^\d+\.\s+(.+)$/);
+    if (orderedMatch) {
+      if (listItems.length && listType !== "ol") flushList(key);
+      listType = "ol";
+      listItems.push(orderedMatch[1]);
+      return;
+    }
+
+    flushList(key);
+
+    const h4Match = line.match(/^###\s+(.+)$/);
+    if (h4Match) {
+      elements.push(<h4 key={key} className="markdown-h4">{renderInlineMarkdown(h4Match[1], key)}</h4>);
+      return;
+    }
+    const h3Match = line.match(/^##\s+(.+)$/);
+    if (h3Match) {
+      elements.push(<h3 key={key} className="markdown-h3">{renderInlineMarkdown(h3Match[1], key)}</h3>);
+      return;
+    }
+    const h2Match = line.match(/^#\s+(.+)$/);
+    if (h2Match) {
+      elements.push(<h2 key={key} className="markdown-h2">{renderInlineMarkdown(h2Match[1], key)}</h2>);
+      return;
+    }
+
+    elements.push(<p key={key} className="markdown-p">{renderInlineMarkdown(line, key)}</p>);
+  });
+
+  flushList("final");
+  flushCodeBlock("final");
+
+  return <div className="markdown-renderer">{elements}</div>;
 }
 
 function StatusPill({ scan, now }) {
@@ -290,9 +449,48 @@ function CandidateItem({ candidate }) {
 }
 
 function FindingDetailPanel({ finding, detail }) {
+  const [reportFormat, setReportFormat] = useState("md");
+  const [reportContent, setReportContent] = useState("");
+  const [reportLoading, setReportLoading] = useState(false);
+  const [reportError, setReportError] = useState("");
+
+  useEffect(() => {
+    setReportFormat("md");
+    setReportContent("");
+    setReportError("");
+    setReportLoading(false);
+  }, [finding?.finding_id]);
+
   if (!finding) {
     return <EmptyState title="취약점을 선택하세요" body="왼쪽 목록에서 항목을 선택하면 상세 설명과 증거를 확인할 수 있습니다." />;
   }
+
+  const loadFindingReport = async (format) => {
+    setReportLoading(true);
+    setReportError("");
+    try {
+      const payload = await fetchFindingReport(finding.finding_id, format);
+      const content = payload?.content;
+      setReportFormat(payload?.format || format);
+      setReportContent(
+        typeof content === "string" ? content : JSON.stringify(content, null, 2)
+      );
+    } catch (error) {
+      setReportError(error.message || "리포트를 생성하지 못했습니다.");
+      setReportContent("");
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
+  const copyReport = async () => {
+    if (!reportContent) return;
+    try {
+      await navigator.clipboard.writeText(reportContent);
+    } catch {
+      setReportError("클립보드 복사에 실패했습니다.");
+    }
+  };
 
   return (
     <div className="artifact-modal-detail">
@@ -302,6 +500,33 @@ function FindingDetailPanel({ finding, detail }) {
         <h3>{finding.title}</h3>
       </div>
       <p className="finding-subtitle">신뢰도 {finding.confidence} | 증거 {finding.evidence_count || 0}건</p>
+
+      <div className="section-actions" style={{ marginBottom: 12 }}>
+        <button type="button" className="ghost-button" onClick={() => loadFindingReport("md")} disabled={reportLoading}>
+          Markdown 리포트
+        </button>
+        <button type="button" className="ghost-button" onClick={() => loadFindingReport("json")} disabled={reportLoading}>
+          JSON 리포트
+        </button>
+        <button type="button" className="ghost-button" onClick={copyReport} disabled={!reportContent}>
+          복사
+        </button>
+      </div>
+
+      {reportError ? <div className="callout callout-error">{reportError}</div> : null}
+      {reportLoading ? <div className="callout callout-neutral">리포트를 생성하는 중입니다...</div> : null}
+      {reportContent ? (
+        <div className="detail-summary">
+          <strong>보고서 ({reportFormat})</strong>
+          {reportFormat === "md" ? (
+            <div className="detail-steps markdown-surface">
+              <SimpleMarkdown content={reportContent} />
+            </div>
+          ) : (
+            <pre className="detail-steps">{reportContent}</pre>
+          )}
+        </div>
+      ) : null}
 
       {detail?.summary ? (
         <div className="llm-analysis">
@@ -337,6 +562,8 @@ function FindingDetailPanel({ finding, detail }) {
 }
 
 function FindingsModal({ findings, detail, loading, error, selectedFindingId, onSelect, onClose }) {
+  useLockBodyScroll(true);
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal-card modal-card-wide" onClick={(event) => event.stopPropagation()}>
@@ -388,6 +615,8 @@ function FindingsModal({ findings, detail, loading, error, selectedFindingId, on
 }
 
 function CandidatesModal({ candidates, onClose }) {
+  useLockBodyScroll(true);
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal-card modal-card-wide" onClick={(event) => event.stopPropagation()}>
@@ -412,7 +641,48 @@ function CandidatesModal({ candidates, onClose }) {
 }
 
 function RunDetailsModal({ scan, requestCount, candidateCount, onClose }) {
+  const [reportFormat, setReportFormat] = useState("md");
+  const [reportContent, setReportContent] = useState("");
+  const [reportLoading, setReportLoading] = useState(false);
+  const [reportError, setReportError] = useState("");
+
+  useLockBodyScroll(true);
+
+  useEffect(() => {
+    setReportFormat("md");
+    setReportContent("");
+    setReportError("");
+    setReportLoading(false);
+  }, [scan?.run_id]);
+
   if (!scan) return null;
+
+  const loadDeveloperReport = async (format) => {
+    setReportLoading(true);
+    setReportError("");
+    try {
+      const payload = await fetchScanDeveloperReport(scan.run_id, format);
+      const content = payload?.content;
+      setReportFormat(payload?.format || format);
+      setReportContent(
+        typeof content === "string" ? content : JSON.stringify(content, null, 2)
+      );
+    } catch (error) {
+      setReportError(error.message || "전체 보고서를 생성하지 못했습니다.");
+      setReportContent("");
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
+  const copyDeveloperReport = async () => {
+    if (!reportContent) return;
+    try {
+      await navigator.clipboard.writeText(reportContent);
+    } catch {
+      setReportError("클립보드 복사에 실패했습니다.");
+    }
+  };
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -425,27 +695,56 @@ function RunDetailsModal({ scan, requestCount, candidateCount, onClose }) {
           <button type="button" className="ghost-button" onClick={onClose}>닫기</button>
         </div>
 
-        <div className="detail-grid detail-grid-compact">
-          <div><span>Run ID</span><strong>{scan.run_id}</strong></div>
-          <div><span>상태</span><strong>{scan.status}</strong></div>
-          <div><span>엔진</span><strong>{getScanEngine(scan)}</strong></div>
-          <div><span>생성 시각</span><strong>{formatDateTime(scan.created_at)}</strong></div>
-          <div><span>최근 갱신</span><strong>{formatDateTime(scan.updated_at)}</strong></div>
-          <div><span>종료 시각</span><strong>{formatDateTime(scan.finished_at)}</strong></div>
-          <div><span>요청 예산</span><strong>{formatCount(scan.request_budget_used)} / {formatCount(scan.request_budget_total)}</strong></div>
-          <div><span>요청 수</span><strong>{formatCount(requestCount)}</strong></div>
-          <div><span>가설 수</span><strong>{formatCount(candidateCount)}</strong></div>
-          <div><span>LLM 호출</span><strong>{formatCount(scan.llm_calls_count)}</strong></div>
-          <div><span>토큰</span><strong>{formatCount(scan.llm_tokens_used)}</strong></div>
-          <div><span>비용</span><strong>{formatCurrency(scan.llm_cost_usd)}</strong></div>
-        </div>
-
-        {scan.error_log ? (
-          <div className="failure-panel">
-            <strong>실패 로그</strong>
-            <pre className="failure-log">{scan.error_log}</pre>
+        <div className="modal-scroll-body">
+          <div className="detail-grid detail-grid-compact">
+            <div><span>Run ID</span><strong>{scan.run_id}</strong></div>
+            <div><span>상태</span><strong>{scan.status}</strong></div>
+            <div><span>엔진</span><strong>{getScanEngine(scan)}</strong></div>
+            <div><span>생성 시각</span><strong>{formatDateTime(scan.created_at)}</strong></div>
+            <div><span>최근 갱신</span><strong>{formatDateTime(scan.updated_at)}</strong></div>
+            <div><span>종료 시각</span><strong>{formatDateTime(scan.finished_at)}</strong></div>
+            <div><span>요청 예산</span><strong>{formatCount(scan.request_budget_used)} / {formatCount(scan.request_budget_total)}</strong></div>
+            <div><span>요청 수</span><strong>{formatCount(requestCount)}</strong></div>
+            <div><span>가설 수</span><strong>{formatCount(candidateCount)}</strong></div>
+            <div><span>LLM 호출</span><strong>{formatCount(scan.llm_calls_count)}</strong></div>
+            <div><span>토큰</span><strong>{formatCount(scan.llm_tokens_used)}</strong></div>
+            <div><span>비용</span><strong>{formatCurrency(scan.llm_cost_usd)}</strong></div>
           </div>
-        ) : null}
+
+          <div className="section-actions" style={{ marginTop: 16 }}>
+            <button type="button" className="ghost-button" onClick={() => loadDeveloperReport("md")} disabled={reportLoading}>
+              보고서(MD)
+            </button>
+            <button type="button" className="ghost-button" onClick={() => loadDeveloperReport("json")} disabled={reportLoading}>
+              보고서(JSON)
+            </button>
+            <button type="button" className="ghost-button" onClick={copyDeveloperReport} disabled={!reportContent}>
+              복사
+            </button>
+          </div>
+
+          {reportError ? <div className="callout callout-error">{reportError}</div> : null}
+          {reportLoading ? <div className="callout callout-neutral">전체 보고서를 생성하는 중입니다...</div> : null}
+          {reportContent ? (
+            <div className="detail-summary" style={{ marginTop: 16 }}>
+              <strong>보고서 ({reportFormat})</strong>
+              {reportFormat === "md" ? (
+                <div className="detail-steps markdown-surface">
+                  <SimpleMarkdown content={reportContent} />
+                </div>
+              ) : (
+                <pre className="detail-steps">{reportContent}</pre>
+              )}
+            </div>
+          ) : null}
+
+          {scan.error_log ? (
+            <div className="failure-panel">
+              <strong>실패 로그</strong>
+              <pre className="failure-log">{scan.error_log}</pre>
+            </div>
+          ) : null}
+        </div>
       </div>
     </div>
   );

@@ -26,7 +26,13 @@ from .serializers import (
     VisualAnalysisSerializer, IDORTestSessionSerializer, WAFBypassAttemptSerializer,
     VulnerabilityEntrySerializer, PayloadPatternSerializer, ReportArchiveSerializer,
 )
-from .reporting import build_report, serialize_report_json, serialize_report_md
+from .reporting import (
+    build_report,
+    build_developer_report,
+    build_finding_report,
+    serialize_report_json,
+    serialize_report_md,
+)
 from .scan_control import request_scan_stop
 
 class StandardPagination(PageNumberPagination):
@@ -436,8 +442,16 @@ def list_verification_loops(request, cand_id):
 @api_view(["GET", "POST"])
 def scan_run_report(request, run_id):
     run_id = str(run_id)
+    kind = (request.query_params.get("kind") or request.data.get("kind") or "summary").lower().strip()
 
     if request.method == "POST":
+        if kind == "developer":
+            report = build_developer_report(run_id)
+            fmt = (request.query_params.get("format") or request.data.get("format") or "md").lower().strip()
+            if fmt in ("json",):
+                return Response({"run_id": run_id, "kind": "developer", "format": "json", "content": report.json_obj}, status=status.HTTP_201_CREATED)
+            return Response({"run_id": run_id, "kind": "developer", "format": "md", "content": report.md_text}, status=status.HTTP_201_CREATED)
+
         report = build_report(run_id)
         scan_run = ScanRun.objects.get(run_id=run_id)
         rr, _ = RunReport.objects.update_or_create(
@@ -452,6 +466,13 @@ def scan_run_report(request, run_id):
             "message": "report generated",
         }, status=status.HTTP_201_CREATED)
 
+    if kind == "developer":
+        report = build_developer_report(run_id)
+        fmt = (request.query_params.get("format") or request.query_params.get("export") or "md").lower().strip()
+        if fmt in ("json",):
+            return Response({"run_id": run_id, "kind": "developer", "format": "json", "content": report.json_obj})
+        return Response({"run_id": run_id, "kind": "developer", "format": "md", "content": report.md_text})
+
     rr = RunReport.objects.filter(scan_run__run_id=run_id).order_by("-updated_at").first()
     if not rr:
         return Response({"detail": "report not generated yet. POST this endpoint first."}, status=status.HTTP_404_NOT_FOUND)
@@ -460,6 +481,19 @@ def scan_run_report(request, run_id):
     if fmt in ("md", "markdown"):
         return Response({"run_id": run_id, "format": "md", "content": rr.markdown})
     return Response({"run_id": run_id, "format": "json", "content": json_mod.loads(rr.json)})
+
+
+@api_view(["GET", "POST"])
+def finding_report(request, finding_id):
+    finding_id = str(finding_id)
+    try:
+        report = build_finding_report(finding_id)
+    except Finding.DoesNotExist:
+        return Response({"detail": "finding not found"}, status=status.HTTP_404_NOT_FOUND)
+    fmt = (request.query_params.get("format") or request.data.get("format") or "md").lower().strip()
+    if fmt in ("json",):
+        return Response({"finding_id": finding_id, "format": "json", "content": report.json_obj})
+    return Response({"finding_id": finding_id, "format": "md", "content": report.md_text})
 
 
 @api_view(["GET"])
