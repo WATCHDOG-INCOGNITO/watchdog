@@ -1268,7 +1268,7 @@ function ResultsView({
           helper={`${formatCount(scan.llm_tokens_used)} tokens | ${formatCurrency(scan.llm_cost_usd)}`}
           tone="warning"
         />
-        {scan.mode === "discovery" ? (
+        {(scan.mode === "discovery" || scan.mode === "hybrid-lite" || scan.config?.mode === "mcp") ? (
           <StatCard
             label="탐색 트리"
             value="Tree"
