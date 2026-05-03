@@ -1023,6 +1023,11 @@ function BrowserLoginModal({ initialTarget, onClose, onImported }) {
 
 function NewScanModal({ onClose, onCreated }) {
   const [targetUrl, setTargetUrl] = useState("");
+  const [guardrailRaw, setGuardrailRaw] = useState("");
+  const [guardrailPreview, setGuardrailPreview] = useState(null);
+  const [guardrailPreviewLoading, setGuardrailPreviewLoading] = useState(false);
+  const [guardrailPreviewError, setGuardrailPreviewError] = useState("");
+  const [guardrailEnforcementMode, setGuardrailEnforcementMode] = useState("balanced");
   const [requestBudget, setRequestBudget] = useState(10);
   const [discoveryWorkers, setDiscoveryWorkers] = useState(3);
   const [forceSpa, setForceSpa] = useState(false);
@@ -1111,6 +1116,24 @@ function NewScanModal({ onClose, onCreated }) {
     setRoleModels((prev) => ({ ...prev, [roleKey]: modelId }));
   }
 
+  async function handleGuardrailPreview() {
+    if (!guardrailRaw.trim()) {
+      setGuardrailPreview(null);
+      setGuardrailPreviewError("");
+      return;
+    }
+    setGuardrailPreviewLoading(true);
+    setGuardrailPreviewError("");
+    try {
+      const preview = await apiPost("/api/guardrails/normalize/", { raw_text: guardrailRaw });
+      setGuardrailPreview(preview);
+    } catch (previewError) {
+      setGuardrailPreviewError(previewError.message);
+    } finally {
+      setGuardrailPreviewLoading(false);
+    }
+  }
+
   async function handleSubmit() {
     if (!targetUrl.trim()) return;
     setSubmitting(true);
@@ -1121,6 +1144,7 @@ function NewScanModal({ onClose, onCreated }) {
         mode: "mcp",
         agent_mode: "discovery",
         discovery_workers: Math.max(1, Math.min(20, Number(discoveryWorkers) || 3)),
+        guardrail_enforcement_mode: guardrailEnforcementMode,
         model_profile: modelProfile,
         models: { ...roleModels },
       };
@@ -1135,6 +1159,7 @@ function NewScanModal({ onClose, onCreated }) {
         mode: "hybrid-lite",
         request_budget_total: Number(requestBudget) || 10,
         config,
+        guardrail_raw: guardrailRaw.trim(),
       });
 
       // SSO profile → scan 에 attach (쿠키를 _secrets 에 박음)
@@ -1179,6 +1204,95 @@ function NewScanModal({ onClose, onCreated }) {
           <span>요청 예산</span>
           <input type="number" min="1" value={requestBudget} onChange={(event) => setRequestBudget(event.target.value)} />
         </label>
+
+        <label className="field">
+          <span>버그바운티 가드레일 붙여넣기 (선택)</span>
+          <textarea
+            className="guardrail-textarea"
+            value={guardrailRaw}
+            onChange={(event) => setGuardrailRaw(event.target.value)}
+            placeholder="플랫폼 정책, in-scope / out-of-scope, 금지 행위, rate limit 안내 등을 그대로 붙여넣으세요."
+            rows={10}
+          />
+          <span style={{ fontSize: "0.8em", opacity: 0.6, marginTop: 2 }}>
+            백엔드가 이 원문을 정리해서 에이전트 시스템 프롬프트에 주입합니다.
+          </span>
+        </label>
+
+        <div className="guardrail-preview-actions">
+          <button
+            type="button"
+            className="ghost-button"
+            disabled={guardrailPreviewLoading || !guardrailRaw.trim()}
+            onClick={handleGuardrailPreview}
+          >
+            {guardrailPreviewLoading ? "정리 중..." : "정리 미리보기"}
+          </button>
+        </div>
+
+        {guardrailPreviewError ? <div className="callout callout-error">{guardrailPreviewError}</div> : null}
+        {guardrailPreview ? (
+          <div className="guardrail-preview-card">
+            <div className="guardrail-preview-head">
+              <strong>가드레일 정리 결과</strong>
+              <span>{guardrailPreview.constraints?.length || 0} constraints</span>
+            </div>
+            <div className="guardrail-preview-section">
+              <div className="guardrail-preview-label">Summary</div>
+              <p>{guardrailPreview.summary || "요약 결과가 없습니다."}</p>
+            </div>
+            <div className="guardrail-preview-section">
+              <div className="guardrail-preview-label">Hard Constraints</div>
+              {guardrailPreview.constraints?.length ? (
+                <ul className="guardrail-constraint-list">
+                  {guardrailPreview.constraints.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}
+                </ul>
+              ) : (
+                <p>추출된 제약사항이 없습니다.</p>
+              )}
+            </div>
+            <div className="guardrail-preview-section">
+              <div className="guardrail-preview-label">Markdown</div>
+              <pre>{guardrailPreview.markdown || "정리된 markdown이 없습니다."}</pre>
+            </div>
+          </div>
+        ) : null}
+
+        <div className="model-config-panel" style={{ marginTop: 14 }}>
+          <div className="model-config-head">
+            <div>
+              <span className="model-config-title">가드레일 집행 강도</span>
+              <p>
+                {guardrailEnforcementMode === "strict"
+                  ? "정책 해석 결과를 보수적으로 집행합니다. 명시적 제한뿐 아니라 경고성 규칙도 적극적으로 차단해 민감한 프로그램 운영 기준에 맞춥니다."
+                  : "명시적으로 판정 가능한 범위 위반은 즉시 차단하고, 자동화·요청 속도와 같이 해석 여지가 있는 규칙은 경고 중심으로 처리해 탐지 효율과 정책 준수의 균형을 유지합니다."}
+              </p>
+            </div>
+          </div>
+
+          <div className="toggle-group guardrail-mode-group">
+            <button
+              type="button"
+              className={`toggle-option guardrail-mode-option ${guardrailEnforcementMode === "balanced" ? "active" : ""}`}
+              onClick={() => setGuardrailEnforcementMode("balanced")}
+            >
+              <span className="guardrail-mode-kicker">탐지력 우선</span>
+              <span className="guardrail-mode-subkicker">(유연한 집행)</span>
+              <span className="guardrail-mode-divider" aria-hidden="true" />
+              <span className="guardrail-mode-copy">범위 위반은 즉시 차단하고, 정책 해석이 필요한 항목은 안내 중심으로 처리해 분석 연속성을 유지합니다.</span>
+            </button>
+            <button
+              type="button"
+              className={`toggle-option guardrail-mode-option ${guardrailEnforcementMode === "strict" ? "active" : ""}`}
+              onClick={() => setGuardrailEnforcementMode("strict")}
+            >
+              <span className="guardrail-mode-kicker">정책 우선</span>
+              <span className="guardrail-mode-subkicker">(가드레일 준수 강화)</span>
+              <span className="guardrail-mode-divider" aria-hidden="true" />
+              <span className="guardrail-mode-copy">정책 신호를 보수적으로 해석해 제한 가능성이 있는 행위까지 사전에 통제합니다.</span>
+            </button>
+          </div>
+        </div>
 
         <label className="field">
           <span>Discovery 워커 수</span>

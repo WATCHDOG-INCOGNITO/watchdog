@@ -7,6 +7,11 @@ from .models import (
     DiscoveryNode,
 )
 
+
+class GuardrailNormalizeSerializer(serializers.Serializer):
+    raw_text = serializers.CharField(allow_blank=False, trim_whitespace=True, max_length=100000)
+
+
 class ScanRunSerializer(serializers.ModelSerializer):
     class Meta:
         model = ScanRun
