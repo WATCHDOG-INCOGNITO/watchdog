@@ -20,6 +20,7 @@ import requests
 
 from django.utils import timezone
 
+from .guardrail_enforcer import guardrail_decision
 from .models import Candidate, ScanRun, VerificationLoop
 from .scan_control import ScanStopped, raise_if_stop_requested
 from .storage_service import confirm_candidate
@@ -38,7 +39,7 @@ REQUEST_TIMEOUT = 10
 DELAY_BETWEEN = 0.5
 
 
-def _run_external_tools(base_url, endpoint, method, params, vuln_type):
+def _run_external_tools(scan_run, base_url, endpoint, method, params, vuln_type):
     """vuln_type에 따라 적절한 외부 도구를 실행하고 결과를 반환한다."""
     base_url = base_url.rstrip("/")
     target = f"{base_url}/{endpoint.lstrip('/')}"
@@ -53,7 +54,7 @@ def _run_external_tools(base_url, endpoint, method, params, vuln_type):
 
     if vuln_type == "sqli":
         logger.info(f"[tool] sqlmap 실행: {target}")
-        r = tool_bridge.sqlmap_scan(target_url=target, method=method, level=2, risk=2)
+        r = tool_bridge.sqlmap_scan(target_url=target, method=method, level=2, risk=2, scan_run=scan_run)
         if r.get("error"):
             logger.warning(f"[tool] sqlmap 실패: {r['error']}")
         else:
@@ -65,7 +66,7 @@ def _run_external_tools(base_url, endpoint, method, params, vuln_type):
 
     elif vuln_type == "xss":
         logger.info(f"[tool] dalfox 실행: {target}")
-        r = tool_bridge.dalfox_scan(target_url=target)
+        r = tool_bridge.dalfox_scan(target_url=target, scan_run=scan_run)
         if r.get("error"):
             logger.warning(f"[tool] dalfox 실패: {r['error']}")
         else:
@@ -76,7 +77,7 @@ def _run_external_tools(base_url, endpoint, method, params, vuln_type):
 
     # nuclei는 모든 vuln_type에 대해 실행
     logger.info(f"[tool] nuclei 실행: {base_url}")
-    nr = tool_bridge.nuclei_scan(target_url=base_url, severity="critical,high,medium")
+    nr = tool_bridge.nuclei_scan(target_url=base_url, severity="critical,high,medium", scan_run=scan_run)
     if not nr.get("error") and nr.get("findings_count", 0) > 0:
         relevant = [f for f in nr.get("findings", []) if endpoint in f or vuln_type in f.lower()]
         if relevant:
@@ -86,7 +87,7 @@ def _run_external_tools(base_url, endpoint, method, params, vuln_type):
                 result["confirmed_by_tool"] = True
 
     # WAF 감지
-    waf = tool_bridge.wafw00f_scan(base_url)
+    waf = tool_bridge.wafw00f_scan(base_url, scan_run=scan_run)
     if not waf.get("error"):
         waf_output = waf.get("output", "")
         if "is behind" in waf_output.lower():
@@ -97,8 +98,9 @@ def _run_external_tools(base_url, endpoint, method, params, vuln_type):
     return result
 
 class AttackExecutor:
-    def __init__(self, base_url, timeout=REQUEST_TIMEOUT):
+    def __init__(self, base_url, scan_run=None, timeout=REQUEST_TIMEOUT):
         self.base_url = base_url.rstrip("/")
+        self.scan_run = scan_run
         self.timeout = timeout
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "WatchdogVerifier/1.0"})
@@ -107,6 +109,23 @@ class AttackExecutor:
         url = urljoin(self.base_url + "/", endpoint.lstrip("/"))
         params = dict(extra_params or {})
         params[param] = value
+        decision = guardrail_decision(self.scan_run, "http_request", {"url": url, "method": method})
+        if decision.get("action") == "block":
+            messages = decision.get("messages") or []
+            return {
+                "url": url,
+                "status_code": None,
+                "body": "",
+                "elapsed": 0,
+                "content_length": 0,
+                "error": messages[0] if messages else "Guardrail blocked this action.",
+            }
+        if decision.get("action") == "warn":
+            logger.warning(
+                "[%s] guardrail warning for verifier http_request: %s",
+                getattr(self.scan_run, "run_id", "no-scan"),
+                " | ".join(decision.get("messages") or []),
+            )
 
         try:
             start = time.time()
@@ -176,7 +195,7 @@ def run_verification_loop(candidate, scan_run):
     params = _flat_params(req.params)
     context = candidate.features or {}
 
-    executor = AttackExecutor(scan_run.target_url)
+    executor = AttackExecutor(scan_run.target_url, scan_run=scan_run)
 
     candidate.status = "verifying"
     candidate.save(update_fields=["status"])
@@ -184,7 +203,7 @@ def run_verification_loop(candidate, scan_run):
     logger.info(f"[{candidate.cand_id}] LLM 주도 검증 시작: {method} {endpoint} ({vuln_type})")
 
     # 0단계: 외부 보안 도구 선행 실행
-    tool_results = _run_external_tools(scan_run.target_url, endpoint, method, params, vuln_type)
+    tool_results = _run_external_tools(scan_run, scan_run.target_url, endpoint, method, params, vuln_type)
     if tool_results.get("confirmed_by_tool"):
         logger.info(f"[{candidate.cand_id}] 외부 도구가 취약점 확정: {tool_results['tool_name']}")
         evidence_list = [{

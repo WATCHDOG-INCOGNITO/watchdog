@@ -40,6 +40,7 @@ for _p in _app_paths:
         sys.path.append(_p)
 
 from .error_utils import summarize_exception  # noqa: E402
+from .guardrail_enforcer import guardrail_decision as shared_guardrail_decision  # noqa: E402
 from .llm_trace_store import (  # noqa: E402
     build_prompt_preview,
     build_response_preview,
@@ -230,6 +231,157 @@ SYSTEM_PROMPT = """\
 - 각 단계의 결과를 분석한 후 다음 행동을 결정하세요.
 - 더 이상 분석할 것이 없으면 리포트를 생성하고 종료하세요.
 """
+
+
+def _build_guardrail_prompt(scan_run: ScanRun | None) -> str:
+    try:
+        config = scan_run.config or {} if scan_run is not None else {}
+    except Exception:
+        config = {}
+    guardrail = config.get("guardrail") if isinstance(config, dict) else None
+    if not isinstance(guardrail, dict):
+        return ""
+
+    summary = str(guardrail.get("summary") or "").strip()
+    constraints = guardrail.get("constraints") or []
+    markdown = str(guardrail.get("markdown") or "").strip()
+    if not summary and not constraints and not markdown:
+        return ""
+
+    lines = [
+        "## Bug Bounty Guardrails",
+        "The following pasted program policy is part of this run's operating constraints.",
+        "If any planned action is ambiguous, choose the safer interpretation.",
+        "Never perform an action that conflicts with the rules below.",
+    ]
+    if summary:
+        lines.extend(["", "Summary:", summary])
+    if isinstance(constraints, list) and constraints:
+        lines.extend(["", "Hard constraints:"])
+        for item in constraints[:12]:
+            text = str(item).strip()
+            if text:
+                lines.append(f"- {text}")
+    if markdown:
+        lines.extend(["", "Normalized policy excerpt:", markdown[:2500]])
+    return "\n".join(lines).strip()
+
+
+def _compose_system_prompt(scan_run: ScanRun | None, base_prompt: str) -> str:
+    guardrail_prompt = _build_guardrail_prompt(scan_run)
+    if not guardrail_prompt:
+        return base_prompt
+    return f"{guardrail_prompt}\n\n{base_prompt}"
+
+
+def _normalize_guardrail_host(value: str) -> str:
+    host = (value or "").strip().lower()
+    if not host:
+        return ""
+    parsed = urlparse(host if "://" in host else f"http://{host}")
+    return (parsed.hostname or parsed.netloc or "").strip().lower().strip(".")
+
+
+def _host_matches_rule(host: str, rule_host: str) -> bool:
+    normalized_host = _normalize_guardrail_host(host)
+    normalized_rule = _normalize_guardrail_host(rule_host)
+    if not normalized_host or not normalized_rule:
+        return False
+    return normalized_host == normalized_rule or normalized_host.endswith(f".{normalized_rule}")
+
+
+def _extract_tool_hosts(tool_name: str, tool_args: dict) -> list[str]:
+    hosts: list[str] = []
+    seen = set()
+
+    def add_host_from_value(value):
+        text = str(value or "").strip()
+        if not text:
+            return
+        parsed = urlparse(text if "://" in text else f"http://{text}")
+        host = (parsed.hostname or parsed.netloc or "").strip().lower()
+        if host and host not in seen:
+            seen.add(host)
+            hosts.append(host)
+
+    if tool_name in {
+        "http_request", "curl_request", "http_session_request", "browser_navigate",
+        "sqlmap_scan", "nuclei_scan", "dalfox_scan", "ffuf_scan", "nikto_scan",
+        "whatweb_scan", "wafw00f_scan", "nmap_scan",
+    }:
+        for key in ("url", "target_url", "target"):
+            if key in tool_args:
+                add_host_from_value(tool_args.get(key))
+
+    if tool_name == "multi_http_probe":
+        requests_json = tool_args.get("requests_json") or ""
+        try:
+            reqs = json.loads(requests_json) if isinstance(requests_json, str) else requests_json
+        except Exception:
+            reqs = []
+        if isinstance(reqs, list):
+            for item in reqs:
+                if isinstance(item, dict):
+                    add_host_from_value(item.get("url"))
+
+    return hosts
+
+
+def _extract_tool_urls(tool_name: str, tool_args: dict) -> list[str]:
+    urls: list[str] = []
+    seen = set()
+
+    def add_url(value):
+        text = str(value or "").strip()
+        if not text:
+            return
+        parsed = urlparse(text if "://" in text else f"http://{text}")
+        if not parsed.scheme or not parsed.netloc:
+            return
+        normalized = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path or ''}".rstrip("/")
+        if normalized not in seen:
+            seen.add(normalized)
+            urls.append(normalized)
+
+    if tool_name in {
+        "http_request", "curl_request", "http_session_request", "browser_navigate",
+        "sqlmap_scan", "nuclei_scan", "dalfox_scan", "ffuf_scan", "nikto_scan",
+        "whatweb_scan", "wafw00f_scan",
+    }:
+        for key in ("url", "target_url"):
+            if key in tool_args:
+                add_url(tool_args.get(key))
+
+    if tool_name == "multi_http_probe":
+        requests_json = tool_args.get("requests_json") or ""
+        try:
+            reqs = json.loads(requests_json) if isinstance(requests_json, str) else requests_json
+        except Exception:
+            reqs = []
+        if isinstance(reqs, list):
+            for item in reqs:
+                if isinstance(item, dict):
+                    add_url(item.get("url"))
+
+    return urls
+
+
+def _url_matches_prefix(url: str, prefix: str) -> bool:
+    normalized_url = (url or "").rstrip("/")
+    normalized_prefix = (prefix or "").rstrip("/")
+    return bool(normalized_url and normalized_prefix and normalized_url.startswith(normalized_prefix))
+
+
+def _guardrail_decision(scan_run: ScanRun, tool_name: str, tool_args: dict) -> dict:
+    return shared_guardrail_decision(scan_run, tool_name, tool_args)
+
+
+def _guardrail_violation(scan_run: ScanRun, tool_name: str, tool_args: dict) -> str:
+    decision = _guardrail_decision(scan_run, tool_name, tool_args)
+    if decision.get("action") == "block":
+        messages = decision.get("messages") or []
+        return messages[0] if messages else "Guardrail blocked this action."
+    return ""
 
 
 def _get_pg_connection_string() -> str:
@@ -1442,6 +1594,17 @@ async def _execute_single_tool(
     tool_args = dict(tb.input or {})
     tool_args = _maybe_inject_auto_auth(scan_run, tool_name, tool_args)
     tool_args = _maybe_inject_bug_bounty_ua(scan_run, tool_name, tool_args)
+    guardrail_decision = _guardrail_decision(scan_run, tool_name, tool_args)
+    guardrail_messages = guardrail_decision.get("messages") or []
+    if guardrail_decision.get("action") == "block":
+        guardrail_error = guardrail_messages[0] if guardrail_messages else "Guardrail blocked this action."
+        logger.warning(f"[{scan_run.run_id}] guardrail blocked {tool_name}: {guardrail_error}")
+        return {
+            "type": "tool_result",
+            "tool_use_id": tb.id,
+            "content": guardrail_error,
+            "is_error": True,
+        }
     logger.info(
         f"[{scan_run.run_id}] tool {tool_name}"
         f"({json.dumps(tool_args, ensure_ascii=False)[:200]})"
@@ -1477,6 +1640,8 @@ async def _execute_single_tool(
             logger.debug(f"[{scan_run.run_id}] auto-push links error: {e}")
 
     text = raw_text
+    if guardrail_decision.get("action") == "warn" and guardrail_messages:
+        text = "[GUARDRAIL WARNING]\n" + "\n".join(guardrail_messages) + "\n\n" + text
     if tool_name in HTTP_RESULT_TOOLS and not is_error:
         text = _compact_http_tool_result(text)
     limit = _tool_result_limit(tool_name)
@@ -1591,7 +1756,7 @@ async def _run_role_phase(
         # role별 turn loop는 같은 system을 반복 → 큰 절약.
         cached_system = [{
             "type": "text",
-            "text": system_prompt,
+            "text": _compose_system_prompt(scan_run, system_prompt),
             "cache_control": {"type": "ephemeral"},
         }]
         call_messages = _compact_messages_for_call(messages, role)
@@ -4368,7 +4533,7 @@ async def _run_single_agent_loop(
         response = _call_llm_with_retry(
             anthropic, scan_run,
             model=selected_model, max_tokens=4096,
-            system=SYSTEM_PROMPT, tools=anthropic_tools, messages=messages,
+            system=_compose_system_prompt(scan_run, SYSTEM_PROMPT), tools=anthropic_tools, messages=messages,
         )
 
         total_input_tokens += response.usage.input_tokens

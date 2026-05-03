@@ -20,7 +20,7 @@ from .models import (
     OOBHit,
 )
 from .serializers import (
-    ScanRunSerializer, LLMTraceSerializer, RequestCatalogSerializer, CandidateSerializer,
+    GuardrailNormalizeSerializer, ScanRunSerializer, LLMTraceSerializer, RequestCatalogSerializer, CandidateSerializer,
     FindingSerializer, EvidenceBlobSerializer, FindingEvidenceLinkSerializer,
     AgentTaskSerializer, VerificationLoopSerializer, HypothesisSerializer,
     VisualAnalysisSerializer, IDORTestSessionSerializer, WAFBypassAttemptSerializer,
@@ -34,6 +34,7 @@ from .reporting import (
     serialize_report_md,
 )
 from .scan_control import request_scan_stop
+from .guardrail_parser import normalize_guardrail_text
 
 class StandardPagination(PageNumberPagination):
     page_size = 20
@@ -57,6 +58,14 @@ def health(request):
     except Exception:
         pass
     return Response({"ok": True, "db_alive": db_alive})
+
+
+@api_view(["POST"])
+def normalize_guardrail(request):
+    serializer = GuardrailNormalizeSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    normalized = normalize_guardrail_text(serializer.validated_data["raw_text"])
+    return Response(normalized)
 
 
 # ── OOB callback receiver ────────────────────────────────────
@@ -88,13 +97,24 @@ def scan_runs(request):
     if request.method == "GET":
         return _paginate(request, ScanRun.objects.all().order_by("-created_at"), ScanRunSerializer)
 
+    config = request.data.get("config")
+    if not isinstance(config, dict):
+        config = {}
+    else:
+        config = dict(config)
+
+    guardrail_raw = request.data.get("guardrail_raw") or config.get("guardrail_raw") or ""
+    if isinstance(guardrail_raw, str) and guardrail_raw.strip():
+        config["guardrail"] = normalize_guardrail_text(guardrail_raw)
+        config.pop("guardrail_raw", None)
+
     data = {
         "target_url": request.data.get("target_url", "http://example.com"),
         # default discovery — MLLA / critic / multi_http_probe / SimHash dedup 흐름.
         # frontend 트리 버튼 + worker swarm 활용. hybrid-lite 명시 시에만 그쪽 흐름.
         "mode": request.data.get("mode", "discovery"),
         "request_budget_total": request.data.get("request_budget_total", 10),
-        "config": request.data.get("config"),
+        "config": config,
     }
     serializer = ScanRunSerializer(data=data)
     serializer.is_valid(raise_exception=True)

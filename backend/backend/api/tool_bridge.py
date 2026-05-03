@@ -13,6 +13,8 @@ from urllib.parse import urljoin
 
 import requests
 
+from .guardrail_enforcer import guardrail_decision
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,6 +32,20 @@ def _tool_available(name):
     return shutil.which(name) is not None
 
 
+def _guardrail_gate(scan_run, tool_name, tool_args):
+    if scan_run is None:
+        return None
+    decision = guardrail_decision(scan_run, tool_name, tool_args)
+    messages = decision.get("messages") or []
+    if decision.get("action") == "block":
+        message = messages[0] if messages else "Guardrail blocked this action."
+        logger.warning("[%s] guardrail blocked %s in tool_bridge: %s", scan_run.run_id, tool_name, message)
+        return {"error": message, "guardrail_action": "block"}
+    if decision.get("action") == "warn" and messages:
+        logger.warning("[%s] guardrail warning for %s in tool_bridge: %s", scan_run.run_id, tool_name, " | ".join(messages))
+    return None
+
+
 def check_tools():
     tools = ["sqlmap", "nuclei", "dalfox", "nmap", "ffuf", "wafw00f",
              "httpx", "katana", "curl", "chromium", "chromium-browser"]
@@ -37,7 +53,10 @@ def check_tools():
     return {"available": available, "total": len(available)}
 
 
-def sqlmap_scan(target_url, params="", method="GET", level=1, risk=1, extra_args=""):
+def sqlmap_scan(target_url, params="", method="GET", level=1, risk=1, extra_args="", scan_run=None):
+    blocked = _guardrail_gate(scan_run, "sqlmap_scan", {"target_url": target_url})
+    if blocked:
+        return blocked
     if not _tool_available("sqlmap"):
         return {"error": "sqlmap not installed"}
     cmd = ["sqlmap", "-u", target_url, "--batch", "--output-dir=/tmp/sqlmap_out",
@@ -54,7 +73,10 @@ def sqlmap_scan(target_url, params="", method="GET", level=1, risk=1, extra_args
     }
 
 
-def nuclei_scan(target_url, templates="", severity="", tags="", extra_args=""):
+def nuclei_scan(target_url, templates="", severity="", tags="", extra_args="", scan_run=None):
+    blocked = _guardrail_gate(scan_run, "nuclei_scan", {"target_url": target_url})
+    if blocked:
+        return blocked
     if not _tool_available("nuclei"):
         return {"error": "nuclei not installed"}
     cmd = ["nuclei", "-u", target_url, "-silent", "-nc"]
@@ -71,7 +93,10 @@ def nuclei_scan(target_url, templates="", severity="", tags="", extra_args=""):
     return {"findings_count": len(findings), "findings": findings[-50:], "returncode": result["returncode"]}
 
 
-def dalfox_scan(target_url, params="", extra_args=""):
+def dalfox_scan(target_url, params="", extra_args="", scan_run=None):
+    blocked = _guardrail_gate(scan_run, "dalfox_scan", {"target_url": target_url})
+    if blocked:
+        return blocked
     if not _tool_available("dalfox"):
         return {"error": "dalfox not installed"}
     cmd = ["dalfox", "url", target_url, "--silence", "--no-color"]
@@ -85,7 +110,10 @@ def dalfox_scan(target_url, params="", extra_args=""):
     return {"vulnerabilities": vulns, "full_output": result["stdout"][-5000:], "returncode": result["returncode"]}
 
 
-def http_request(url, method="GET", headers="{}", body="", follow_redirects=True):
+def http_request(url, method="GET", headers="{}", body="", follow_redirects=True, scan_run=None):
+    blocked = _guardrail_gate(scan_run, "http_request", {"url": url, "method": method})
+    if blocked:
+        return blocked
     try:
         hdrs = json.loads(headers) if headers else {}
     except json.JSONDecodeError:
@@ -124,7 +152,10 @@ def http_request(url, method="GET", headers="{}", body="", follow_redirects=True
         return {"url": url, "error": str(e)}
 
 
-def wafw00f_scan(target_url):
+def wafw00f_scan(target_url, scan_run=None):
+    blocked = _guardrail_gate(scan_run, "wafw00f_scan", {"target_url": target_url})
+    if blocked:
+        return blocked
     if not _tool_available("wafw00f"):
         return {"error": "wafw00f not installed"}
     cmd = ["wafw00f", target_url, "-o", "-"]
@@ -132,7 +163,10 @@ def wafw00f_scan(target_url):
     return {"output": result["stdout"][-3000:], "returncode": result["returncode"]}
 
 
-def nmap_scan(target, ports="80,443,8080,8443", scan_type="service"):
+def nmap_scan(target, ports="80,443,8080,8443", scan_type="service", scan_run=None):
+    blocked = _guardrail_gate(scan_run, "nmap_scan", {"target": target})
+    if blocked:
+        return blocked
     if not _tool_available("nmap"):
         return {"error": "nmap not installed"}
     cmd = ["nmap"]
