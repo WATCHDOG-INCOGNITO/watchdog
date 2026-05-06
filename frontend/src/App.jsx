@@ -231,6 +231,10 @@ async function fetchScanDeveloperReport(runId, format = "md") {
   return apiGet(`/api/scan-runs/${runId}/report/?kind=developer&format=${format}`);
 }
 
+async function fetchAggregateReport(format = "md") {
+  return apiGet(`/api/reports/aggregate/?format=${format}`);
+}
+
 function useLockBodyScroll(active) {
   useEffect(() => {
     if (!active || typeof document === "undefined") return undefined;
@@ -635,6 +639,81 @@ function CandidatesModal({ candidates, onClose }) {
         ) : (
           <EmptyState title="저장된 가설이 없습니다" body="현재 실행에는 저장된 가설이 없습니다." />
         )}
+      </div>
+    </div>
+  );
+}
+
+function AggregateReportModal({ onClose }) {
+  const [reportFormat, setReportFormat] = useState("md");
+  const [reportContent, setReportContent] = useState("");
+  const [reportLoading, setReportLoading] = useState(false);
+  const [reportError, setReportError] = useState("");
+
+  useLockBodyScroll(true);
+
+  const loadReport = async (format) => {
+    setReportLoading(true);
+    setReportError("");
+    try {
+      const payload = await fetchAggregateReport(format);
+      const content = payload?.content;
+      setReportFormat(payload?.format || format);
+      setReportContent(typeof content === "string" ? content : JSON.stringify(content, null, 2));
+    } catch (error) {
+      setReportError(error.message || "통합 보고서를 생성하지 못했습니다.");
+      setReportContent("");
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
+  const copyReport = async () => {
+    if (!reportContent) return;
+    try {
+      await navigator.clipboard.writeText(reportContent);
+    } catch {
+      setReportError("클립보드 복사에 실패했습니다.");
+    }
+  };
+
+  useEffect(() => {
+    loadReport("md");
+  }, []);
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-card modal-card-wide" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <div className="section-kicker">Report</div>
+            <h2>통합 보고서</h2>
+          </div>
+          <button type="button" className="ghost-button" onClick={onClose}>닫기</button>
+        </div>
+
+        <div className="modal-scroll-body">
+          <div className="section-actions" style={{ marginBottom: 16 }}>
+            <button type="button" className="ghost-button" onClick={() => loadReport("md")} disabled={reportLoading}>보고서(MD)</button>
+            <button type="button" className="ghost-button" onClick={() => loadReport("json")} disabled={reportLoading}>보고서(JSON)</button>
+            <button type="button" className="ghost-button" onClick={copyReport} disabled={!reportContent}>복사</button>
+          </div>
+
+          {reportError ? <div className="callout callout-error">{reportError}</div> : null}
+          {reportLoading ? <div className="callout callout-neutral">통합 보고서를 생성하는 중입니다...</div> : null}
+          {reportContent ? (
+            <div className="detail-summary">
+              <strong>보고서 ({reportFormat})</strong>
+              {reportFormat === "md" ? (
+                <div className="detail-steps markdown-surface">
+                  <SimpleMarkdown content={reportContent} />
+                </div>
+              ) : (
+                <pre className="detail-steps">{reportContent}</pre>
+              )}
+            </div>
+          ) : null}
+        </div>
       </div>
     </div>
   );
@@ -3106,6 +3185,7 @@ export default function App() {
   const [llmTraceSnapshot, setLlmTraceSnapshot] = useState({ traces: [], count: 0 });
 
   const [showNewScan, setShowNewScan] = useState(false);
+  const [showAggregateReport, setShowAggregateReport] = useState(false);
   const [showRunDetails, setShowRunDetails] = useState(false);
   const [showFindingsModal, setShowFindingsModal] = useState(false);
   const [showCandidatesModal, setShowCandidatesModal] = useState(false);
@@ -3364,10 +3444,14 @@ export default function App() {
           </div>
         </div>
 
-        <div className="header-actions">
-          <button type="button" className="primary-button" onClick={() => setShowNewScan(true)}>
-            <span className="button-icon" aria-hidden="true">+</span>
-            <span>새 스캔</span>
+          <div className="header-actions">
+            <button type="button" className="ghost-button" onClick={() => setShowAggregateReport(true)}>
+              <span className="button-icon" aria-hidden="true">≡</span>
+              <span>통합 보고서</span>
+            </button>
+            <button type="button" className="primary-button" onClick={() => setShowNewScan(true)}>
+              <span className="button-icon" aria-hidden="true">+</span>
+              <span>새 스캔</span>
           </button>
         </div>
       </header>
@@ -3456,6 +3540,10 @@ export default function App() {
             refreshScanList();
           }}
         />
+      ) : null}
+
+      {showAggregateReport ? (
+        <AggregateReportModal onClose={() => setShowAggregateReport(false)} />
       ) : null}
 
       {showRunDetails ? (
