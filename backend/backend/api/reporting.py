@@ -118,7 +118,7 @@ def _mapping_for(vuln_type: str | None) -> Dict[str, Any]:
             "cvss": {"score": 6.5, "severity": "Moderate"},
         },
         "information_disclosure": {
-            "mitre": {"tactic": "Collection / Exfiltration", "technique": "Data from Information Repositories"},
+            "mitre": {"tactic": "Collection / Information Disclosure", "technique": "Data from Information Repositories"},
             "cwe": {"id": "CWE-200", "name": "Exposure of Sensitive Information"},
             "cvss": {"score": 5.3, "severity": "Moderate"},
         },
@@ -181,6 +181,8 @@ def _soften_low_confidence_text(text: str, confidence: Any) -> str:
     value = re.sub(r"\bcan access\b", "may be able to access", value, flags=re.IGNORECASE)
     value = re.sub(r"\bis vulnerable to\b", "may be vulnerable to", value, flags=re.IGNORECASE)
     value = re.sub(r"\bconfirms\b", "suggests", value, flags=re.IGNORECASE)
+    value = re.sub(r"\.\.+", ".", value)
+    value = re.sub(r"\.\s*\.", ".", value)
     return value
 
 
@@ -275,6 +277,75 @@ def _highest_severity(items: List[Dict[str, Any]]) -> str:
     )
 
 
+def _flow_tactic(item: Dict[str, Any]) -> str:
+    tactic = str(((item.get("mitre") or {}).get("tactic")) or "Discovery").strip()
+    if _is_low_confidence(item.get("confidence")):
+        if "Privilege Escalation" in tactic or "Access Control" in tactic:
+            return "Potential Privilege Escalation / Access Control"
+        if "Defense Evasion" in tactic:
+            return "Potential Defense Evasion"
+        if "Initial Access" in tactic or "Execution" in tactic:
+            return f"Potential {tactic}"
+        if "Collection" in tactic:
+            return "Potential Collection"
+        return f"Potential {tactic}"
+    return tactic
+
+
+def _mitre_flow_summary(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    confirmed_path: List[str] = []
+    potential_extension: List[str] = []
+    basis_lines: List[str] = []
+
+    def _append_unique(values: List[str], value: str) -> None:
+        if value and value not in values:
+            values.append(value)
+
+    for item in items:
+        tactic = _flow_tactic(item)
+        title = str(item.get("title") or "Untitled finding").strip()
+        endpoint = str(item.get("endpoint") or UNKNOWN_ENDPOINT).strip()
+        low_conf = _is_low_confidence(item.get("confidence"))
+        if low_conf:
+            _append_unique(potential_extension, tactic)
+            basis_lines.append(
+                f"- {title} in `{endpoint}` may indicate {tactic} and requires additional validation."
+            )
+        else:
+            _append_unique(confirmed_path, tactic)
+            basis_lines.append(
+                f"- {title} in `{endpoint}` supports {tactic}."
+            )
+
+    observed_flow = " → ".join(confirmed_path + potential_extension) if (confirmed_path or potential_extension) else "No ATT&CK flow derived from generated findings."
+    return {
+        "observed_flow": observed_flow,
+        "confirmed_path": confirmed_path,
+        "potential_extension": potential_extension,
+        "basis": basis_lines,
+    }
+
+
+def _mitre_flow_md(flow: Dict[str, Any]) -> str:
+    confirmed = " → ".join(flow.get("confirmed_path") or []) or "None"
+    potential = " → ".join(flow.get("potential_extension") or []) or "None"
+    basis = _safe_join_lines(flow.get("basis") or ["- No supporting findings were available."])
+    return f"""## MITRE ATT&CK Flow Summary
+Observed / potential attack flow based on generated findings:
+
+- Observed flow: {flow.get('observed_flow') or 'No ATT&CK flow derived from generated findings.'}
+
+Confirmed path:
+{confirmed}
+
+Potential extension:
+{potential}
+
+Basis:
+{basis}
+"""
+
+
 def _developer_finding_item(finding: Any) -> Dict[str, Any]:
     candidate = getattr(finding, "candidate", None)
     request = getattr(candidate, "request", None) if candidate else None
@@ -356,6 +427,7 @@ def build_developer_report(run_id: str) -> DeveloperReportResult:
 
     finding_items = [_developer_finding_item(f) for f in findings_qs.order_by("-created_at")]
     host = _target_host(scan_run.target_url)
+    flow = _mitre_flow_summary(finding_items)
 
     if finding_items:
         highest_severity = _highest_severity(finding_items)
@@ -376,6 +448,7 @@ def build_developer_report(run_id: str) -> DeveloperReportResult:
         "executive_summary": executive_summary,
         "findings_count": len(finding_items),
         "findings_by_severity": severity_counts_map,
+        "mitre_flow": flow,
         "findings": finding_items,
     }
 
@@ -433,6 +506,8 @@ def build_developer_report(run_id: str) -> DeveloperReportResult:
 - Total findings: {len(finding_items)}
 {_safe_join_lines([f"- {k}: {v}" for k, v in severity_counts_map.items()])}
 
+{_mitre_flow_md(flow)}
+
 {findings_md_text}
 """
 
@@ -458,6 +533,7 @@ def build_aggregate_developer_report(host: str | None = None) -> AggregateReport
     target_urls = list(findings_by_target.keys())
     highest_severity = _highest_severity(all_items) if all_items else "Unknown"
     scope = host or "all-runs"
+    overall_flow = _mitre_flow_summary(all_items)
 
     if all_items:
         executive_summary = (
@@ -473,10 +549,12 @@ def build_aggregate_developer_report(host: str | None = None) -> AggregateReport
         "executive_summary": executive_summary,
         "targets_count": len(target_urls),
         "findings_count": len(all_items),
+        "mitre_flow": overall_flow,
         "targets": [
             {
                 "target_url": target_url,
                 "findings_count": len(items),
+                "mitre_flow": _mitre_flow_summary(items),
                 "findings": items,
             }
             for target_url, items in findings_by_target.items()
@@ -485,6 +563,7 @@ def build_aggregate_developer_report(host: str | None = None) -> AggregateReport
 
     target_blocks: List[str] = []
     for target_url, items in findings_by_target.items():
+        target_flow = _mitre_flow_summary(items)
         finding_blocks = []
         for idx, item in enumerate(items, start=1):
             finding_blocks.append(
@@ -533,6 +612,8 @@ def build_aggregate_developer_report(host: str | None = None) -> AggregateReport
 
 ## Executive Summary
 {executive_summary}
+
+{_mitre_flow_md(overall_flow)}
 
 ## Included URLs
 {_safe_join_lines([f"- {target}" for target in target_urls]) or '- none'}
