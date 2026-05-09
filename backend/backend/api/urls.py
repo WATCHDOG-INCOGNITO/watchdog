@@ -44,6 +44,7 @@ urlpatterns = [
     path("api/candidates/<str:cand_id>/loops/", views.list_verification_loops),
 
     path("api/findings/", views.list_findings),
+    path("api/reports/aggregate/", views.aggregate_report),
     path("api/findings/<str:finding_id>/", views.get_finding),
     path("api/findings/<str:finding_id>/detail/", views.finding_detail),
     path("api/findings/<str:finding_id>/report/", views.finding_report),

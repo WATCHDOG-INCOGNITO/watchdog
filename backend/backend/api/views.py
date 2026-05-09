@@ -27,9 +27,12 @@ from .serializers import (
     VulnerabilityEntrySerializer, PayloadPatternSerializer, ReportArchiveSerializer,
 )
 from .reporting import (
+    build_aggregate_developer_report,
     build_report,
     build_developer_report,
     build_finding_report,
+    serialize_aggregate_report_json,
+    serialize_aggregate_report_md,
     serialize_report_json,
     serialize_report_md,
 )
@@ -494,6 +497,16 @@ def finding_report(request, finding_id):
     if fmt in ("json",):
         return Response({"finding_id": finding_id, "format": "json", "content": report.json_obj})
     return Response({"finding_id": finding_id, "format": "md", "content": report.md_text})
+
+
+@api_view(["GET"])
+def aggregate_report(request):
+    host = (request.query_params.get("host") or "").strip().lower() or None
+    fmt = (request.query_params.get("format") or "md").lower().strip()
+    report = build_aggregate_developer_report(host=host)
+    if fmt in ("json",):
+        return Response({"scope": report.scope, "format": "json", "content": report.json_obj})
+    return Response({"scope": report.scope, "format": "md", "content": report.md_text})
 
 
 @api_view(["GET"])
