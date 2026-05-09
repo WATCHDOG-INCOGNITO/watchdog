@@ -12,6 +12,7 @@ router.register(r"report-archives", views.ReportArchiveViewSet, basename="report
 
 urlpatterns = [
     path("health/", views.health),
+    path("api/guardrails/normalize/", views.normalize_guardrail),
 
     # OOB callback — token만 일치하면 무엇이든 받음. 페이로드가 admin bot 등을 통해 hit.
     path("oob/<str:token>/", views.oob_receiver),

@@ -9,7 +9,7 @@ services:
       POSTGRES_USER: bugbounty
       POSTGRES_PASSWORD: bugbounty123
     ports:
-      - "5432:5432"
+      - "${DB_EXPOSE_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

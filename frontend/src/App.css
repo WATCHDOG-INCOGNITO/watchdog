@@ -486,6 +486,65 @@ button { cursor: pointer; }
 .toggle-group { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .toggle-option.active { background: rgba(29,103,214,0.1); border-color: rgba(29,103,214,0.26); }
 
+.guardrail-mode-group {
+  margin-top: 10px;
+}
+
+.guardrail-mode-option {
+  min-height: 116px;
+  display: grid;
+  align-content: start;
+  justify-items: start;
+  gap: 6px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  text-align: left;
+}
+
+.toggle-option.guardrail-mode-option {
+  display: grid;
+  justify-items: start;
+  align-content: start;
+  justify-content: stretch;
+}
+
+.guardrail-mode-kicker {
+  color: var(--text);
+  font-size: 0.98rem;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 1.2;
+}
+
+.guardrail-mode-subkicker {
+  display: inline-block;
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-dim);
+  opacity: 0.9;
+}
+
+.guardrail-mode-divider {
+  width: 100%;
+  height: 1px;
+  margin: 4px 0 2px;
+  background: rgba(37, 45, 42, 0.12);
+}
+
+.guardrail-mode-copy {
+  color: var(--text);
+  font-size: 0.86rem;
+  line-height: 1.55;
+  font-weight: 600;
+}
+
+.guardrail-mode-option.active .guardrail-mode-divider {
+  background: rgba(29,103,214,0.22);
+}
+
 .field { display: grid; gap: 10px; margin-top: 16px; }
 .field span, .checkbox-row span { color: var(--text-dim); font-size: 0.9rem; }
 .field input, .field select { width: 100%; padding: 14px 16px; border: 1px solid rgba(29,103,214,0.14); background: rgba(255,255,255,0.94); color: var(--text); }
@@ -2063,6 +2122,78 @@ select:focus-visible {
 
 .auth-add-button {
   width: 100%;
+}
+
+.guardrail-textarea {
+  width: 100%;
+  min-height: 220px;
+  padding: 14px 16px;
+  resize: vertical;
+  border: 1px solid rgba(29,103,214,0.14);
+  background: rgba(255,255,255,0.94);
+  color: var(--text);
+  font: 0.9rem/1.6 "IBM Plex Sans", sans-serif;
+}
+
+.guardrail-preview-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.guardrail-preview-card {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px solid rgba(37, 45, 42, 0.12);
+  border-radius: 8px;
+  background: #f7f5ef;
+}
+
+.guardrail-preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.guardrail-preview-head span,
+.guardrail-preview-label {
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.guardrail-preview-section {
+  display: grid;
+  gap: 6px;
+}
+
+.guardrail-preview-section p,
+.guardrail-preview-section pre {
+  margin: 0;
+}
+
+.guardrail-preview-section pre {
+  max-height: 220px;
+  overflow: auto;
+  padding: 12px;
+  border-radius: 6px;
+  background: rgba(255,255,255,0.9);
+  border: 1px solid rgba(37, 45, 42, 0.08);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: 0.82rem/1.6 "IBM Plex Mono", monospace;
+}
+
+.guardrail-constraint-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.guardrail-constraint-list li {
+  margin: 4px 0;
 }
 
 .auth-badge,
