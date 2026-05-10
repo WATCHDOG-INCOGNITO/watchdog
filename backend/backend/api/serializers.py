@@ -11,7 +11,6 @@ from .models import (
 class GuardrailNormalizeSerializer(serializers.Serializer):
     raw_text = serializers.CharField(allow_blank=False, trim_whitespace=True, max_length=100000)
 
-
 class ScanRunSerializer(serializers.ModelSerializer):
     class Meta:
         model = ScanRun
@@ -30,6 +29,7 @@ class RequestCatalogSerializer(serializers.ModelSerializer):
         model = RequestCatalog
         fields = "__all__"
         read_only_fields = ["req_id", "created_at"]
+
 
 class CandidateSerializer(serializers.ModelSerializer):
     class Meta:

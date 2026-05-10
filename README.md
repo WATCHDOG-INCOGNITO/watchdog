@@ -4,7 +4,6 @@
 
 Watchdog combines a multi-agent LLM architecture with a structured Knowledge Base, a living memory system, and a visual Discovery Tree to autonomously perform deep, multi-step exploit chains against web applications.
 
----
 
 ## Key Features
 
@@ -34,7 +33,6 @@ A Model Context Protocol (MCP) server exposing 28+ tools for HTTP requests, KB s
 
 ## Architecture
 
-```
 ┌─────────────────────────────────────────────────┐
 │                   Frontend (React)              │
 │         Canvas Graph · Detail Panel · Live WS   │

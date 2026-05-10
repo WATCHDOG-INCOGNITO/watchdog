@@ -192,4 +192,3 @@ class Crawler:
 
         logger.info(f"크롤링 완료: {len(self.results)}개 엔드포인트 수집")
         return self.results
-

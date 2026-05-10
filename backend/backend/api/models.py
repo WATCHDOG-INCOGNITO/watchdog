@@ -287,7 +287,6 @@ class IDORTestSession(models.Model):
 
     class Meta:
         db_table = "idor_test_sessions"
-
 class WAFBypassAttempt(models.Model):
     class MutationType(models.TextChoices):
         ORIGINAL = "original"
@@ -346,6 +345,7 @@ class PayloadPattern(models.Model):
     name = models.CharField(max_length=256)
     vuln_type = models.CharField(max_length=64)
     sub_technique = models.CharField(max_length=128, null=True, blank=True)
+
     category = models.CharField(max_length=64, default="detection")
 
     request_template = models.TextField(null=True, blank=True)
@@ -462,7 +462,6 @@ class DeadEnd(models.Model):
     class Meta:
         db_table = "dead_ends"
         unique_together = [("target_host", "endpoint", "vuln_type", "pattern_id")]
-
     @property
     def fp_rate(self):
         return self.false_positive_count / self.times_used if self.times_used else 0.0
@@ -561,7 +560,6 @@ class DiscoveryNode(models.Model):
         indexes = [
             models.Index(fields=["scan_run", "status", "-depth", "created_at"]),
         ]
-
 
 class ReportArchive(models.Model):
     class ValidationStatus(models.TextChoices):

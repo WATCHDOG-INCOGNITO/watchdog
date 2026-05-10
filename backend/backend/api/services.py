@@ -7,6 +7,7 @@ import logging
 import re
 from django.utils import timezone
 
+
 from .error_utils import summarize_exception
 from .llm_trace_store import record_llm_trace
 from .models import ScanRun, RequestCatalog, Candidate
@@ -18,11 +19,13 @@ from .scan_control import (
     register_scan,
     unregister_scan,
 )
+
 from .crawler import Crawler
 
 logger = logging.getLogger(__name__)
 
 # 규칙 기반 필터링 (1단계: 비용 제로)
+
 
 # 파라미터 이름 기반 의심 패턴
 SUSPICIOUS_PARAM_PATTERNS = [

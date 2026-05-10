@@ -28,7 +28,7 @@ services:
     command: ["sh", "-c", "python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:8000"]
     environment:
       DJANGO_DEBUG: "1"
-      DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1"
+      DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1,backend"
       DJANGO_SECRET_KEY: "dev-only-not-a-secret"
       DB_NAME: "${E2E_DB_NAME:-bugbounty_agent}"
       DB_USER: "${E2E_DB_USER:-bugbounty}"

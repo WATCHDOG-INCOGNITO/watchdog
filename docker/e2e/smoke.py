@@ -174,6 +174,7 @@ def _check_report(base: str, run_id: str, deadline: float, poll_interval: float)
         return False
 
     print("timed out waiting for report to be available", file=sys.stderr)
+
     return False
 
 
@@ -278,7 +279,6 @@ def main(argv: list[str]) -> int:
                 elif st not in (0, 400, 404):
                     print(f"GET {candidate_path} failed: status={st} body={body}", file=sys.stderr)
                     return 1
-
             for request_path in (
                 f"/api/request-catalog/list/?run_id={run_id}",
                 f"/api/scan-runs/{run_id}/request-catalog/",
