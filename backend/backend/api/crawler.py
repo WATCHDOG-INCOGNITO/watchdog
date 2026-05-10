@@ -13,7 +13,6 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-
 class Crawler:
     """BFS 기반 웹 크롤러"""
 

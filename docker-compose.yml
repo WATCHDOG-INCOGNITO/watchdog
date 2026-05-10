@@ -2,14 +2,14 @@ version: "3.9"
 
 services:
   db:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
       POSTGRES_DB: bugbounty_agent
       POSTGRES_USER: bugbounty
       POSTGRES_PASSWORD: bugbounty123
     ports:
-      - "5432:5432"
+      - "${DB_EXPOSE_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -26,19 +26,139 @@ services:
     environment:
       DJANGO_SECRET_KEY: "change-this-in-production"
       DJANGO_DEBUG: "1"
-      DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1,0.0.0.0"
-      DB_NAME: bugbounty_agent
-      DB_USER: bugbounty
-      DB_PASSWORD: bugbounty123
-      DB_HOST: db
-      DB_PORT: "5432"
+      DJANGO_ALLOWED_HOSTS: "*"
+      DB_NAME: ${DB_NAME:-bugbounty_agent}
+      DB_USER: ${DB_USER:-bugbounty}
+      DB_PASSWORD: ${DB_PASSWORD:-bugbounty123}
+      DB_HOST: ${DB_HOST:-db}
+      DB_PORT: ${DB_PORT:-5432}
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      WATCHDOG_AGENT_MODEL: "${WATCHDOG_AGENT_MODEL:-claude-sonnet-4-20250514}"
+      WATCHDOG_MODEL_ROUTEMAP: "${WATCHDOG_MODEL_ROUTEMAP:-}"
+      WATCHDOG_MODEL_ENTRYPOINT: "${WATCHDOG_MODEL_ENTRYPOINT:-}"
+      WATCHDOG_MODEL_HYPOTHESIS: "${WATCHDOG_MODEL_HYPOTHESIS:-}"
+      WATCHDOG_MODEL_EXPLOIT: "${WATCHDOG_MODEL_EXPLOIT:-}"
+      WATCHDOG_MODEL_CONFIRMER: "${WATCHDOG_MODEL_CONFIRMER:-}"
+      WATCHDOG_MODEL_CRITIC: "${WATCHDOG_MODEL_CRITIC:-}"
+      WATCHDOG_MODEL_REPORTER: "${WATCHDOG_MODEL_REPORTER:-}"
+      # 모든 secret(GCP key 등)은 host의 ./secrets/ 폴더 한 곳에 모음.
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-/run/secrets/gcp-key.json}
+      GCS_BUCKET_NAME: ${GCS_BUCKET_NAME:-watchdog-evidence}
+      # Multi-agent swarm 설정
+      WATCHDOG_AGENT_MODE: "${WATCHDOG_AGENT_MODE:-swarm}"
+      WATCHDOG_SWARM_EXECUTORS: "${WATCHDOG_SWARM_EXECUTORS:-3}"
+      WATCHDOG_SWARM_VERIFIERS: "${WATCHDOG_SWARM_VERIFIERS:-2}"
+      WATCHDOG_SWARM_QUIESCENCE_S: "${WATCHDOG_SWARM_QUIESCENCE_S:-30}"
+      WATCHDOG_SWARM_MAX_HYPOTHESES: "${WATCHDOG_SWARM_MAX_HYPOTHESES:-20}"
+      # Discovery mode 설정
+      WATCHDOG_DISCOVERY_WORKERS: "${WATCHDOG_DISCOVERY_WORKERS:-5}"
+      WATCHDOG_DISCOVERY_WORKER_BUDGET: "${WATCHDOG_DISCOVERY_WORKER_BUDGET:-50}"
+      WATCHDOG_DISCOVERY_EXPLOIT_BUDGET: "${WATCHDOG_DISCOVERY_EXPLOIT_BUDGET:-30}"
+      WATCHDOG_DISCOVERY_CLUE_BUDGET: "${WATCHDOG_DISCOVERY_CLUE_BUDGET:-25}"
+      WATCHDOG_DISCOVERY_MAX_CALLS: "${WATCHDOG_DISCOVERY_MAX_CALLS:-500}"
+      WATCHDOG_DISCOVERY_MAX_COST_USD: "${WATCHDOG_DISCOVERY_MAX_COST_USD:-10.0}"
+      # Browser profile bridge
+      BROWSER_AGENT_URL: "http://browser:8891"
+      PROFILES_DIR: "/app/profiles"
+      SOURCE_ROOTS: "/sources"
+    volumes:
+      - ./secrets:/run/secrets:ro
+      # 대회 원본은 /raw-sources 에 read-only mount (에이전트 직접 접근 불가)
+      - ./codegate2023-fin:/raw-sources/codegate2023-fin:ro
+      - ./codegate2024-final:/raw-sources/codegate2024-final:ro
+      - ./codegate2025-final:/raw-sources/codegate2025-final:ro
+      - ./codegate2026-pre:/raw-sources/codegate2026-pre:ro
+      # Living KB 영속화 — confirm된 learned 패턴이 즉시 host의 techniques/<vuln_type>/*.md
+      # 로 dump되어 git commit 가능. 컨테이너 재빌드/볼륨 초기화에도 살아남음.
+      - ./backend/backend/api/management/commands/techniques:/app/api/management/commands/techniques
+      # Browser bridge profile 공유 — browser 컨테이너가 /profiles 에 쓰면
+      # backend 가 /app/profiles 에서 읽어 browser_load_storage_state 호출.
+      - ./profiles:/app/profiles
     depends_on:
       db:
         condition: service_healthy
     command: >
-      sh -c "python manage.py migrate --noinput &&
-             python manage.py runserver 0.0.0.0:8000"
+      sh -c "python /app/scripts/link_for_user.py &&
+      python manage.py migrate --noinput &&
+      python manage.py runserver 0.0.0.0:8000"
+
+  mcp:
+    build: ./backend/backend
+    restart: unless-stopped
+    ports:
+      - "8889:8889"
+    volumes:
+      - ./secrets:/run/secrets:ro
+      # Living KB 영속화 — backend와 동일 경로에 bind. learn_from_finding이
+      # mcp 컨테이너에서 호출되어도 호스트의 같은 .md 파일에 기록.
+      - ./backend/backend/api/management/commands/techniques:/app/api/management/commands/techniques
+    environment:
+      DJANGO_SECRET_KEY: "change-this-in-production"
+      DJANGO_DEBUG: "1"
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp-key.json
+      DB_NAME: ${DB_NAME:-bugbounty_agent}
+      DB_USER: ${DB_USER:-bugbounty}
+      DB_PASSWORD: ${DB_PASSWORD:-bugbounty123}
+      DB_HOST: ${DB_HOST:-db}
+      DB_PORT: ${DB_PORT:-5432}
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      MCP_SSE: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: "python -m watchdog_mcp.server --sse"
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+  # ── Browser bridge — SSO/OAuth 세션을 Watchdog UI 안에서 완결 ──────
+  # noVNC 로 headful chromium 을 UI iframe 에 표시. 사용자가 로그인하면
+  # browser_agent 가 자동으로 storage_state 추출 → backend /api/profiles/
+  # import 호출. Google ToS 때문에 automated login 은 불가 — 사용자가
+  # 직접 VNC 화면에서 로그인해야 한다.
+  browser:
+    build: ./docker/browser
+    restart: unless-stopped
+    ports:
+      - "6080:6080"   # noVNC web client
+      - "8891:8891"   # browser_agent Flask API
+    environment:
+      WATCHDOG_API: "http://backend:8000"
+      PROFILES_DIR: "/profiles"
+      LOGIN_TIMEOUT_SEC: "${BROWSER_LOGIN_TIMEOUT_SEC:-600}"
+    volumes:
+      # 저장된 storage_state JSON 은 host ./profiles 에 mirror — backend 와
+      # 공유되어야 browser_load_storage_state 도구가 그대로 접근 가능.
+      - ./profiles:/profiles
+    depends_on:
+      - backend
+
+  # ── OSS eval targets — 평소엔 뜨지 않음 ──────────────────────────
+  # 평가 시: `docker compose --profile eval-oss up -d juice-shop dvwa`
+  # Watchdog backend 에서 `http://juice-shop:3000` / `http://dvwa` 로 접근.
+  # XBOW / Shannon 비교용 표준 web pentest target.
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    profiles: ["eval-oss"]
+    restart: unless-stopped
+    ports:
+      # 호스트 8030 → frontend(3000) 와 멀리 분리. 컨테이너 내부는 3000 유지.
+      - "8030:3000"
+    environment:
+      NODE_ENV: unsafe
+
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    profiles: ["eval-oss"]
+    restart: unless-stopped
+    ports:
+      # 호스트 8082 → backend(8000) / mcp(8889) 와 충돌 없음.
+      - "8082:80"
 
 volumes:
   pgdata:

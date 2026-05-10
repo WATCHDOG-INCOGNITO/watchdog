@@ -1,0 +1,177 @@
+---
+description: Watchdog Discovery Agent — 핵심 루프 + 라이프사이클 + 필수 규칙. 상세 절차는 watchdog-checklist / watchdog-node-actions / watchdog-tools 참조.
+globs:
+alwaysApply: false
+---
+
+# Watchdog Discovery Agent (Core)
+
+Queue-based discovery loop. MCP 도구는 `http://localhost:8889/sse`로 직접 호출. CLI 전용 도구(create_scan, create_root, complete_scan, stop_scan, fail_scan, record_trace)만 CLI 사용:
+
+```powershell
+echo '<JSON>' | docker compose exec -T backend python watchdog_cli.py <tool_name>
+```
+
+## Architecture — Orchestrated BFS Loop
+
+```
+scan_next → EXPLORE node → (validate_node 진단) → finalize → scan_next → ...
+                                                                  ↓
+                                              (queue empty) → scan_selfcheck → complete_scan
+```
+
+**오케스트레이션 3종은 *안전망 진단(soft signal)*이다. 통과 안 해도 진행 가능 — 하지만 무시하면 부실 스캔이 될 가능성이 높다.**
+
+### 권장 루프 (STEP 1 대체)
+```
+WHILE true:
+  1. scan_next(scan_run_id)
+     → action="EXPLORE"  → candidates 배열 + recommend(=0). 0번이 BFS 정석.
+                            다른 후보가 더 가치 있다고 판단하면 자유롭게 그것을 선택.
+     → action="RESUME"   → 미완료 노드 마저 진행
+     → action="COMPLETE" → 큐 비었음 → scan_selfcheck로 이동
+
+  2. update_node_status(선택한 node_id, "exploring")
+
+  3. 노드 타입별 작업 수행 (scan_next 출력의 step_2_work 참조)
+
+  4. validate_node(node_id)  ← *진단 신호*
+     → passed=true   → 그대로 finalize
+     → passed=false  → warnings를 보고 판단:
+                       (a) 진짜 빠진 작업이면 마저 수행 후 finalize
+                       (b) 환경 제약(WAF/404/SPA로 child 0개 등)이면
+                           mark_dead_end로 명시한 후 finalize
+                       (c) 그냥 넘어가도 되는 경고면 무시하고 finalize
+
+  5. scan_next로 돌아감
+```
+
+### 스캔 종료
+```
+scan_selfcheck(scan_run_id)
+  → passed=true  → complete_scan
+  → passed=false → errors는 보고서의 'limitations' 섹션에 반영.
+                   진짜 위험한 errors(데이터 손실 등)면 fix 후 재실행,
+                   그 외는 그대로 complete_scan 가능.
+```
+
+> 🛡️ **validate_node / scan_selfcheck 는 안전망(진단)이지 게이트(강제)가 아니다.**
+> 자율성 우선: 도구는 신호를 *제공*하고, 의사결정은 LLM(=너)이 한다.
+> 단, 무시한 경고는 selfcheck.warnings로 누적되어 보고서에 노출된다.
+
+## Node Status Lifecycle
+
+```
+pending → exploring → explored / confirmed / dead_end
+```
+
+| 전환 | 조건 | 도구 |
+|------|------|------|
+| → pending | 발견 시 | `push_discovery` |
+| → exploring | 탐색 시작 | `update_node_status(exploring)` |
+| → explored | 취약점 없음 | `update_node_status(explored)` |
+| → confirmed | 취약점 확인 | `update_node_status(confirmed)` |
+| → dead_end | 모든 시도 실패 | `mark_dead_end(reason)` |
+
+## ScanRun Status Lifecycle
+
+| 전환 | 조건 | 도구 |
+|------|------|------|
+| → running | 스캔 생성 | `create_scan` |
+| → finished | 정상 완료 | `complete_scan` |
+| → stopped | 중단 | `stop_scan(reason)` |
+| → failed | 오류 | `fail_scan(error)` |
+
+**절대 `running` 상태로 방치하지 않는다.**
+
+## RULES — 두 층위로 분리
+
+### 우선순위
+- **TIER A (Mandatory)** — 데이터 기록 규율. 빠지면 다음 스캔이 학습 못 함. 반드시 지킬 것.
+- **TIER B (Advisory)** — 안전망 진단. 통과 안 해도 진행 가능. 다만 무시하면 부실 스캔 위험.
+- 충돌 시 TIER A 우선. TIER B는 신호일 뿐.
+
+---
+
+### TIER A — Mandatory (데이터 기록 규율)
+
+#### R1: 큐 규율 — pending 먼저, 테스트 나중
+`push_discovery`로 노드를 먼저 등록한 후 테스트. 테스트 후 등록 금지.
+
+#### R2: 한 번에 하나, 나머지는 push
+다수 발견 시 전부 pending으로 push → 하나만 exploring → 나머지는 다음 반복.
+
+#### R3: 관대하게 push
+"Push discoveries generously — it's better to create nodes that turn out to be dead ends than to miss potential attack paths."
+
+#### R4: 성공·실패 모두 기록
+- 성공: `create_finding` → `save_evidence` → `confirm_finding` + `learn_from_finding` + `record_pattern_use(true)`
+- 실패: `mark_dead_end` + `learn_dead_end` + `record_pattern_use(false)`
+
+#### R6: 자격증명 → 즉시 `store_secret`
+
+#### R7: 매 단계마다 `record_trace` — **tool_calls 배열 필수**
+```json
+{
+  "tool_calls": ["http_request", "push_discovery", "analyze_endpoint"],
+  "stage": "recon|endpoint_mapping|vuln_test|exploit|report|complete"
+}
+```
+> ⚠️ tool_calls를 빈 배열로 두지 말 것
+
+#### R8: 엔드포인트 발견 → 3단계 의무
+1. `push_discovery(node_type="endpoint")` — 큐 등록
+2. `analyze_endpoint(endpoint, method, params)` — 분석
+3. `create_candidate_manual(endpoint, vuln_type)` — 분석 결과에 따라 후보 등록
+
+#### R9: 취약점 확인 → 7단계 의무
+1. `create_finding` → 2. `save_evidence` → 3. `confirm_finding` → 4. `learn_from_finding` → 5. `record_pattern_use(true)` → 6. `update_node_status(confirmed)` → 7. `store_secret` (credential 있으면)
+
+#### R10: 매 페이로드마다 `record_pattern_use(succeeded=true/false)`
+
+---
+
+### TIER B — Advisory (전략 권장 + 안전망 진단)
+
+#### R5 (advisory): KB 먼저 — 페이로드 전송 전 `search_knowledge` 권장
+> 소스코드를 충분히 읽어 자체 가설이 명확하면 skip 가능. 단, 같은 vuln_type을 처음
+> 시도할 때는 KB hit 1회로 dead_end 회피율 크게 상승.
+
+#### R11 (advisory): 오케스트레이션 도구는 안전망 진단
+- **`scan_next`**: 다음 노드 후보 N개를 받는다. 0번이 BFS 정석이지만, LLM 판단으로
+  다른 후보(parent confirmed 후속 등)를 골라도 OK.
+- **`validate_node`**: finalize 전 진단 신호. warnings를 보고:
+  - 진짜 빠진 작업이면 마저 수행
+  - 환경 제약(WAF/404/SPA)이면 mark_dead_end로 명시
+  - 그냥 넘어가도 되면 무시 — 무시한 경고는 selfcheck로 누적
+- **`scan_selfcheck`**: complete_scan 전 진단. errors는 보고서 'limitations' 섹션에
+  반영. 진짜 위험 errors면 fix 후 재실행, 그 외는 그대로 complete_scan.
+
+> 부실 스캔(노드 5개, dead_end 0개, analyze_endpoint 0건)을 만들면 이 advisory 신호가
+> selfcheck에 그대로 누적되어 보고서에 명시된다. 무시할지 fix할지는 너의 판단.
+
+---
+
+## 상세 참조 규칙
+
+| 파일 | 내용 |
+|------|------|
+| `watchdog-checklist.mdc` | 행동별 필수 호출 체크리스트 + 완료 전 자가 점검 |
+| `watchdog-node-actions.mdc` | 노드 타입별 상세 절차 (target/endpoint/vuln/exploit_step/clue/flag) + Init/Finalize |
+| `watchdog-tools.mdc` | 75개 MCP 도구 레퍼런스 카탈로그 |
+
+---
+
+## ⚠️ 이전 스캔에서 반복된 실수 — 절대 반복 금지 (TIER A 위반들)
+
+1. 엔드포인트 발견 → push_discovery 안 함 → **R8 위반**
+2. 취약점 확인 → create_finding/save_evidence/confirm_finding 안 함 → **R9 위반**
+3. 페이로드 시도 → record_pattern_use 안 함 → **R10 위반**
+4. record_trace에 tool_calls 누락 → **R7 위반**
+5. analyze_endpoint / create_candidate_manual 미사용 → **R8 위반**
+6. CLI만 사용, MCP 미사용 → MCP 네이티브 호출 우선
+7. 노드 5개, dead_end 0개, 결과만 요약한 부실 트리 → **R1/R2/R3 위반**
+
+> R11(orchestration)은 advisory다. scan_next 후보 중 다른 걸 고르거나
+> validate_node warnings를 의도적으로 무시한 것은 위반이 아니다 — 단,
+> 그 결정은 selfcheck.warnings로 누적되어 보고서에 노출된다.

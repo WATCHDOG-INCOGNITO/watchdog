@@ -1,8 +1,3 @@
-"""
-LLM 라우터 모듈
-Claude API를 호출하여 candidate를 분석한다.
-향후 openai, gemini 등 다른 모델도 추가 가능한 구조.
-"""
 
 import os
 import json
@@ -12,10 +7,40 @@ from anthropic import Anthropic
 
 logger = logging.getLogger(__name__)
 
-# API 키는 환경변수에서 가져옴
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-
 client = None
+
+ANALYZE_SYSTEM = (
+    "You are a senior web application security analyst working only in an "
+    "authorized internal test lab. Classify candidates carefully, prefer "
+    "non-destructive validation paths, and return strict JSON."
+)
+
+PAYLOAD_SYSTEM = (
+    "You are a web vulnerability verification planner for an authorized "
+    "internal lab. Generate the smallest set of high-signal, non-destructive "
+    "payloads needed to verify or refute one hypothesis. Prefer context-aware "
+    "payloads over naive signatures."
+)
+
+RESPONSE_SYSTEM = (
+    "You are a web security response analyst for an authorized internal lab. "
+    "Use the response, timing, headers, and prior attempts to decide whether "
+    "the current hypothesis is supported, disproved, or better explained by a "
+    "different vulnerability family. Avoid repetitive next steps."
+)
+
+WAF_SYSTEM = (
+    "You are a web security engineer evaluating blacklist-based request "
+    "filters in an authorized internal lab. Suggest bounded, low-noise, "
+    "non-destructive alternative encodings and context shifts."
+)
+
+VERDICT_SYSTEM = (
+    "You are a senior application security consultant. Produce an evidence-led "
+    "final verdict. If the evidence is incomplete, say so clearly instead of "
+    "overstating confidence."
+)
 
 
 def get_client():
@@ -25,126 +50,319 @@ def get_client():
     return client
 
 
-def analyze_candidate(candidate_data):
-    """
-    candidate 정보를 Claude에 보내서 분석받는다.
+def _parse_json(raw: str) -> dict:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1]
+        raw = raw.rsplit("```", 1)[0]
+    return json.loads(raw)
+        
 
-    Args:
-        candidate_data: dict {
-            "endpoint": "/api/users",
-            "method": "GET",
-            "params": {"id": "1"},
-            "vuln_type": "sqli",
-            "hypothesis": "규칙 기반 탐지: ...",
-            "features": {...},
-        }
+def _dump_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2)
 
-    Returns:
-        dict {
-            "risk_level": "high" | "medium" | "low" | "none",
-            "confidence": 0.0~1.0,
-            "analysis": "분석 내용",
-            "suggested_payloads": ["...", "..."],
-            "next_action": "verify" | "dismiss" | "escalate",
-        }
-    """
+
+def _call_llm(prompt: str, system: str = "", max_tokens: int = 1024) -> tuple[dict, dict]:
     c = get_client()
+    kwargs = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if system:
+        kwargs["system"] = system
 
-    prompt = f"""당신은 웹 애플리케이션 보안 전문가입니다.
-아래 의심 지점(candidate)을 분석하고, JSON으로 결과를 반환해주세요.
+    raw = ""
+    try:
+        resp = c.messages.create(**kwargs)
+        raw = resp.content[0].text.strip()
+        result = _parse_json(raw)
+        usage = {"input_tokens": resp.usage.input_tokens, "output_tokens": resp.usage.output_tokens}
+        return result, usage
+    except json.JSONDecodeError:
+        logger.error(f"JSON parse failed: {raw[:300]}")
+        return {}, {}
+    except Exception as e:
+        logger.error(f"LLM call failed: {e}")
+        return {}, {}
 
-## 의심 지점 정보
-- 엔드포인트: {candidate_data.get('method', 'GET')} {candidate_data.get('endpoint', '/')}
-- 파라미터: {json.dumps(candidate_data.get('params', {}), ensure_ascii=False)}
-- 의심 유형: {candidate_data.get('vuln_type', 'unknown')}
-- 탐지 근거: {candidate_data.get('hypothesis', '')}
-- 추가 정보: {json.dumps(candidate_data.get('features', {}), ensure_ascii=False)}
 
-## 반환 형식 (JSON만 반환, 다른 텍스트 없이)
+def analyze_candidate(candidate_data: dict) -> dict:
+    prompt = f"""Review one candidate from an authorized internal web security lab.
+
+Request
+- endpoint: {candidate_data.get('method', 'GET')} {candidate_data.get('endpoint', '/')}
+- parameters: {_dump_json(candidate_data.get('params', {}))}
+- vulnerability_type: {candidate_data.get('vuln_type', 'unknown')}
+- hypothesis: {candidate_data.get('hypothesis', '')}
+- features: {_dump_json(candidate_data.get('features', {}))}
+
+Tasks
+1. Classify the likely sink and parsing context.
+2. Estimate whether the current evidence is strong, weak, or misleading.
+3. Suggest up to 4 non-destructive validation ideas.
+4. If the candidate is likely a false positive, prefer dismissal.
+5. If the evidence better matches a different family, mention that in reasoning.
+
+Return JSON only:
 {{
-    "risk_level": "high | medium | low | none",
-    "confidence": 0.0~1.0,
-    "analysis": "이 엔드포인트가 왜 위험한지 또는 안전한지 설명",
-    "suggested_payloads": ["검증용 페이로드1", "검증용 페이로드2"],
-    "next_action": "verify | dismiss | escalate",
-    "reasoning": "판단 근거"
+  "risk_level": "high|medium|low|none",
+  "confidence": 0.0,
+  "analysis": "short evidence-led analysis",
+  "suggested_payloads": ["idea 1", "idea 2"],
+  "next_action": "verify|dismiss|escalate",
+  "reasoning": "why this action is appropriate"
 }}"""
 
-    try:
-        response = c.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        raw = response.content[0].text.strip()
-
-        # JSON 파싱 (```json ... ``` 감싸져있을 수 있음)
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1]
-            raw = raw.rsplit("```", 1)[0]
-
-        result = json.loads(raw)
-
-        # 토큰 사용량 기록
-        result["_usage"] = {
-            "input_tokens": response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
-        }
-
-        logger.info(f"LLM 분석 완료: {candidate_data.get('endpoint')} → "
-                     f"risk={result.get('risk_level')}, action={result.get('next_action')}")
-
-        return result
-
-    except json.JSONDecodeError as e:
-        logger.error(f"LLM 응답 JSON 파싱 실패: {e}\nraw={raw}")
+    result, usage = _call_llm(prompt, system=ANALYZE_SYSTEM)
+    if not result:
         return {
             "risk_level": "unknown",
             "confidence": 0.0,
-            "analysis": f"JSON 파싱 실패: {raw[:200]}",
+            "analysis": "LLM analysis failed",
             "suggested_payloads": [],
             "next_action": "escalate",
+            "_usage": usage,
+            "_trace_prompt": prompt,
+            "_trace_response_preview": "LLM analysis failed",
         }
-    except Exception as e:
-        logger.error(f"LLM 호출 실패: {e}")
-        return {
-            "risk_level": "unknown",
-            "confidence": 0.0,
-            "analysis": f"API 호출 실패: {str(e)}",
-            "suggested_payloads": [],
-            "next_action": "escalate",
-        }
+    result["_usage"] = usage
+    result["_trace_prompt"] = prompt
+    result["_trace_response_preview"] = _dump_json({
+        key: value for key, value in result.items() if not str(key).startswith("_")
+    })
+    return result
 
 
-def batch_analyze_candidates(candidates_data, max_count=10):
-    """
-    여러 candidate를 분석한다.
-    비용 절감을 위해 max_count만큼만 처리 (priority 높은 순으로 이미 정렬되어 있다고 가정).
-
-    Args:
-        candidates_data: list of candidate dicts
-        max_count: 최대 분석 개수
-
-    Returns:
-        list of analysis results
-    """
+def batch_analyze_candidates(candidates_data: list, max_count: int = 10) -> list:
     results = []
     total_tokens = 0
-
     for i, cand in enumerate(candidates_data[:max_count]):
-        logger.info(f"[{i+1}/{min(len(candidates_data), max_count)}] "
-                     f"분석 중: {cand.get('method')} {cand.get('endpoint')}")
-
+        logger.info(f"[{i + 1}/{min(len(candidates_data), max_count)}] analyze {cand.get('method')} {cand.get('endpoint')}")
         result = analyze_candidate(cand)
         result["candidate_index"] = i
         result["endpoint"] = cand.get("endpoint")
         result["vuln_type"] = cand.get("vuln_type")
-
         usage = result.get("_usage", {})
         total_tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-
         results.append(result)
-
-    logger.info(f"배치 분석 완료: {len(results)}개, 총 토큰: {total_tokens}")
+    logger.info(f"Batch analysis complete: {len(results)} candidates, {total_tokens} tokens")
     return results
+
+
+def generate_initial_payloads(vuln_type: str, endpoint: str, method: str, params: dict, context: dict = None) -> dict:
+    prompt = f"""Plan the next validation payloads for one hypothesis in an authorized internal lab.
+
+Input
+- vulnerability_type: {vuln_type}
+- endpoint: {method} {endpoint}
+- parameters: {_dump_json(params)}
+- context: {_dump_json(context or {})}
+
+Global rules
+1. Generate the minimum set of high-signal, non-destructive payloads.
+2. Use at most 2 probe payloads, 2 confirm payloads, and 1 bounded follow-up payload.
+3. Each payload must use a technically distinct technique.
+4. Prefer context-aware payloads over naive signatures.
+5. Never suggest destructive changes, persistence, exfiltration, or external callbacks.
+6. If a blacklist or weak WAF is likely, prefer quote-less, attribute-aware, function-based, or encoding-aware alternatives.
+
+Type-specific guidance
+- SQLi: classify numeric vs string context first. For id-like numeric parameters behind a blacklist, first probes must stay within one scalar expression and avoid quotes, UNION, SELECT, semicolons, inline comments, OR, and AND. Strongly prefer quote-less CASE WHEN expressions, arithmetic rewrites, or bounded built-in function calls that can change rows, timing, or errors without changing state.
+- XSS: identify whether the reflection is in HTML text, HTML attribute, inline script string, URL, or template-like context. If obvious tags are likely blocked, consider bounded breakout probes that target the exact context without relying on the most common blocked signatures.
+- IDOR: prefer nearby identifiers or role-bounded object transitions. Avoid bulk enumeration.
+- SSRF: use only safe internal sinks allowed in the lab and keep the scope narrow.
+
+Return JSON only:
+{{
+  "strategy": "short attack strategy",
+  "target_params": ["param1", "param2"],
+  "stages": [
+    {{
+      "stage": "probe",
+      "payloads": [
+        {{
+          "param": "parameter name",
+          "value": "payload value",
+          "method": "GET|POST",
+          "description": "why this payload is useful",
+          "success_indicator": {{
+            "type": "body_contains|status_code|time_delay|body_diff|header_contains",
+            "value": "expected evidence"
+          }}
+        }}
+      ]
+    }},
+    {{
+      "stage": "confirm",
+      "payloads": []
+    }},
+    {{
+      "stage": "extract",
+      "payloads": []
+    }}
+  ]
+}}"""
+
+    result, usage = _call_llm(prompt, system=PAYLOAD_SYSTEM, max_tokens=2048)
+    if not result:
+        return {"strategy": "fallback", "target_params": list(params.keys())[:3], "stages": [], "_usage": usage}
+    result["_usage"] = usage
+    return result
+
+
+def analyze_response_and_decide(
+    vuln_type: str,
+    endpoint: str,
+    method: str,
+    payload_sent: dict,
+    response_data: dict,
+    attempt_history: list = None,
+) -> dict:
+    history_str = ""
+    if attempt_history:
+        history_lines = []
+        for h in attempt_history[-5:]:
+            history_lines.append(
+                f"- payload={str(h.get('payload', '?'))[:120]} "
+                f"status={h.get('status_code', '?')} indicator={h.get('indicator_matched', False)}"
+            )
+        history_str = "\n".join(history_lines)
+
+    prompt = f"""Analyze the latest validation response from an authorized internal lab and decide the next move.
+
+Hypothesis
+- vulnerability_type: {vuln_type}
+- endpoint: {method} {endpoint}
+
+Payload sent
+- param: {payload_sent.get('param', '?')}
+- value: {payload_sent.get('value', '?')}
+- description: {payload_sent.get('description', '?')}
+- success_indicator: {_dump_json(payload_sent.get('success_indicator', {}))}
+
+Observed response
+- status_code: {response_data.get('status_code', '?')}
+- elapsed_seconds: {response_data.get('elapsed', '?')}
+- content_length: {response_data.get('content_length', '?')}
+- headers: {_dump_json(response_data.get('headers', {}))}
+- body_excerpt:
+{response_data.get('body', '')[:1500]}
+
+Recent attempts
+{history_str or "- none"}
+
+Decision rules
+1. If the current evidence already proves the hypothesis, use confirm.
+2. If the current evidence strongly disproves the hypothesis, use abort.
+3. If the response better matches a different vulnerability family, explain that and prefer pivot or abort instead of repeating the same idea.
+4. Do not propose near-duplicate next payloads.
+5. Keep next_payloads bounded, non-destructive, and technically distinct.
+
+Return JSON only:
+{{
+  "vulnerable": true,
+  "confidence": 0.0,
+  "analysis": "what the response means",
+  "evidence_found": "specific evidence",
+  "next_action": "confirm|escalate|pivot|abort",
+  "next_payloads": [
+    {{
+      "param": "parameter name",
+      "value": "payload value",
+      "method": "GET|POST",
+      "description": "why this is the next step",
+      "success_indicator": {{
+        "type": "body_contains|status_code|time_delay|body_diff|header_contains",
+        "value": "expected evidence"
+      }}
+    }}
+  ],
+  "reasoning": "why this next action is best"
+}}"""
+
+    result, usage = _call_llm(prompt, system=RESPONSE_SYSTEM, max_tokens=2048)
+    if not result:
+        return {
+            "vulnerable": None,
+            "confidence": 0.0,
+            "analysis": "LLM response analysis failed",
+            "next_action": "abort",
+            "next_payloads": [],
+            "_usage": usage,
+        }
+    result["_usage"] = usage
+    return result
+
+
+def mutate_payload_for_bypass(original_payload: str, vuln_type: str, blocked_response: str) -> dict:
+    prompt = f"""A blacklist-based filter blocked a request in an authorized internal lab.
+
+Input
+- vulnerability_type: {vuln_type}
+- original_payload: {original_payload}
+- blocked_response_excerpt: {blocked_response[:500]}
+
+Task
+Generate 3 to 6 low-noise, non-destructive alternative payload variants that try a different encoding, parsing context, or syntax shape. Avoid trivial duplicates. Do not propose destructive or data-exfiltrating payloads.
+
+Return JSON only:
+{{
+  "mutations": [
+    {{
+      "value": "mutated payload",
+      "technique": "what changed",
+      "description": "why this variant may bypass a weak blacklist"
+    }}
+  ]
+}}"""
+
+    result, usage = _call_llm(prompt, system=WAF_SYSTEM, max_tokens=1024)
+    if not result:
+        return {"mutations": [], "_usage": usage}
+    result["_usage"] = usage
+    return result
+
+
+def make_final_verdict(vuln_type: str, endpoint: str, attempt_history: list) -> dict:
+    history_summary = []
+    for h in attempt_history:
+        history_summary.append(
+            {
+                "payload": str(h.get("payload", ""))[:200],
+                "status_code": h.get("status_code"),
+                "elapsed": h.get("elapsed"),
+                "indicator_matched": h.get("indicator_matched", False),
+                "llm_analysis": str(h.get("llm_analysis", ""))[:200],
+            }
+        )
+
+    prompt = f"""Produce a final evidence-led verdict for one authorized internal lab hypothesis.
+
+Input
+- vulnerability_type: {vuln_type}
+- endpoint: {endpoint}
+- attempts:
+{_dump_json(history_summary)}
+
+Return JSON only:
+{{
+  "verdict": "confirmed|likely|unlikely|not_vulnerable",
+  "confidence": 0.0,
+  "severity": "critical|high|medium|low|info",
+  "summary": "short final summary",
+  "reproduction_steps": "brief reproduction notes if confirmed",
+  "evidence_summary": "most important evidence"
+}}"""
+
+    result, usage = _call_llm(prompt, system=VERDICT_SYSTEM, max_tokens=1024)
+    if not result:
+        return {
+            "verdict": "unlikely",
+            "confidence": 0.0,
+            "severity": "info",
+            "summary": "LLM verdict failed",
+            "_usage": usage,
+        }
+    result["_usage"] = usage
+    return result

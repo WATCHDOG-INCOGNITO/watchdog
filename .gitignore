@@ -22,3 +22,45 @@ media/
 
 # Logs
 *.log
+
+# 민감 파일
+.env
+*.json.key
+# 모든 secret 한 폴더에 모음 — 디렉터리 자체만 유지
+secrets/*
+!secrets/.gitkeep
+!secrets/README.md
+# (legacy) 이전 위치 — 이미 secrets/ 로 이동
+gcp-key1.json
+voyage_api.key
+
+frontend/node_modules/
+
+# Temporary exploit/trace/debug scripts (root-level)
+_*.py
+_*.php
+
+# Watchdog CLI helper
+# watchdog_cli.py  # now tracked — core interface for external AI agents
+
+# Cursor IDE (track rules for agent workflow, ignore the rest)
+.cursor/*
+!.cursor/rules/
+
+# CTF 문제 디렉터리 (별도 repo로 clone, 크기 큼 + .git submodule)
+codegate2023-fin/
+codegate2024-final/
+codegate2025-final/
+codegate2026-pre/
+
+# CTF eval — exploit 스크립트 / 대회 문제별 진행 파일 (저작권 보호)
+agent/eval/_*
+agent/eval/PROGRESS.md
+agent/eval/HANDOFF.md
+agent/eval/targets.yaml
+agent/eval/history.jsonl
+
+# Playwright storage_state profiles (SSO 쿠키 — 절대 커밋 금지)
+# tools/browser_profile_login.py login 으로 생성
+profiles/*
+!profiles/.gitkeep

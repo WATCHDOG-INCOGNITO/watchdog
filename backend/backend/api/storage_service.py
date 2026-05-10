@@ -12,10 +12,8 @@ from .models import Candidate, Finding, EvidenceBlob, FindingEvidenceLink
 
 logger = logging.getLogger(__name__)
 
-
 class StorageError(Exception):
     pass
-
 
 def confirm_candidate(cand_id, severity=None, title=None, summary=None,
                       reproduction_steps=None, confidence=None, evidence_list=None):
@@ -79,6 +77,51 @@ def confirm_candidate(cand_id, severity=None, title=None, summary=None,
         candidate.status = "confirmed"
         candidate.save(update_fields=["status"])
 
+        # 2b. Discovery node 연동: 연결된 노드가 있으면 confirmed로 승격.
+        # features.discovery_node_id 가 없으면 endpoint+vuln_type 매칭으로 fallback —
+        # create_candidate_manual 이 link 안 했던 candidate 도 자동으로 노드 상태 회복.
+        from api.models import DiscoveryNode, EndpointSpec
+        from urllib.parse import urlparse as _urlparse
+        disc_node_id = (candidate.features or {}).get("discovery_node_id")
+        if disc_node_id:
+            DiscoveryNode.objects.filter(node_id=disc_node_id).update(status="confirmed")
+        else:
+            ep = (candidate.request.endpoint if candidate.request else
+                  (candidate.features or {}).get("endpoint", "")) or ""
+            ep_norm = ep.split("?", 1)[0].rstrip("/") or "/"
+            qs = (
+                DiscoveryNode.objects
+                .filter(scan_run=candidate.scan_run, node_type="vuln")
+                .filter(endpoint__in=[ep, ep_norm, ep_norm + "/"])
+                .exclude(status="confirmed")
+            )
+            picked = qs.filter(vuln_type=candidate.vuln_type).order_by("-created_at").first()
+            picked = picked or qs.order_by("-created_at").first()
+            if picked:
+                DiscoveryNode.objects.filter(node_id=picked.node_id).update(status="confirmed")
+
+        # 2c. EndpointSpec 안전망 — 확정된 vuln_type 을 그 endpoint 의 명세에
+        # 자동 추가 (다음 scan 의 RouteMap/EntryPoint 가 즉시 활용).
+        # host 표기는 netloc 사용 (port 포함) — tools_learn._host_of 와 일관.
+        try:
+            target_url = candidate.scan_run.target_url or ""
+            parsed = _urlparse(target_url)
+            host = (parsed.netloc or parsed.hostname or "").lower()
+            ep = (candidate.request.endpoint if candidate.request else "") or ""
+            method = (candidate.request.method if candidate.request else "GET") or "GET"
+            if host and ep:
+                spec, _ = EndpointSpec.objects.get_or_create(
+                    target_host=host, method=method, endpoint=ep,
+                    defaults={"suspected_vuln_types": [candidate.vuln_type]},
+                )
+                cur = list(spec.suspected_vuln_types or [])
+                if candidate.vuln_type and candidate.vuln_type not in cur:
+                    cur.append(candidate.vuln_type)
+                    spec.suspected_vuln_types = sorted(cur)
+                    spec.save(update_fields=["suspected_vuln_types"])
+        except Exception as e:
+            logger.warning(f"EndpointSpec auto-update failed: {e}")
+
         # 3. Evidence 생성 + 링크
         created_evidence = []
         if evidence_list:
@@ -117,7 +160,6 @@ def confirm_candidate(cand_id, severity=None, title=None, summary=None,
         "evidence": created_evidence,
     }
 
-
 def dismiss_candidate(cand_id, reason="false_positive"):
     """
     candidate를 오탐/폐기 처리한다.
@@ -140,9 +182,33 @@ def dismiss_candidate(cand_id, reason="false_positive"):
     candidate.status = reason
     candidate.save(update_fields=["status"])
 
+    # 안전망 — 연결된 vuln 노드를 dead_end 로 자동 전이 (LLM 의 mark_dead_end 누락 보완).
+    # discovery_node_id 또는 endpoint+vuln_type fallback.
+    from api.models import DiscoveryNode
+    from django.utils import timezone
+    disc_node_id = (candidate.features or {}).get("discovery_node_id")
+    target_node = None
+    if disc_node_id:
+        target_node = DiscoveryNode.objects.filter(node_id=disc_node_id).first()
+    if not target_node:
+        ep = ((candidate.features or {}).get("endpoint") or "")
+        ep_norm = ep.split("?", 1)[0].rstrip("/") or "/"
+        if ep:
+            qs = (
+                DiscoveryNode.objects
+                .filter(scan_run=candidate.scan_run, node_type="vuln")
+                .filter(endpoint__in=[ep, ep_norm, ep_norm + "/"])
+                .exclude(status__in=["confirmed", "dead_end"])
+            )
+            target_node = (qs.filter(vuln_type=candidate.vuln_type).order_by("-created_at").first()
+                           or qs.order_by("-created_at").first())
+    if target_node:
+        DiscoveryNode.objects.filter(node_id=target_node.node_id).update(
+            status="dead_end", explored_at=timezone.now(),
+        )
+
     logger.info(f"Candidate {cand_id} dismissed ({reason})")
     return {"candidate_id": str(cand_id), "status": reason}
-
 
 def attach_evidence(finding_id, evidence_data):
     """
@@ -187,7 +253,6 @@ def attach_evidence(finding_id, evidence_data):
     logger.info(f"Finding {finding_id}: {len(created)} evidence 추가")
     return {"finding_id": str(finding_id), "evidence_added": created}
 
-
 def get_finding_detail(finding_id):
     """finding + 전체 evidence를 한 번에 조회"""
     try:
@@ -226,7 +291,6 @@ def get_finding_detail(finding_id):
         "evidence": evidence,
     }
 
-
 def get_scan_findings_summary(run_id):
     """스캔 전체 결과 요약 (P5 리포트용)"""
     findings = Finding.objects.filter(scan_run_id=run_id).select_related("candidate")
@@ -261,14 +325,11 @@ def get_scan_findings_summary(run_id):
 
     return summary
 
-
-# ==========================================================
 # 내부 유틸
-# ==========================================================
 
 def _estimate_severity(vuln_type, priority_score):
     """vuln_type + priority_score로 severity 추정"""
-    high_severity_types = {"sqli", "ssrf", "upload", "rce", "deserialization"}
+    high_severity_types = {"sqli", "ssrf", "file_upload", "rce", "deserialization"}
     medium_severity_types = {"xss", "idor", "csrf"}
 
     if vuln_type in high_severity_types:
@@ -283,3 +344,32 @@ def _estimate_severity(vuln_type, priority_score):
         if priority_score >= 0.5:
             return "medium"
         return "low"
+
+
+
+# ── GCS 증거 업로드 ──
+
+def upload_evidence_to_gcs(blob: "EvidenceBlob", content_bytes: bytes) -> str:
+    """EvidenceBlob의 content를 GCS에 업로드하고 storage_ref를 반환한다."""
+    from django.conf import settings
+    bucket_name = getattr(settings, "GCS_BUCKET_NAME", "")
+    if not bucket_name:
+        return "local://auto"
+
+    try:
+        from google.cloud import storage as gcs_storage
+        client = gcs_storage.Client()
+        bucket = client.bucket(bucket_name)
+        gcs_path = f"evidence/{blob.finding_id}/{blob.blob_id}/{blob.kind}"
+        gcs_blob = bucket.blob(gcs_path)
+        gcs_blob.upload_from_string(content_bytes, content_type="application/json")
+        ref = f"gs://{bucket_name}/{gcs_path}"
+        blob.storage_ref = ref
+        blob.save(update_fields=["storage_ref"])
+        return ref
+    except ImportError:
+        return "local://auto"
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"GCS upload failed: {e}")
+        return "local://auto"

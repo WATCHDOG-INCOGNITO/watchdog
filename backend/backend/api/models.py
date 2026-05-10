@@ -1,10 +1,22 @@
 import uuid
 from django.db import models
 
+try:
+    from pgvector.django import VectorField
+    _PGVECTOR_AVAILABLE = True
+except ImportError:  # pgvector 미설치 환경 (로컬 lint 등)
+    _PGVECTOR_AVAILABLE = False
 
-# ==========================================================
+    class VectorField(models.JSONField):  # type: ignore[no-redef]
+        """pgvector 미설치 시 fallback. 실제 Docker 런타임에는 pgvector 사용."""
+
+        def __init__(self, *args, dimensions: int = 1024, **kwargs):
+            self.dimensions = dimensions
+            kwargs.setdefault("null", True)
+            kwargs.setdefault("blank", True)
+            super().__init__(*args, **kwargs)
+
 # Scan 관련
-# ==========================================================
 
 class ScanRun(models.Model):
     class Status(models.TextChoices):
@@ -12,16 +24,19 @@ class ScanRun(models.Model):
         RUNNING = "running"
         FINISHED = "finished"
         FAILED = "failed"
+        STOPPED = "stopped"
 
     class Mode(models.TextChoices):
         HYBRID_MAX = "hybrid-max"
         HYBRID_LITE = "hybrid-lite"
+        DISCOVERY = "discovery"
 
     run_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     target_url = models.TextField()
-    mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.HYBRID_LITE)
+    mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.DISCOVERY)
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.QUEUED)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
     finished_at = models.DateTimeField(null=True, blank=True)
 
     request_budget_total = models.IntegerField(default=10)
@@ -37,6 +52,40 @@ class ScanRun(models.Model):
         db_table = "scan_runs"
         ordering = ["-created_at"]
 
+    def save(self, *args, **kwargs):
+        update_fields = kwargs.get("update_fields")
+        if update_fields is not None:
+            fields = set(update_fields)
+            fields.add("updated_at")
+            kwargs["update_fields"] = list(fields)
+        super().save(*args, **kwargs)
+
+
+class LLMTrace(models.Model):
+    trace_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="llm_traces")
+    call_index = models.IntegerField(default=0)
+    stage = models.CharField(max_length=32, default="analysis")
+    model = models.CharField(max_length=64, blank=True, default="")
+    prompt_preview = models.TextField(blank=True, default="")
+    response_preview = models.TextField(blank=True, default="")
+    tool_calls = models.JSONField(default=list, blank=True)
+    stop_reason = models.CharField(max_length=64, blank=True, default="")
+    input_tokens = models.IntegerField(default=0)
+    output_tokens = models.IntegerField(default=0)
+    metadata = models.JSONField(default=dict, blank=True)
+    error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    target_node = models.ForeignKey(
+        "DiscoveryNode",
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="traces",
+    )
+
+    class Meta:
+        db_table = "llm_traces"
+        ordering = ["-call_index", "-created_at"]
 
 class RequestCatalog(models.Model):
     req_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -56,7 +105,6 @@ class RequestCatalog(models.Model):
 
     class Meta:
         db_table = "request_catalog"
-
 
 class Candidate(models.Model):
     class DetectionStage(models.TextChoices):
@@ -87,7 +135,6 @@ class Candidate(models.Model):
         db_table = "candidates"
         ordering = ["-priority_score"]
 
-
 class Finding(models.Model):
     class Severity(models.TextChoices):
         INFO = "info"
@@ -111,7 +158,6 @@ class Finding(models.Model):
     class Meta:
         db_table = "findings"
 
-
 class EvidenceBlob(models.Model):
     blob_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     finding = models.ForeignKey(Finding, on_delete=models.CASCADE, null=True, blank=True, related_name="evidence_items")
@@ -126,7 +172,6 @@ class EvidenceBlob(models.Model):
     class Meta:
         db_table = "evidence_blobs"
 
-
 class FindingEvidenceLink(models.Model):
     link_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     finding = models.ForeignKey(Finding, on_delete=models.CASCADE, related_name="evidence_links")
@@ -137,10 +182,7 @@ class FindingEvidenceLink(models.Model):
     class Meta:
         db_table = "finding_evidence_links"
 
-
-# ==========================================================
 # 다중 에이전트 / 검증 루프 / 가설
-# ==========================================================
 
 class AgentTask(models.Model):
     class AgentType(models.TextChoices):
@@ -173,7 +215,6 @@ class AgentTask(models.Model):
         db_table = "agent_tasks"
         ordering = ["-created_at"]
 
-
 class VerificationLoop(models.Model):
     class NextAction(models.TextChoices):
         RETRY = "retry"
@@ -195,7 +236,6 @@ class VerificationLoop(models.Model):
         db_table = "verification_loops"
         ordering = ["candidate", "attempt_number"]
 
-
 class Hypothesis(models.Model):
     class Result(models.TextChoices):
         PENDING = "pending"
@@ -215,7 +255,6 @@ class Hypothesis(models.Model):
     class Meta:
         db_table = "hypotheses"
 
-
 class VisualAnalysis(models.Model):
     analysis_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="visual_analyses")
@@ -228,7 +267,6 @@ class VisualAnalysis(models.Model):
 
     class Meta:
         db_table = "visual_analysis"
-
 
 class IDORTestSession(models.Model):
     class Verdict(models.TextChoices):
@@ -249,8 +287,6 @@ class IDORTestSession(models.Model):
 
     class Meta:
         db_table = "idor_test_sessions"
-
-
 class WAFBypassAttempt(models.Model):
     class MutationType(models.TextChoices):
         ORIGINAL = "original"
@@ -272,10 +308,7 @@ class WAFBypassAttempt(models.Model):
     class Meta:
         db_table = "waf_bypass_attempts"
 
-
-# ==========================================================
 # Knowledge DB (3종 자산)
-# ==========================================================
 
 class VulnerabilityEntry(models.Model):
     vuln_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -301,7 +334,6 @@ class VulnerabilityEntry(models.Model):
     class Meta:
         db_table = "vulnerability_entries"
 
-
 class PayloadPattern(models.Model):
     class SafetyLevel(models.TextChoices):
         SAFE = "safe"
@@ -312,6 +344,8 @@ class PayloadPattern(models.Model):
     vulnerability = models.ForeignKey(VulnerabilityEntry, on_delete=models.SET_NULL, null=True, blank=True, related_name="patterns")
     name = models.CharField(max_length=256)
     vuln_type = models.CharField(max_length=64)
+    sub_technique = models.CharField(max_length=128, null=True, blank=True)
+
     category = models.CharField(max_length=64, default="detection")
 
     request_template = models.TextField(null=True, blank=True)
@@ -336,6 +370,19 @@ class PayloadPattern(models.Model):
     source = models.CharField(max_length=64, null=True, blank=True)
     tags = models.JSONField(null=True, blank=True)
 
+    embedding = VectorField(dimensions=768, null=True, blank=True)
+    embedding_model = models.CharField(max_length=64, null=True, blank=True)
+
+    # Living KB — host-specific learned 패턴
+    # NULL이면 일반 patterns(seed 또는 generic mutation), 값이 있으면 그 host에서 통한 패턴
+    target_host = models.CharField(max_length=255, null=True, blank=True, db_index=True)
+    # 학습 메타: 사용된 endpoint, oracle 결과, 응답 fingerprint 등
+    attack_metadata = models.JSONField(null=True, blank=True)
+
+    # SimHash dedup (XBOW pattern) — request_template 또는 attack_metadata.payload 의 64-bit fingerprint.
+    # 같은 본질의 변종 페이로드를 100번 시도하는 낭비를 줄인다. NULL = 미계산(legacy).
+    simhash = models.BigIntegerField(null=True, blank=True, db_index=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -346,10 +393,173 @@ class PayloadPattern(models.Model):
     def success_rate(self):
         return self.times_succeeded / self.times_used if self.times_used else 0.0
 
+
+class TargetProfile(models.Model):
+    """Living KB — host별 누적 지식.
+    같은 host 재스캔 시 Planner가 즉시 활용. CWE/OWASP commodity가 아닌
+    이 host에 대한 사적 메모(framework, server, WAF, 통한 우회, 막힌 경로).
+    """
+    profile_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    host = models.CharField(max_length=255, unique=True, db_index=True)
+    framework = models.CharField(max_length=128, null=True, blank=True)
+    server = models.CharField(max_length=128, null=True, blank=True)
+    waf = models.CharField(max_length=128, null=True, blank=True)
+    fingerprint = models.JSONField(null=True, blank=True)  # response headers, tech detection 등
+    notes = models.TextField(null=True, blank=True)        # 자유 메모
+
+    # 통한 패턴/체인 카운트
+    confirmed_findings_count = models.IntegerField(default=0)
+    learned_patterns_count = models.IntegerField(default=0)
+    dead_ends_count = models.IntegerField(default=0)
+
+    last_scan_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "target_profiles"
+
+
+class OOBHit(models.Model):
+    """Out-of-band callback 수신 기록 — XSS bot, SSRF, RCE 등이 우리 서버를 hit 하면 저장.
+
+    공격 페이로드가 외부 callback URL로 사용할 수 있게 backend에 `/oob/<token>/...` view 노출.
+    공격이 admin bot 등을 통해 우리 endpoint를 hit하면 method/headers/query/body 전부 저장.
+    Verifier 등이 oob_get_hits(token) 으로 폴링.
+    """
+    hit_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    token = models.CharField(max_length=128, db_index=True)
+    method = models.CharField(max_length=16)
+    path = models.TextField()
+    query_string = models.TextField(null=True, blank=True)
+    headers = models.JSONField(null=True, blank=True)
+    body = models.TextField(null=True, blank=True)
+    remote_addr = models.CharField(max_length=64, null=True, blank=True)
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "oob_hits"
+        ordering = ["-received_at"]
+
+
+class DeadEnd(models.Model):
+    """Negative knowledge — 이 host/endpoint/vuln_type 조합에 시도했으나 실패한 패턴.
+    다음 스캔에서 같은 시도 회피해 cost/turn 절약.
+    """
+    dead_end_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    target_host = models.CharField(max_length=255, db_index=True)
+    endpoint = models.TextField()
+    vuln_type = models.CharField(max_length=64)
+    pattern_id = models.UUIDField(null=True, blank=True)  # PayloadPattern.pattern_id (옵션)
+    payload_used = models.TextField(null=True, blank=True)
+    reason = models.TextField(null=True, blank=True)  # "oracle returned false", "no diff" 등
+    times_seen = models.IntegerField(default=1)
+    # SimHash dedup — payload_used 의 64-bit fingerprint. 새 시도가 본질적으로 같은지 즉시 비교.
+    simhash = models.BigIntegerField(null=True, blank=True, db_index=True)
+    last_seen_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "dead_ends"
+        unique_together = [("target_host", "endpoint", "vuln_type", "pattern_id")]
     @property
     def fp_rate(self):
         return self.false_positive_count / self.times_used if self.times_used else 0.0
 
+
+class EndpointSpec(models.Model):
+    """API endpoint 명세 KB — host 별 endpoint 메타데이터 누적.
+
+    PayloadPattern (technique/learned/cve) 가 *어떻게 공격할지* 라면, 이건
+    *어디를 공격할지* 의 누적. 같은 host 재방문 시 RouteMap 이 정찰을
+    skip 하고 바로 EntryPoint 단계로 진입 가능.
+
+    Resume + EndpointSpec 활용 흐름:
+      1. 첫 scan: EntryPoint 가 endpoint 분석 → record_endpoint_spec 호출
+      2. 다음 scan: RouteMap 이 recall_target(host) → endpoint specs 받음 →
+         재정찰 skip + EntryPoint 노드로 바로 시드
+      3. 변화 감지: 같은 host 같은 endpoint 인데 response_shape 달라지면
+         "변경됨" 표시 → 재분석 트리거
+    """
+    spec_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    target_host = models.CharField(max_length=255, db_index=True)
+    method = models.CharField(max_length=8)
+    endpoint = models.TextField()
+    # endpoint param 명세 — JSON Schema-lite. 예: {"q": {"type":"str","in":"query","required":true}}
+    params_schema = models.JSONField(null=True, blank=True)
+    headers_required = models.JSONField(null=True, blank=True)  # ["Authorization", "X-CSRF"]
+    auth_required = models.BooleanField(default=False)
+    # 응답 구조: {"status_codes":[200,401], "content_types":["application/json"], "fields":["id","email"]}
+    response_shape = models.JSONField(null=True, blank=True)
+    # EntryPoint sub-agent 가 분석한 의심 vuln_type — KB의 "이 endpoint는 이 공격 받을 가능성"
+    suspected_vuln_types = models.JSONField(null=True, blank=True)  # ["sqli", "xss"]
+    # 코드/응답에서 식별한 sink hint
+    sink_hints = models.JSONField(null=True, blank=True)  # ["db_query", "render_html", "include"]
+    notes = models.TextField(null=True, blank=True)
+    times_seen = models.IntegerField(default=1)
+    last_seen_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    embedding = VectorField(dimensions=768, null=True, blank=True)
+    embedding_model = models.CharField(max_length=64, null=True, blank=True)
+
+    class Meta:
+        db_table = "endpoint_specs"
+        unique_together = [("target_host", "method", "endpoint")]
+        indexes = [
+            models.Index(fields=["target_host", "last_seen_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.method} {self.endpoint} @ {self.target_host}"
+
+
+# Discovery Queue — 단서 축적형 탐색 트리
+
+class DiscoveryNode(models.Model):
+    """탐색 중 발견한 단서 하나. parent를 따라가면 exploit chain이 자동 재구성된다.
+
+    Queue = DiscoveryNode.objects.filter(status="pending").order_by("-depth", "created_at")
+    """
+
+    class NodeType(models.TextChoices):
+        TARGET = "target"
+        ENDPOINT = "endpoint"
+        VULN = "vuln"
+        CLUE = "clue"
+        EXPLOIT_STEP = "exploit_step"
+        FLAG = "flag"
+        DEAD_END = "dead_end"
+
+    class Status(models.TextChoices):
+        PENDING = "pending"
+        EXPLORING = "exploring"
+        EXPLORED = "explored"
+        DEAD_END = "dead_end"
+        CONFIRMED = "confirmed"
+
+    node_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="discoveries")
+    parent = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.CASCADE, related_name="children",
+    )
+    depth = models.IntegerField(default=0)
+
+    node_type = models.CharField(max_length=32, choices=NodeType.choices)
+    endpoint = models.CharField(max_length=512, null=True, blank=True)
+    vuln_type = models.CharField(max_length=64, null=True, blank=True)
+    summary = models.TextField()
+    context = models.JSONField(default=dict, blank=True)
+
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    worker_id = models.CharField(max_length=64, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    explored_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "discovery_nodes"
+        indexes = [
+            models.Index(fields=["scan_run", "status", "-depth", "created_at"]),
+        ]
 
 class ReportArchive(models.Model):
     class ValidationStatus(models.TextChoices):
@@ -393,3 +603,20 @@ class ReportArchive(models.Model):
     class Meta:
         db_table = "report_archives"
         unique_together = [("source", "source_id")]
+
+# Report (P5)
+
+class RunReport(models.Model):
+    """Stored, reproducible report artifacts for a ScanRun (P5)."""
+
+    report_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan_run = models.OneToOneField(ScanRun, on_delete=models.CASCADE, related_name="report")
+
+    markdown = models.TextField()
+    json = models.TextField()
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "run_reports"

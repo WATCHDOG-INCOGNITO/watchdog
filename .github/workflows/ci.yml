@@ -34,7 +34,8 @@ jobs:
         run: docker build -t local/backend:ci -f backend/backend/Dockerfile backend/backend
 
       - name: Trivy image scan (fail on HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@0.24.0
+        # The legacy 0.24.0 tag was removed; pin the restored v0.24.0 release immutably.
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8
         with:
           image-ref: local/backend:ci
           severity: HIGH,CRITICAL
@@ -56,6 +57,10 @@ jobs:
         run: |
           docker compose -f docker/docker-compose.e2e.yml up -d --build
           python3 docker/e2e/smoke.py --base-url http://localhost:8000 --target-url http://test-target:8080 --timeout 60
+
+      - name: E2E Logs
+        if: failure()
+        run: docker compose -f docker/docker-compose.e2e.yml logs --no-color --tail=200
 
       - name: E2E Teardown
         if: always()

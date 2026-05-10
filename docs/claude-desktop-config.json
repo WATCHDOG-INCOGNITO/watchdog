@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "watchdog": {
+      "url": "http://localhost:8889/sse"
+    }
+  }
+}
