@@ -32,7 +32,7 @@ A Model Context Protocol (MCP) server exposing 28+ tools for HTTP requests, KB s
 ---
 
 ## Architecture
-
+```
 ┌─────────────────────────────────────────────────┐
 │                   Frontend (React)              │
 │         Canvas Graph · Detail Panel · Live WS   │
