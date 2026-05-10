@@ -1,6 +1,6 @@
 # Watchdog
 
-**AI-powered autonomous penetration testing agent** that discovers, chains, and exploits vulnerabilities — just like a human red-teamer, but at machine speed.
+**AI-powered autonomous penetration testing agent** that discovers, chains, and exploits vulnerabilities — just like a human red-teamer but at machine speed.
 
 Watchdog combines a multi-agent LLM architecture with a structured Knowledge Base, a living memory system, and a visual Discovery Tree to autonomously perform deep, multi-step exploit chains against web applications.
 
