@@ -2,9 +2,10 @@ anthropic==0.52.0
 asgiref==3.11.1
 beautifulsoup4==4.12.3
 channels[daphne]==4.2.0
-Django==6.0.2
+Django==6.0.5
 django-cors-headers==4.6.0
 djangorestframework==3.16.1
+Twisted==26.4.0rc2
 mcp[cli]>=1.0.0
 playwright==1.49.1
 psycopg2-binary==2.9.9
