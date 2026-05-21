@@ -58,9 +58,11 @@ warnings 로 누적되어 보고서에 노출.
 git commit / PR / 리모트 산출물에 `Co-Authored-By`, `generated-by`, AI 관련
 crediting 일체 금지. 사용자 본인(ialleejy) 명의만.
 
-### Claude API only
-OpenAI / Gemini 등 다른 vendor 안 씀. 4주차 LiteLLM N-version 포기,
-critic agent 단일로 대체. Claude family (Sonnet/Haiku/Opus) 내 voting 은 미결.
+### LLM provider bridge
+Claude remains the default provider, but the runtime can now accept
+provider-qualified model configs such as `anthropic:<model>` and
+`openai:<model>`. Keep Claude behavior as the compatibility baseline when
+adding Codex/OpenAI roles.
 
 ## 작업 시 자주 쓰는 경로
 

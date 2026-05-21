@@ -67,6 +67,7 @@ A Model Context Protocol (MCP) server exposing 28+ tools for HTTP requests, KB s
 ### Prerequisites
 - Docker & Docker Compose
 - (Optional) `ANTHROPIC_API_KEY` for autonomous agent mode
+- (Optional) `OPENAI_API_KEY` for OpenAI/Codex-compatible provider experiments
 
 ### Run
 
@@ -105,6 +106,10 @@ curl -X POST http://localhost:8000/api/scan-runs/ \
 - `Balanced`: Uses Sonnet for most discovery and verification steps, with lighter models for support roles.
 - `High Performance`: Uses stronger models for complex hypotheses, exploit execution, and confirmation.
 - `Advanced Settings`: You can customize the model for each discovery role individually.
+
+Role models can also be configured as provider-qualified strings such as
+`anthropic:claude-sonnet-4-20250514` or `openai:<model-id>`, or as objects like
+`{"provider":"anthropic","model":"claude-sonnet-4-20250514"}`.
 
 
 ## Knowledge Base

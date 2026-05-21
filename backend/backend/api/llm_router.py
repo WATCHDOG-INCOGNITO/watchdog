@@ -3,12 +3,17 @@ import os
 import json
 import logging
 
-from anthropic import Anthropic
+from .llm_provider import (
+    DEFAULT_MODEL,
+    DEFAULT_PROVIDER,
+    call_text_llm,
+    resolve_model_spec,
+)
 
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-client = None
+LLM_SCREEN_MODEL = os.environ.get("WATCHDOG_LLM_SCREEN_MODEL", DEFAULT_MODEL)
+LLM_SCREEN_PROVIDER = os.environ.get("WATCHDOG_LLM_SCREEN_PROVIDER", DEFAULT_PROVIDER)
 
 ANALYZE_SYSTEM = (
     "You are a senior web application security analyst working only in an "
@@ -42,14 +47,6 @@ VERDICT_SYSTEM = (
     "overstating confidence."
 )
 
-
-def get_client():
-    global client
-    if client is None:
-        client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    return client
-
-
 def _parse_json(raw: str) -> dict:
     raw = raw.strip()
     if raw.startswith("```"):
@@ -62,22 +59,22 @@ def _dump_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2)
 
 
-def _call_llm(prompt: str, system: str = "", max_tokens: int = 1024) -> tuple[dict, dict]:
-    c = get_client()
-    kwargs = {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    if system:
-        kwargs["system"] = system
-
+def _call_llm(prompt: str, system: str = "", max_tokens: int = 1024, model_spec=None) -> tuple[dict, dict]:
     raw = ""
     try:
-        resp = c.messages.create(**kwargs)
-        raw = resp.content[0].text.strip()
+        spec = model_spec or resolve_model_spec(
+            LLM_SCREEN_MODEL,
+            default_model=LLM_SCREEN_MODEL,
+            default_provider=LLM_SCREEN_PROVIDER,
+        )
+        raw, usage = call_text_llm(
+            spec=spec,
+            prompt=prompt,
+            system=system,
+            max_tokens=max_tokens,
+        )
+        raw = raw.strip()
         result = _parse_json(raw)
-        usage = {"input_tokens": resp.usage.input_tokens, "output_tokens": resp.usage.output_tokens}
         return result, usage
     except json.JSONDecodeError:
         logger.error(f"JSON parse failed: {raw[:300]}")
@@ -87,7 +84,7 @@ def _call_llm(prompt: str, system: str = "", max_tokens: int = 1024) -> tuple[di
         return {}, {}
 
 
-def analyze_candidate(candidate_data: dict) -> dict:
+def analyze_candidate(candidate_data: dict, model_spec=None) -> dict:
     prompt = f"""Review one candidate from an authorized internal web security lab.
 
 Request
@@ -114,7 +111,7 @@ Return JSON only:
   "reasoning": "why this action is appropriate"
 }}"""
 
-    result, usage = _call_llm(prompt, system=ANALYZE_SYSTEM)
+    result, usage = _call_llm(prompt, system=ANALYZE_SYSTEM, model_spec=model_spec)
     if not result:
         return {
             "risk_level": "unknown",
@@ -134,12 +131,12 @@ Return JSON only:
     return result
 
 
-def batch_analyze_candidates(candidates_data: list, max_count: int = 10) -> list:
+def batch_analyze_candidates(candidates_data: list, max_count: int = 10, model_spec=None) -> list:
     results = []
     total_tokens = 0
     for i, cand in enumerate(candidates_data[:max_count]):
         logger.info(f"[{i + 1}/{min(len(candidates_data), max_count)}] analyze {cand.get('method')} {cand.get('endpoint')}")
-        result = analyze_candidate(cand)
+        result = analyze_candidate(cand, model_spec=model_spec)
         result["candidate_index"] = i
         result["endpoint"] = cand.get("endpoint")
         result["vuln_type"] = cand.get("vuln_type")

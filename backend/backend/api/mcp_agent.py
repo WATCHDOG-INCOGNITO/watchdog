@@ -19,7 +19,6 @@ from urllib.parse import urlparse
 
 from asgiref.sync import sync_to_async
 from django.utils import timezone
-from anthropic import Anthropic
 
 # 프로젝트의 /app/mcp/ 폴더가 pip의 mcp SDK를 가리므로
 # sys.path에서 /app을 임시 제거하고 import한다.
@@ -41,6 +40,13 @@ for _p in _app_paths:
 
 from .error_utils import summarize_exception  # noqa: E402
 from .guardrail_enforcer import guardrail_decision as shared_guardrail_decision  # noqa: E402
+from .llm_provider import (  # noqa: E402
+    DEFAULT_PROVIDER,
+    LLMProviderError,
+    call_llm,
+    estimate_cost_usd,
+    resolve_model_spec,
+)
 from .llm_trace_store import (  # noqa: E402
     build_prompt_preview,
     build_response_preview,
@@ -112,6 +118,7 @@ SWARM_QUIESCENCE_S = int(os.environ.get("WATCHDOG_SWARM_QUIESCENCE_S", "30"))
 SWARM_MAX_HYPOTHESES = int(os.environ.get("WATCHDOG_SWARM_MAX_HYPOTHESES", "20"))
 MAX_PLAN_ITERATIONS = 2  # planner→executor→verifier 사이클 반복 횟수 (replan 포함)
 MODEL = os.environ.get("WATCHDOG_AGENT_MODEL", "claude-sonnet-4-20250514")
+MODEL_PROVIDER = os.environ.get("WATCHDOG_LLM_PROVIDER", DEFAULT_PROVIDER)
 AGENT_MODE_DEFAULT = os.environ.get("WATCHDOG_AGENT_MODE", "multi").lower()
 
 ROLE_MODEL_ENV = {
@@ -147,8 +154,8 @@ def _normalize_model_role(role: str) -> str:
     return ROLE_MODEL_ALIASES.get(base, base) or "single"
 
 
-def _model_for_role(scan_run: ScanRun | None, role: str) -> str:
-    """Resolve model precedence: scan config -> role env -> global env -> code default."""
+def _configured_model_for_role(scan_run: ScanRun | None, role: str):
+    """Resolve raw model config precedence: scan config -> role env -> global env."""
     role_key = _normalize_model_role(role)
     try:
         cfg = scan_run.config or {} if scan_run is not None else {}
@@ -164,6 +171,8 @@ def _model_for_role(scan_run: ScanRun | None, role: str) -> str:
         ]
         for key in candidates:
             value = configured.get(key)
+            if isinstance(value, dict):
+                return value
             if isinstance(value, str) and value.strip():
                 return value.strip()
 
@@ -173,6 +182,25 @@ def _model_for_role(scan_run: ScanRun | None, role: str) -> str:
         if value:
             return value
     return MODEL
+
+
+def _model_spec_for_role(scan_run: ScanRun | None, role: str):
+    """Resolve provider/model for a role while preserving legacy model strings."""
+    raw = _configured_model_for_role(scan_run, role)
+    try:
+        cfg = scan_run.config or {} if scan_run is not None else {}
+    except Exception:
+        cfg = {}
+    default_provider = cfg.get("provider") if isinstance(cfg, dict) else None
+    return resolve_model_spec(
+        raw,
+        default_model=MODEL,
+        default_provider=default_provider or MODEL_PROVIDER,
+    )
+
+
+def _model_for_role(scan_run: ScanRun | None, role: str) -> str:
+    return _model_spec_for_role(scan_run, role).model
 
 
 def _int_from_config(
@@ -188,10 +216,6 @@ def _int_from_config(
     except (TypeError, ValueError):
         value = default
     return max(min_value, min(max_value, value))
-
-# Sonnet 4 pricing: input $3/MTok, output $15/MTok
-INPUT_COST_PER_TOKEN = Decimal("0.000003")
-OUTPUT_COST_PER_TOKEN = Decimal("0.000015")
 
 SYSTEM_PROMPT = """\
 당신은 웹 애플리케이션 보안 스캐너 에이전트입니다.
@@ -723,14 +747,17 @@ class _Accumulator:
         self.input_tokens = 0
         self.output_tokens = 0
         self.calls = 0
+        self.cost_usd = Decimal("0")
 
 
-def _call_llm_with_retry(anthropic, scan_run, **kwargs):
+def _call_llm_with_retry(scan_run, model_spec, **kwargs):
     response = None
     for retry in range(3):
         try:
-            response = anthropic.messages.create(**kwargs)
+            response = call_llm(model_spec, **kwargs)
             return response
+        except LLMProviderError:
+            raise
         except Exception as api_err:
             msg = str(api_err).lower()
             if any(x in msg for x in ("rate_limit", "429", "529", "overloaded")):
@@ -1760,9 +1787,8 @@ async def _run_role_phase(
             "cache_control": {"type": "ephemeral"},
         }]
         call_messages = _compact_messages_for_call(messages, role)
-        selected_model = _model_for_role(scan_run, role)
+        selected_spec = _model_spec_for_role(scan_run, role)
         call_kwargs = dict(
-            model=selected_model,
             max_tokens=ROLE_OUTPUT_TOKEN_BUDGET.get(role, 4096),
             system=cached_system,
             messages=call_messages,
@@ -1788,17 +1814,19 @@ async def _run_role_phase(
                 }
             call_kwargs["tools"] = cached_tools
 
-        response = _call_llm_with_retry(anthropic, scan_run, **call_kwargs)
+        response = _call_llm_with_retry(scan_run, selected_spec, **call_kwargs)
 
         acc.input_tokens += response.usage.input_tokens
         acc.output_tokens += response.usage.output_tokens
+        acc.cost_usd += estimate_cost_usd(
+            selected_spec,
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+        )
         acc.calls += 1
         scan_run.llm_calls_count = acc.calls
         scan_run.llm_tokens_used = acc.input_tokens + acc.output_tokens
-        scan_run.llm_cost_usd = (
-            Decimal(str(acc.input_tokens)) * INPUT_COST_PER_TOKEN
-            + Decimal(str(acc.output_tokens)) * OUTPUT_COST_PER_TOKEN
-        )
+        scan_run.llm_cost_usd = acc.cost_usd
         await sync_to_async(scan_run.save)(update_fields=[
             "llm_calls_count", "llm_tokens_used", "llm_cost_usd",
         ])
@@ -1840,7 +1868,7 @@ async def _run_role_phase(
                 scan_run=scan_run,
                 call_index=acc.calls,
                 stage=f"multi:{role}",
-                model=selected_model,
+                model=selected_spec.trace_label,
                 prompt_preview=prompt_preview,
                 response_preview=response_preview,
                 tool_calls=tool_calls,
@@ -1863,7 +1891,7 @@ async def _run_role_phase(
                 scan_run=scan_run,
                 call_index=acc.calls,
                 stage=f"multi:{role}",
-                model=selected_model,
+                model=selected_spec.trace_label,
                 prompt_preview=prompt_preview,
                 response_preview=response_preview,
                 tool_calls=tool_calls,
@@ -1889,7 +1917,7 @@ async def _run_role_phase(
             scan_run=scan_run,
             call_index=acc.calls,
             stage=f"multi:{role}",
-            model=selected_model,
+            model=selected_spec.trace_label,
             prompt_preview=prompt_preview,
             response_preview=response_preview,
             tool_calls=tool_calls,
@@ -4431,7 +4459,7 @@ async def _run_discovery_loop(
 
 async def _connect_mcp_and_run(scan_run: ScanRun, mode: str):
     """MCP 서버 연결 후 mode에 따라 single/multi/swarm/discovery loop를 실행."""
-    anthropic = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    llm_client = None
 
     # `-m watchdog_mcp.server` 로 띄워야 server.py 의 relative import (`from .tools_*`)
     # 가 정상 동작한다. 파일 경로 직접 전달은 패키지 컨텍스트가 없어서 실패.
@@ -4495,14 +4523,14 @@ async def _connect_mcp_and_run(scan_run: ScanRun, mode: str):
         )
 
         if mode == "discovery":
-            await _run_discovery_loop(scan_run, anthropic, anthropic_tools, tool_router)
+            await _run_discovery_loop(scan_run, llm_client, anthropic_tools, tool_router)
         elif mode == "swarm":
-            await _run_swarm(scan_run, anthropic, anthropic_tools, tool_router)
+            await _run_swarm(scan_run, llm_client, anthropic_tools, tool_router)
         elif mode == "multi":
-            await _run_multi_agent_loop(scan_run, anthropic, anthropic_tools, tool_router)
+            await _run_multi_agent_loop(scan_run, llm_client, anthropic_tools, tool_router)
         else:
             await _run_single_agent_loop(
-                scan_run, anthropic, anthropic_tools, tool_router
+                scan_run, llm_client, anthropic_tools, tool_router
             )
 
 
@@ -4516,6 +4544,7 @@ async def _run_single_agent_loop(
     total_input_tokens = 0
     total_output_tokens = 0
     total_calls = 0
+    total_cost_usd = Decimal("0")
 
     messages = [{
         "role": "user",
@@ -4529,22 +4558,24 @@ async def _run_single_agent_loop(
     for turn in range(MAX_TURNS):
         raise_if_stop_requested(scan_run)
         logger.info(f"[{scan_run.run_id}] single turn {turn + 1}/{MAX_TURNS}")
-        selected_model = _model_for_role(scan_run, "single")
+        selected_spec = _model_spec_for_role(scan_run, "single")
         response = _call_llm_with_retry(
-            anthropic, scan_run,
-            model=selected_model, max_tokens=4096,
+            scan_run, selected_spec,
+            max_tokens=4096,
             system=_compose_system_prompt(scan_run, SYSTEM_PROMPT), tools=anthropic_tools, messages=messages,
         )
 
         total_input_tokens += response.usage.input_tokens
         total_output_tokens += response.usage.output_tokens
+        total_cost_usd += estimate_cost_usd(
+            selected_spec,
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+        )
         total_calls += 1
         scan_run.llm_calls_count = total_calls
         scan_run.llm_tokens_used = total_input_tokens + total_output_tokens
-        scan_run.llm_cost_usd = (
-            Decimal(str(total_input_tokens)) * INPUT_COST_PER_TOKEN
-            + Decimal(str(total_output_tokens)) * OUTPUT_COST_PER_TOKEN
-        )
+        scan_run.llm_cost_usd = total_cost_usd
         await sync_to_async(scan_run.save)(update_fields=[
             "llm_calls_count", "llm_tokens_used", "llm_cost_usd",
         ])
