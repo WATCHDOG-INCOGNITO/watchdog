@@ -39,6 +39,7 @@ for _p in _app_paths:
         sys.path.append(_p)
 
 from .error_utils import summarize_exception  # noqa: E402
+from .discovery_queue import build_queue_metadata  # noqa: E402
 from .guardrail_enforcer import guardrail_decision as shared_guardrail_decision  # noqa: E402
 from .llm_provider import (  # noqa: E402
     DEFAULT_PROVIDER,
@@ -1544,6 +1545,11 @@ def _auto_push_discovered_links(
             continue
 
         try:
+            ctx = {
+                "discovered_from": source_ep,
+                "source": "auto_link_extraction",
+                "http_tool": tool_name,
+            }
             DiscoveryNode.objects.create(
                 scan_run_id=scan_run_id,
                 parent=parent_node,
@@ -1552,12 +1558,14 @@ def _auto_push_discovered_links(
                 endpoint=ep_norm,
                 vuln_type="",
                 summary=f"Auto-discovered via {source_ep}",
-                context={
-                    "discovered_from": source_ep,
-                    "source": "auto_link_extraction",
-                    "http_tool": tool_name,
-                },
+                context=ctx,
                 status="pending",
+                **build_queue_metadata(
+                    node_type="endpoint",
+                    context=ctx,
+                    depth=parent_depth + 1,
+                    parent_status=parent_node.status if parent_node else "",
+                ),
             )
             pushed += 1
         except Exception:
@@ -1584,6 +1592,11 @@ def _auto_push_discovered_links(
             continue
 
         try:
+            ctx = {
+                "source": "auto_hash_route_extraction",
+                "http_tool": tool_name,
+                "needs_browser": True,
+            }
             DiscoveryNode.objects.create(
                 scan_run_id=scan_run_id,
                 parent=parent_node,
@@ -1592,12 +1605,14 @@ def _auto_push_discovered_links(
                 endpoint=route_norm,
                 vuln_type="",
                 summary=f"SPA hash route — browser_navigate to discover APIs",
-                context={
-                    "source": "auto_hash_route_extraction",
-                    "http_tool": tool_name,
-                    "needs_browser": True,
-                },
+                context=ctx,
                 status="pending",
+                **build_queue_metadata(
+                    node_type="clue",
+                    context=ctx,
+                    depth=parent_depth + 1,
+                    parent_status=parent_node.status if parent_node else "",
+                ),
             )
             pushed += 1
         except Exception:
@@ -4074,6 +4089,13 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
         # endpoint 는 normalize 된 값으로 저장 — push_discovery 의 dedup 과
         # 일관. prev.endpoint 가 full URL 이어도 path 만 남김.
         stored_ep = norm_ep or (prev.endpoint or "")
+        queue_meta = build_queue_metadata(
+            node_type=prev.node_type,
+            vuln_type=prev.vuln_type or "",
+            context=merged_ctx,
+            depth=new_depth,
+            parent_status=new_parent.status if new_parent else "",
+        )
         new_node = DiscoveryNode.objects.create(
             scan_run=scan_run,
             parent=new_parent,
@@ -4085,6 +4107,7 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
             context=merged_ctx,
             status=new_status,
             explored_at=explored_at,
+            **queue_meta,
         )
         id_map[prev.node_id] = new_node
         _seeded_key_to_node[seed_key] = new_node
@@ -4277,6 +4300,7 @@ async def _run_discovery_loop(
         summary=f"Root target: {scan_run.target_url}",
         context=root_context,
         status="pending",
+        **build_queue_metadata(node_type="target", context=root_context, depth=0),
     )
 
     # Store root_node_id in config so _auto_push_discovered_links can access it

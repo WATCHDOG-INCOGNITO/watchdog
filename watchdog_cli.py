@@ -44,6 +44,7 @@ from api.storage_service import (
 )
 from api.services import analyze_params, analyze_path, calculate_priority
 from api.llm_trace_store import record_llm_trace as _record_llm_trace
+from api.discovery_queue import build_queue_metadata, node_queue_summary
 from api.mcp_agent import (
     _gather_previous_knowledge,
     _seed_from_previous,
@@ -62,6 +63,7 @@ import re
 import statistics
 import requests as req_lib
 import time
+from datetime import timedelta
 
 
 def _json_out(obj):
@@ -299,6 +301,7 @@ def cmd_push_discovery(p):
                 "node_id": str(existing.node_id),
                 "depth": existing.depth,
                 "node_type": existing.node_type,
+                **node_queue_summary(existing),
                 "deduped": True,
                 "context_merged": bool(ctx),
                 "deduped_reason": "same scan+endpoint+vuln_type+node_type already exists",
@@ -308,6 +311,14 @@ def cmd_push_discovery(p):
     store_ep = raw_ep or (parent.endpoint if parent else "")
     if store_ep:
         store_ep = _normalize_ep(store_ep, target_url)
+
+    queue_meta = build_queue_metadata(
+        node_type=ntype,
+        vuln_type=vuln_type,
+        context=ctx,
+        depth=depth,
+        parent_status=parent.status if parent else "",
+    )
 
     node = DiscoveryNode.objects.create(
         scan_run_id=scan_run_id,
@@ -319,17 +330,17 @@ def cmd_push_discovery(p):
         summary=p.get("summary", ""),
         context=ctx,
         status=p.get("status", "pending"),
+        **queue_meta,
     )
 
-    result = {"node_id": str(node.node_id), "depth": depth}
+    result = {"node_id": str(node.node_id), "depth": depth, **node_queue_summary(node)}
 
     if ntype in ("vuln", "exploit_step", "clue"):
-        score = {"vuln": 0.7, "exploit_step": 0.85, "clue": 0.5}.get(ntype, 0.5)
         cand = Candidate.objects.create(
             scan_run_id=scan_run_id,
             vuln_type=vuln_type or "signal_stub",
             hypothesis=p.get("summary", ""),
-            priority_score=score,
+            priority_score=node.priority_score or 0.5,
             detection_stage="llm_deep",
             status="open",
             features={
@@ -337,6 +348,8 @@ def cmd_push_discovery(p):
                 "node_type": ntype,
                 "endpoint": store_ep,
                 "depth": depth,
+                "queue_lane": node.queue_lane,
+                "provider_hint": node.provider_hint,
             },
         )
         result["cand_id"] = str(cand.cand_id)
@@ -384,7 +397,9 @@ def cmd_mark_dead_end(p):
 
     node.status = "dead_end"
     node.explored_at = timezone.now()
-    node.save(update_fields=["status", "explored_at"])
+    node.lease_owner = None
+    node.leased_until = None
+    node.save(update_fields=["status", "explored_at", "lease_owner", "leased_until"])
     _json_out({"node_id": str(node.node_id), "status": "dead_end"})
 
 
@@ -408,8 +423,19 @@ def cmd_update_node_status(p):
     fields = ["status"]
     if new_status == "exploring":
         node.explored_at = timezone.now()
-        fields.append("explored_at")
+        if p.get("worker_id"):
+            node.worker_id = p.get("worker_id")
+            fields.append("worker_id")
+        node.lease_owner = p.get("worker_id") or node.worker_id
+        lease_seconds = int(os.environ.get("WATCHDOG_DISCOVERY_STALE_S", "300"))
+        node.leased_until = timezone.now() + timedelta(seconds=lease_seconds)
+        fields.extend(["explored_at", "lease_owner", "leased_until"])
+    elif new_status in {"explored", "dead_end", "confirmed"}:
+        node.lease_owner = None
+        node.leased_until = None
+        fields.extend(["lease_owner", "leased_until"])
     node.save(update_fields=fields)
+
     _json_out({
         "node_id": str(node.node_id),
         "old_status": old_status,
@@ -531,6 +557,7 @@ def cmd_create_scan(p):
 
 def cmd_create_root(p):
     run = ScanRun.objects.get(run_id=p["scan_run_id"])
+    ctx = {"target_url": p["target_url"]}
     node = DiscoveryNode.objects.create(
         scan_run=run,
         parent=None,
@@ -538,8 +565,9 @@ def cmd_create_root(p):
         node_type="target",
         endpoint=p["target_url"],
         summary=f"Root target: {p['target_url']}",
-        context={"target_url": p["target_url"]},
+        context=ctx,
         status="pending",
+        **build_queue_metadata(node_type="target", context=ctx, depth=0),
     )
 
     cfg = dict(run.config or {})
@@ -716,7 +744,7 @@ def _embed_patterns(patterns):
 def cmd_list_nodes(p):
     nodes = DiscoveryNode.objects.filter(
         scan_run_id=p["scan_run_id"]
-    ).order_by("depth", "created_at")
+    ).order_by("-priority_score", "-depth", "created_at")
     items = []
     for n in nodes:
         items.append({
@@ -724,6 +752,10 @@ def cmd_list_nodes(p):
             "depth": n.depth,
             "type": n.node_type,
             "status": n.status,
+            "lane": n.queue_lane,
+            "priority_score": n.priority_score,
+            "provider_hint": n.provider_hint,
+            "attempt_count": n.attempt_count,
             "parent": str(n.parent_id)[:8] if n.parent_id else "root",
             "summary": n.summary[:80],
         })
@@ -1255,8 +1287,63 @@ _REQUIRED_ACTIONS = {
 }
 
 
+def _mission_packet(sr, node, actions=None, slot_hints=None):
+    actions = actions or _REQUIRED_ACTIONS.get(node.node_type, {})
+    packet = {
+        "scan_run_id": str(sr.run_id),
+        "target_url": sr.target_url,
+        "node_id": str(node.node_id),
+        "node_type": node.node_type,
+        "endpoint": node.endpoint or "",
+        "vuln_type": node.vuln_type or "",
+        "summary": node.summary,
+        "queue": node_queue_summary(node),
+        "required_init": actions.get("init", []),
+        "required_work": actions.get("work", []),
+        "required_finalize": actions.get("finalize", []),
+    }
+    if slot_hints:
+        packet["slot_hints"] = slot_hints
+    return packet
+
+
+def _candidate_packet(sr, node, rank, vuln_slot_hints=None):
+    parent_status = ""
+    if node.parent_id:
+        par = DiscoveryNode.objects.filter(node_id=node.parent_id).only("status").first()
+        parent_status = par.status if par else ""
+    reasons = [
+        f"priority rank {rank}",
+        f"score={node.priority_score:.4f}",
+        f"{node.node_type} @ depth={node.depth}",
+    ]
+    if parent_status == "dead_end":
+        reasons.append("parent is dead_end; lower value unless new angle exists")
+    elif parent_status == "confirmed":
+        reasons.append("parent confirmed; chain continuation is valuable")
+
+    cand = {
+        "rank": rank,
+        "node_id": str(node.node_id),
+        "node_type": node.node_type,
+        "depth": node.depth,
+        "summary": (node.summary or "")[:160],
+        "endpoint": node.endpoint or "",
+        "parent_id": str(node.parent_id)[:8] if node.parent_id else None,
+        "parent_status": parent_status,
+        "reason": " · ".join(reasons),
+        **node_queue_summary(node),
+    }
+    if vuln_slot_hints and node.endpoint and node.node_type in ("endpoint", "vuln", "exploit_step"):
+        try:
+            cand["slot_hints"] = vuln_slot_hints(sr, node.endpoint)
+        except Exception:
+            pass
+    return cand
+
+
 def cmd_scan_next(p):
-    """BFS loop driver: pick next pending node, show required actions."""
+    """Priority frontier driver: show the best pending nodes and required actions."""
     sr = ScanRun.objects.get(run_id=p["scan_run_id"])
 
     # Check if any node is currently "exploring" (in-progress)
@@ -1270,6 +1357,8 @@ def cmd_scan_next(p):
             "node_type": exploring.node_type,
             "depth": exploring.depth,
             "summary": exploring.summary,
+            **node_queue_summary(exploring),
+            "mission_packet": _mission_packet(sr, exploring, actions),
             "required_work": actions.get("work", []),
             "required_finalize": actions.get("finalize", []),
         })
@@ -1280,7 +1369,7 @@ def cmd_scan_next(p):
     # 판단하면 그쪽으로 가도 OK. 강제는 안전망에만.
     pending_qs = DiscoveryNode.objects.filter(
         scan_run=sr, status="pending"
-    ).order_by("depth", "created_at")
+    ).order_by("-priority_score", "-depth", "created_at")
     pending_list = list(pending_qs[:8])
     pending = pending_list[0] if pending_list else None
 
@@ -1359,8 +1448,17 @@ def cmd_scan_next(p):
                 pass
         candidates.append(cand)
 
+    candidates = [
+        _candidate_packet(sr, n, idx, _vuln_slot_hints)
+        for idx, n in enumerate(pending_list)
+    ]
+
     _json_out({
         "action": "EXPLORE",
+        "scheduler_message": (
+            f"{len(candidates)} candidates; rank 0 is the priority-frontier recommendation. "
+            "Pick another only when chain context is clearly more valuable."
+        ),
         "message": (
             f"{len(candidates)}개 후보 — 0번이 BFS 추천. 다른 후보가 더 가치 있다고 "
             f"판단하면 자유롭게 그것을 선택. 선택 후 update_node_status(exploring) 먼저."
@@ -1373,6 +1471,14 @@ def cmd_scan_next(p):
         "depth": pending.depth,
         "summary": pending.summary,
         "parent_id": str(pending.parent_id)[:8] if pending.parent_id else None,
+        "scheduler": "priority_frontier",
+        **node_queue_summary(pending),
+        "mission_packet": _mission_packet(
+            sr,
+            pending,
+            actions,
+            candidates[0].get("slot_hints") if candidates else None,
+        ),
         "pending_siblings": siblings - 1,
         "step_1_init": actions.get("init", []),
         "step_2_work": actions.get("work", []),
@@ -1383,6 +1489,56 @@ def cmd_scan_next(p):
             "anything in existing_vuln_types_here; avoid prior_dead_end_vuln_types unless "
             "you have a new payload angle."
         ),
+    })
+
+
+def cmd_lease_node(p):
+    """Atomically lease one DiscoveryNode for a subscription/API worker."""
+    sr = ScanRun.objects.get(run_id=p["scan_run_id"])
+    worker_kind = (p.get("worker_kind") or p.get("provider") or "external").strip().lower()
+    worker_id = p.get("worker_id") or f"{worker_kind}-{os.getpid()}"
+
+    node = pick_next_node(str(sr.run_id), worker_id)
+    if node is None:
+        pending = DiscoveryNode.objects.filter(scan_run=sr, status="pending").count()
+        exploring = DiscoveryNode.objects.filter(scan_run=sr, status="exploring").count()
+        action = "WAIT" if pending or exploring else "COMPLETE"
+        _json_out({
+            "action": action,
+            "scan_run_id": str(sr.run_id),
+            "target_url": sr.target_url,
+            "pending": pending,
+            "exploring": exploring,
+            "message": "No node leased. Wait for active leases or run scan_selfcheck/complete_scan.",
+        })
+        return
+
+    actions = _REQUIRED_ACTIONS.get(node.node_type, {})
+    slot_hints = None
+    try:
+        from watchdog_mcp.tools_discovery import _vuln_slot_hints
+        if node.endpoint and node.node_type in ("endpoint", "vuln", "exploit_step"):
+            slot_hints = _vuln_slot_hints(sr, node.endpoint)
+    except Exception:
+        slot_hints = None
+
+    mission = _mission_packet(sr, node, actions, slot_hints)
+    mission["worker_kind"] = worker_kind
+    mission["worker_id"] = worker_id
+    mission["finalize_contract"] = [
+        "record_trace with a non-empty tool_calls array",
+        "update_node_status to explored, confirmed, or dead_end",
+        "store_secret immediately for reusable secrets",
+    ]
+
+    _json_out({
+        "action": "LEASED",
+        "worker_id": worker_id,
+        "leased_node": str(node.node_id),
+        "lease_owner": node.lease_owner,
+        "leased_until": node.leased_until,
+        **node_queue_summary(node),
+        "mission_packet": mission,
     })
 
 
@@ -1636,6 +1792,7 @@ TOOLS = {
     "export_learned":         cmd_export_learned,
     # Orchestration
     "scan_next":              cmd_scan_next,
+    "lease_node":             cmd_lease_node,
     "validate_node":          cmd_validate_node,
     "scan_selfcheck":         cmd_scan_selfcheck,
 }
@@ -1649,7 +1806,7 @@ def cmd_list_tools(_):
 
 
 _TRACE_SKIP_TOOLS = frozenset({
-    "record_trace", "scan_next", "scan_selfcheck", "list_tools",
+    "record_trace", "scan_next", "lease_node", "scan_selfcheck", "list_tools",
     "export_learned", "validate_node",
 })
 

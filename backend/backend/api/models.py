@@ -552,6 +552,15 @@ class DiscoveryNode(models.Model):
 
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
     worker_id = models.CharField(max_length=64, null=True, blank=True)
+    queue_lane = models.CharField(max_length=32, default="hypothesis", blank=True)
+    priority_score = models.FloatField(default=0.0)
+    score_breakdown = models.JSONField(default=dict, blank=True)
+    lease_owner = models.CharField(max_length=128, null=True, blank=True)
+    leased_until = models.DateTimeField(null=True, blank=True)
+    attempt_count = models.IntegerField(default=0)
+    blocked_by = models.JSONField(default=list, blank=True)
+    provider_hint = models.CharField(max_length=32, default="", blank=True)
+    mission = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     explored_at = models.DateTimeField(null=True, blank=True)
 
@@ -559,6 +568,8 @@ class DiscoveryNode(models.Model):
         db_table = "discovery_nodes"
         indexes = [
             models.Index(fields=["scan_run", "status", "-depth", "created_at"]),
+            models.Index(fields=["scan_run", "status", "-priority_score", "-depth", "created_at"]),
+            models.Index(fields=["scan_run", "queue_lane", "status", "-priority_score"]),
         ]
 
 class ReportArchive(models.Model):

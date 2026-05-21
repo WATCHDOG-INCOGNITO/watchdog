@@ -56,7 +56,7 @@ A Model Context Protocol (MCP) server exposing 28+ tools for HTTP requests, KB s
 | **Frontend** | React 18, Canvas API | Discovery Tree graph, live dashboard |
 | **Backend** | Django 5, DRF, Channels | REST API, WebSocket, scan orchestration |
 | **Database** | PostgreSQL 16 + pgvector | Models, embeddings, full-text search |
-| **Agent** | Anthropic Claude API | Multi-agent LLM swarm (Planner → Explorer → Executor) |
+| **Agent** | Anthropic/OpenAI APIs, Claude/Codex CLI workers | Multi-agent LLM swarm (Planner → Explorer → Executor) |
 | **MCP** | SSE transport | Tool server for agent ↔ backend communication |
 | **Infra** | Docker Compose | One-command local deployment |
 
@@ -110,6 +110,9 @@ curl -X POST http://localhost:8000/api/scan-runs/ \
 Role models can also be configured as provider-qualified strings such as
 `anthropic:claude-sonnet-4-20250514` or `openai:<model-id>`, or as objects like
 `{"provider":"anthropic","model":"claude-sonnet-4-20250514"}`.
+
+Subscription-based Claude Code and Codex sessions can also join a scan as
+external workers through `lease_node`. See [subscription workers](docs/subscription-workers.md).
 
 
 ## Knowledge Base
