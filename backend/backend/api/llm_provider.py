@@ -8,7 +8,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROVIDER = os.environ.get("WATCHDOG_LLM_PROVIDER", "anthropic").strip() or "anthropic"
-DEFAULT_MODEL = os.environ.get("WATCHDOG_AGENT_MODEL", "claude-sonnet-4-20250514").strip()
+DEFAULT_MODEL = os.environ.get("WATCHDOG_AGENT_MODEL", "claude-opus-4-7").strip()
 
 PROVIDER_ENV_KEYS = {
     "anthropic": "ANTHROPIC_API_KEY",

@@ -4,6 +4,7 @@ param(
 
     [int]$Iterations = 1,
     [string]$WorkerId = "",
+    [string]$CodexModel = "gpt-5.5",
     [string]$CodexCommand = "codex",
     [string]$BackendContainer = "watchdog-backend-1"
 )
@@ -67,5 +68,10 @@ queue scoring improvements, and report-quality evidence. Do not add yourself as 
 git contributor or co-author.
 "@
 
-    & $CodexCommand exec $prompt
+    & $CodexCommand exec `
+        -m $CodexModel `
+        --sandbox danger-full-access `
+        --dangerously-bypass-approvals-and-sandbox `
+        -C (Get-Location).Path `
+        $prompt
 }

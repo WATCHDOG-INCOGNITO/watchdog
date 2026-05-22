@@ -82,14 +82,18 @@ a Codex claim becomes Claude recheck work.
 Codex worker:
 
 ```powershell
-.\tools\run_codex_worker.ps1 -ScanRunId <RUN_ID> -Iterations 1
+.\tools\run_codex_worker.ps1 -ScanRunId <RUN_ID> -Iterations 1 -CodexModel gpt-5.5
 ```
 
 Claude worker:
 
 ```powershell
-.\tools\run_claude_worker.ps1 -ScanRunId <RUN_ID> -Iterations 1
+.\tools\run_claude_worker.ps1 -ScanRunId <RUN_ID> -Iterations 1 -ClaudeModel claude-opus-4-7
 ```
+
+These high-performance defaults are intentionally expensive: Codex uses
+`gpt-5.5`, and Claude uses `claude-opus-4-7` with maximum effort. Override the
+model parameters only when a lower-cost or compatibility run is needed.
 
 Recommended role split:
 

@@ -119,7 +119,7 @@ SWARM_VERIFIER_COUNT = int(os.environ.get("WATCHDOG_SWARM_VERIFIERS", "2"))
 SWARM_QUIESCENCE_S = int(os.environ.get("WATCHDOG_SWARM_QUIESCENCE_S", "30"))
 SWARM_MAX_HYPOTHESES = int(os.environ.get("WATCHDOG_SWARM_MAX_HYPOTHESES", "20"))
 MAX_PLAN_ITERATIONS = 2  # planner→executor→verifier 사이클 반복 횟수 (replan 포함)
-MODEL = os.environ.get("WATCHDOG_AGENT_MODEL", "claude-sonnet-4-20250514")
+MODEL = os.environ.get("WATCHDOG_AGENT_MODEL", "claude-opus-4-7")
 MODEL_PROVIDER = os.environ.get("WATCHDOG_LLM_PROVIDER", DEFAULT_PROVIDER)
 AGENT_MODE_DEFAULT = os.environ.get("WATCHDOG_AGENT_MODE", "multi").lower()
 

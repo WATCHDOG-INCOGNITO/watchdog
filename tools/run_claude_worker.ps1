@@ -4,6 +4,7 @@ param(
 
     [int]$Iterations = 1,
     [string]$WorkerId = "",
+    [string]$ClaudeModel = "claude-opus-4-7",
     [string]$ClaudeCommand = "claude",
     [string]$BackendContainer = "watchdog-backend-1"
 )
@@ -67,5 +68,11 @@ multi-step chain reasoning, and concise handoff notes. Stay inside the target
 scope described in the mission.
 "@
 
-    & $ClaudeCommand --permission-mode bypassPermissions --dangerously-skip-permissions --add-dir (Get-Location).Path -p $prompt
+    & $ClaudeCommand `
+        --model $ClaudeModel `
+        --effort max `
+        --permission-mode bypassPermissions `
+        --dangerously-skip-permissions `
+        --add-dir (Get-Location).Path `
+        -p $prompt
 }
