@@ -60,6 +60,11 @@ from api.agent_exchange import (
     exchange_summary,
     summarize_work_exchanges,
 )
+from api.strategy import (
+    build_strategy_snapshot,
+    latest_strategy_snapshot,
+    list_evidence_graph,
+)
 from api.mcp_agent import (
     _gather_previous_knowledge,
     _seed_from_previous,
@@ -1259,6 +1264,49 @@ def cmd_export_learned(p):
 
 
 # ═══════════════════════════════════════════════════════
+# Strategy Brain
+# ═══════════════════════════════════════════════════════
+
+def cmd_build_evidence_graph(p):
+    """Build a normalized Evidence Graph and strategy snapshot for a scan."""
+    _json_out(build_strategy_snapshot(
+        scan_run_id=p["scan_run_id"],
+        reset=_parse_bool(p.get("reset"), True),
+    ))
+
+
+def cmd_compose_chains(p):
+    """Compose and score chain candidates from the Evidence Graph."""
+    _json_out(build_strategy_snapshot(
+        scan_run_id=p["scan_run_id"],
+        reset=_parse_bool(p.get("reset"), True),
+    ))
+
+
+def cmd_get_strategy_snapshot(p):
+    """Return the latest Top-3 chain strategy snapshot, rebuilding if asked."""
+    scan_run_id = p["scan_run_id"]
+    if _parse_bool(p.get("rebuild"), False):
+        _json_out(build_strategy_snapshot(
+            scan_run_id=scan_run_id,
+            reset=_parse_bool(p.get("reset"), True),
+        ))
+        return
+    snapshot = latest_strategy_snapshot(scan_run_id)
+    if snapshot is None and _parse_bool(p.get("build_if_missing"), True):
+        snapshot = build_strategy_snapshot(scan_run_id=scan_run_id, reset=True)
+    _json_out(snapshot or {"scan_run_id": scan_run_id, "snapshot": None})
+
+
+def cmd_list_evidence_graph(p):
+    """List Evidence Graph counts and representative nodes for a scan."""
+    _json_out(list_evidence_graph(
+        scan_run_id=p["scan_run_id"],
+        limit=int(p.get("limit", 20)),
+    ))
+
+
+# ═══════════════════════════════════════════════════════
 # Orchestration — BFS Loop Driver + Validator
 # ═══════════════════════════════════════════════════════
 
@@ -2177,6 +2225,11 @@ TOOLS = {
     "record_trace":           cmd_record_trace,
     # Export
     "export_learned":         cmd_export_learned,
+    # Strategy Brain
+    "build_evidence_graph":   cmd_build_evidence_graph,
+    "compose_chains":         cmd_compose_chains,
+    "get_strategy_snapshot":  cmd_get_strategy_snapshot,
+    "list_evidence_graph":    cmd_list_evidence_graph,
     # Orchestration
     "scan_next":              cmd_scan_next,
     "lease_node":             cmd_lease_node,
@@ -2205,7 +2258,8 @@ def cmd_list_tools(_):
 _TRACE_SKIP_TOOLS = frozenset({
     "record_trace", "scan_next", "lease_node", "lease_work", "list_work",
     "list_agent_exchanges", "scan_selfcheck", "list_tools", "export_learned",
-    "validate_node",
+    "validate_node", "build_evidence_graph", "compose_chains",
+    "get_strategy_snapshot", "list_evidence_graph",
 })
 
 

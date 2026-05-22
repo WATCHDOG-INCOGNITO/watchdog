@@ -56,6 +56,10 @@ CLI-only tools include:
 - `add_agent_exchange`
 - `list_agent_exchanges`
 - `resolve_agent_exchange`
+- `build_evidence_graph`
+- `compose_chains`
+- `get_strategy_snapshot`
+- `list_evidence_graph`
 - `validate_node`
 - `scan_selfcheck`
 
@@ -72,6 +76,11 @@ packet; the worker must record traces and call `complete_work` or `fail_work`
 before requesting another lease. Workers should use `add_agent_exchange` to
 leave claims, evidence, counterarguments, consensus, handoff notes, and recheck
 requests for the other provider. `lease_node` remains for compatibility.
+
+The strategy brain CLI tools are advisory in the current phase. They build an
+Evidence Graph, extract primitive capabilities, compose Top-3 chain candidates,
+and return queue-plan suggestions with `provider_hint`; they do not rewrite or
+cancel WorkItems yet.
 
 ## Operating Model
 

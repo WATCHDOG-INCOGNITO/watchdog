@@ -712,6 +712,171 @@ class AgentExchange(models.Model):
         ]
 
 
+class EvidenceNode(models.Model):
+    """Normalized strategic fact used by the global queue composer.
+
+    DiscoveryNode/Candidate/Finding/Trace remain the operational source of
+    truth. EvidenceNode is the read model that lets the strategy brain reason
+    over those artifacts without rewriting the Discovery Tree.
+    """
+
+    class Status(models.TextChoices):
+        OBSERVED = "observed"
+        CLAIMED = "claimed"
+        VERIFIED = "verified"
+        CONTRADICTED = "contradicted"
+        STALE = "stale"
+        DEAD_END = "dead_end"
+
+    evidence_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="evidence_nodes")
+    kind = models.CharField(max_length=64)
+    subtype = models.CharField(max_length=64, blank=True, default="")
+    semantic_key = models.CharField(max_length=512)
+    title = models.CharField(max_length=512, blank=True, default="")
+    summary = models.TextField(blank=True, default="")
+    value_json = models.JSONField(default=dict, blank=True)
+    scope_json = models.JSONField(default=dict, blank=True)
+    auth_scope = models.CharField(max_length=128, blank=True, default="")
+    confidence = models.FloatField(default=0.0)
+    freshness = models.FloatField(default=1.0)
+    status = models.CharField(max_length=32, choices=Status.choices, default=Status.OBSERVED)
+    source_worker = models.CharField(max_length=128, blank=True, default="")
+    provider = models.CharField(max_length=32, blank=True, default="")
+    semantic_hash = models.CharField(max_length=64, blank=True, default="")
+    first_seen_at = models.DateTimeField(auto_now_add=True)
+    last_seen_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "evidence_nodes"
+        unique_together = [("scan_run", "semantic_key")]
+        indexes = [
+            models.Index(fields=["scan_run", "kind", "subtype"], name="evidence_no_scan_r_14888c_idx"),
+            models.Index(fields=["scan_run", "status", "-confidence"], name="evidence_no_scan_r_404bfb_idx"),
+            models.Index(fields=["scan_run", "semantic_hash"], name="evidence_no_scan_r_cf235a_idx"),
+        ]
+
+
+class EvidenceEdge(models.Model):
+    edge_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="evidence_edges")
+    src = models.ForeignKey(EvidenceNode, on_delete=models.CASCADE, related_name="out_edges")
+    dst = models.ForeignKey(EvidenceNode, on_delete=models.CASCADE, related_name="in_edges")
+    edge_type = models.CharField(max_length=64)
+    weight = models.FloatField(default=1.0)
+    rationale = models.TextField(blank=True, default="")
+    created_by = models.CharField(max_length=64, blank=True, default="strategy")
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "evidence_edges"
+        unique_together = [("scan_run", "src", "dst", "edge_type")]
+        indexes = [
+            models.Index(fields=["scan_run", "edge_type"], name="evidence_ed_scan_r_dbb1a1_idx"),
+            models.Index(fields=["scan_run", "active"], name="evidence_ed_scan_r_7613d6_idx"),
+        ]
+
+
+class PrimitiveInstance(models.Model):
+    """Evidence-backed exploit capability extracted from the graph."""
+
+    class Status(models.TextChoices):
+        PROPOSED = "proposed"
+        VERIFIED = "verified"
+        CONTRADICTED = "contradicted"
+        STALE = "stale"
+
+    primitive_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="primitive_instances")
+    category = models.CharField(max_length=64)
+    name = models.CharField(max_length=256)
+    endpoint = models.TextField(blank=True, default="")
+    vuln_type = models.CharField(max_length=64, blank=True, default="")
+    semantic_key = models.CharField(max_length=512)
+    supporting_evidence_ids = models.JSONField(default=list, blank=True)
+    contradicting_evidence_ids = models.JSONField(default=list, blank=True)
+    preconditions_json = models.JSONField(default=list, blank=True)
+    effects_json = models.JSONField(default=list, blank=True)
+    auth_scope = models.CharField(max_length=128, blank=True, default="")
+    confidence = models.FloatField(default=0.0)
+    status = models.CharField(max_length=32, choices=Status.choices, default=Status.PROPOSED)
+    state_fingerprint = models.CharField(max_length=128, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "primitive_instances"
+        unique_together = [("scan_run", "semantic_key")]
+        indexes = [
+            models.Index(fields=["scan_run", "category", "-confidence"], name="primitive_i_scan_r_ee62db_idx"),
+            models.Index(fields=["scan_run", "status", "-confidence"], name="primitive_i_scan_r_70d37c_idx"),
+        ]
+
+
+class ChainCandidate(models.Model):
+    """A composed attack path candidate over one or more primitives."""
+
+    class Status(models.TextChoices):
+        PROPOSED = "proposed"
+        NEEDS_EVIDENCE = "needs_evidence"
+        NEEDS_RECHECK = "needs_recheck"
+        VERIFIED = "verified"
+        REJECTED = "rejected"
+        STALE = "stale"
+
+    chain_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="chain_candidates")
+    name = models.CharField(max_length=256)
+    goal_type = models.CharField(max_length=64)
+    semantic_key = models.CharField(max_length=512)
+    chain_graph_json = models.JSONField(default=dict, blank=True)
+    linearization_json = models.JSONField(default=list, blank=True)
+    supporting_evidence_ids = models.JSONField(default=list, blank=True)
+    primitive_ids = models.JSONField(default=list, blank=True)
+    confidence_score = models.FloatField(default=0.0)
+    impact_score = models.FloatField(default=0.0)
+    execution_score = models.FloatField(default=0.0)
+    total_score = models.FloatField(default=0.0)
+    novelty_score = models.FloatField(default=0.0)
+    cost_score = models.FloatField(default=0.0)
+    missing_evidence_json = models.JSONField(default=list, blank=True)
+    prerequisite_gap_json = models.JSONField(default=list, blank=True)
+    contradiction_json = models.JSONField(default=list, blank=True)
+    provider_hint = models.CharField(max_length=32, blank=True, default="")
+    status = models.CharField(max_length=32, choices=Status.choices, default=Status.PROPOSED)
+    rationale = models.TextField(blank=True, default="")
+    last_promoted_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "chain_candidates"
+        unique_together = [("scan_run", "semantic_key")]
+        indexes = [
+            models.Index(fields=["scan_run", "status", "-total_score"], name="chain_candi_scan_r_778471_idx"),
+            models.Index(fields=["scan_run", "goal_type", "-total_score"], name="chain_candi_scan_r_0ea487_idx"),
+        ]
+
+
+class StrategySnapshot(models.Model):
+    snapshot_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="strategy_snapshots")
+    top_chain_ids_json = models.JSONField(default=list, blank=True)
+    queue_plan_json = models.JSONField(default=list, blank=True)
+    rationale_md = models.TextField(blank=True, default="")
+    graph_stats_json = models.JSONField(default=dict, blank=True)
+    created_by = models.CharField(max_length=64, default="strategy_brain")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "strategy_snapshots"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["scan_run", "-created_at"], name="strategy_sn_scan_r_9fb13f_idx"),
+        ]
+
+
 class ReportArchive(models.Model):
     class ValidationStatus(models.TextChoices):
         UNVERIFIED = "unverified"

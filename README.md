@@ -120,6 +120,10 @@ external workers through WorkItem leases (`lease_work`) and structured
 AgentExchange handoffs/debates. See
 [subscription workers](docs/subscription-workers.md).
 
+The read-only Strategy Brain can now build an Evidence Graph, extract exploit
+primitives, compose Top-3 chain candidates, and return advisory queue plans.
+See [strategy brain](docs/strategy-brain.md).
+
 
 ## Knowledge Base
 
