@@ -410,9 +410,10 @@ def llm_analyze_candidates(request, run_id):
     except ScanRun.DoesNotExist:
         return Response({"error": "run_id not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    import os
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return Response({"error": "ANTHROPIC_API_KEY not set"}, status=status.HTTP_400_BAD_REQUEST)
+    from .llm_provider import DEFAULT_MODEL, is_provider_configured, missing_provider_message, resolve_model_spec
+    spec = resolve_model_spec((scan_run.config or {}).get("llm_screen_model"), default_model=DEFAULT_MODEL)
+    if not is_provider_configured(spec):
+        return Response({"error": missing_provider_message(spec)}, status=status.HTTP_400_BAD_REQUEST)
 
     max_candidates = request.data.get("max_candidates", 10)
     from .services import run_llm_screen
@@ -421,11 +422,12 @@ def llm_analyze_candidates(request, run_id):
 
 @api_view(["POST"])
 def llm_analyze_single(request):
-    import os
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return Response({"error": "ANTHROPIC_API_KEY not set"}, status=status.HTTP_400_BAD_REQUEST)
+    from .llm_provider import DEFAULT_MODEL, is_provider_configured, missing_provider_message, resolve_model_spec
+    spec = resolve_model_spec(request.data.get("model"), default_model=DEFAULT_MODEL)
+    if not is_provider_configured(spec):
+        return Response({"error": missing_provider_message(spec)}, status=status.HTTP_400_BAD_REQUEST)
     from .llm_router import analyze_candidate
-    return Response(analyze_candidate(request.data))
+    return Response(analyze_candidate(request.data, model_spec=spec))
 
 @api_view(["POST"])
 def start_verification(request, run_id):

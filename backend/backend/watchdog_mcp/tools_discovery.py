@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 import os
 from datetime import timedelta
 
+from api.discovery_queue import build_queue_metadata, node_queue_summary
+from api.work_scheduler import ensure_work_item_for_node
+
 DISCOVERY_MAX_DEPTH = int(os.environ.get("WATCHDOG_DISCOVERY_MAX_DEPTH", "50"))
 DISCOVERY_MAX_NODES = int(os.environ.get("WATCHDOG_DISCOVERY_MAX_NODES", "1000"))
 DISCOVERY_STALE_S = int(os.environ.get("WATCHDOG_DISCOVERY_STALE_S", "300"))
@@ -495,10 +498,18 @@ def register(mcp):
             if existing:
                 # Merge new context into existing node (accumulate methods, sources)
                 _merge_context(existing, ctx)
+                work_info = {}
+                try:
+                    work = ensure_work_item_for_node(existing)
+                    work_info = {"work_id": str(work.work_id), "work_type": work.work_type}
+                except Exception as e:
+                    work_info = {"work_enqueue_error": str(e)}
                 return json.dumps({
                     "node_id": str(existing.node_id),
                     "depth": existing.depth,
                     "node_type": existing.node_type,
+                    **node_queue_summary(existing),
+                    **work_info,
                     "deduped": True,
                     "context_merged": bool(ctx),
                     "deduped_reason": "same scan+endpoint+vuln_type+node_type already exists",
@@ -518,6 +529,14 @@ def register(mcp):
                 pass
             store_ep = _normalize_ep(store_ep, target_url)
 
+        queue_meta = build_queue_metadata(
+            node_type=node_type,
+            vuln_type=vuln_type,
+            context=ctx,
+            depth=depth,
+            parent_status=parent.status if parent else "",
+        )
+
         node = DiscoveryNode.objects.create(
             scan_run_id=scan_run_id,
             parent=parent,
@@ -528,6 +547,7 @@ def register(mcp):
             summary=summary,
             context=ctx,
             status="pending",
+            **queue_meta,
         )
 
         cand_id = None
@@ -542,10 +562,17 @@ def register(mcp):
             "node_id": str(node.node_id),
             "depth": node.depth,
             "node_type": node.node_type,
+            **node_queue_summary(node),
             "queue_pending": pending_count,
         }
         if cand_id:
             result["cand_id"] = str(cand_id)
+        try:
+            work = ensure_work_item_for_node(node)
+            result["work_id"] = str(work.work_id)
+            result["work_type"] = work.work_type
+        except Exception as e:
+            logger.warning(f"auto enqueue work item failed for node {node.node_id}: {e}")
         return json.dumps(result)
 
     @mcp.tool()
@@ -598,7 +625,9 @@ def register(mcp):
 
         node.status = "dead_end"
         node.explored_at = timezone.now()
-        node.save(update_fields=["status", "explored_at"])
+        node.lease_owner = None
+        node.leased_until = None
+        node.save(update_fields=["status", "explored_at", "lease_owner", "leased_until"])
 
         if node.endpoint and node.vuln_type:
             from urllib.parse import urlparse
@@ -891,18 +920,29 @@ def pick_next_node(scan_run_id: str, worker_id: str):
             .select_for_update(skip_locked=True)
             .filter(
                 Q(status="pending")
-                | Q(status="exploring", explored_at__lt=stale_cutoff),
+                | Q(status="exploring", leased_until__lt=now)
+                | Q(status="exploring", leased_until__isnull=True, explored_at__lt=stale_cutoff),
                 scan_run_id=scan_run_id,
             )
-            .order_by("-depth", "created_at")
+            .order_by("-priority_score", "-depth", "created_at")
             .first()
         )
         if node is None:
             return None
         node.status = "exploring"
         node.worker_id = worker_id
+        node.lease_owner = worker_id
+        node.leased_until = now + timedelta(seconds=DISCOVERY_STALE_S)
+        node.attempt_count = (node.attempt_count or 0) + 1
         node.explored_at = now  # pick 시점 기록 → stale 판정 기준
-        node.save(update_fields=["status", "worker_id", "explored_at"])
+        node.save(update_fields=[
+            "status",
+            "worker_id",
+            "lease_owner",
+            "leased_until",
+            "attempt_count",
+            "explored_at",
+        ])
         return node
 
 
@@ -910,13 +950,12 @@ def _auto_create_candidate(node):
     """Auto-create a Candidate record when a vuln/exploit_step/clue node is pushed."""
     from api.models import Candidate
     try:
-        score_map = {"vuln": 0.7, "exploit_step": 0.85, "clue": 0.5}
         stage_map = {"vuln": "llm_deep", "exploit_step": "llm_deep", "clue": "llm_screen"}
         cand = Candidate.objects.create(
             scan_run=node.scan_run,
             vuln_type=node.vuln_type or "signal_stub",
             hypothesis=node.summary,
-            priority_score=score_map.get(node.node_type, 0.5),
+            priority_score=node.priority_score or 0.5,
             detection_stage=stage_map.get(node.node_type, "llm_screen"),
             status="open",
             features={
@@ -924,6 +963,8 @@ def _auto_create_candidate(node):
                 "node_type": node.node_type,
                 "endpoint": node.endpoint or "",
                 "depth": node.depth,
+                "queue_lane": node.queue_lane,
+                "provider_hint": node.provider_hint,
             },
         )
         return cand.cand_id

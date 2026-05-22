@@ -451,9 +451,14 @@ def run_verification_loop(candidate, scan_run):
         raise
 
 def run_verification_for_scan(scan_run, max_candidates=10, min_confidence=0.3):
-    import os
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        logger.warning(f"[{scan_run.run_id}] ANTHROPIC_API_KEY 없음, 검증 건너뜀")
+    from .llm_provider import DEFAULT_MODEL, is_provider_configured, missing_provider_message, resolve_model_spec
+    spec = resolve_model_spec(
+        (scan_run.config or {}).get("llm_screen_model"),
+        default_model=DEFAULT_MODEL,
+        default_provider=(scan_run.config or {}).get("llm_screen_provider"),
+    )
+    if not is_provider_configured(spec):
+        logger.warning(f"[{scan_run.run_id}] {missing_provider_message(spec)}, 검증 건너뜀")
         return []
 
     candidates = Candidate.objects.filter(

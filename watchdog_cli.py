@@ -44,6 +44,27 @@ from api.storage_service import (
 )
 from api.services import analyze_params, analyze_path, calculate_priority
 from api.llm_trace_store import record_llm_trace as _record_llm_trace
+from api.discovery_queue import build_queue_metadata, node_queue_summary
+from api.work_scheduler import (
+    block_work_item,
+    build_work_mission_packet,
+    complete_work_item,
+    enqueue_work_item,
+    ensure_work_item_for_node,
+    fail_work_item,
+    lease_next_work_item,
+    unblock_work_item,
+)
+from api.agent_exchange import (
+    add_agent_exchange,
+    exchange_summary,
+    summarize_work_exchanges,
+)
+from api.strategy import (
+    build_strategy_snapshot,
+    latest_strategy_snapshot,
+    list_evidence_graph,
+)
 from api.mcp_agent import (
     _gather_previous_knowledge,
     _seed_from_previous,
@@ -52,7 +73,8 @@ from api.mcp_agent import (
 
 from api.models import (
     ScanRun, DiscoveryNode, Candidate, Finding, RequestCatalog, LLMTrace,
-    PayloadPattern, VulnerabilityEntry, DeadEnd, TargetProfile,
+    PayloadPattern, VulnerabilityEntry, DeadEnd, TargetProfile, WorkItem,
+    AgentExchange,
 )
 
 from django.db import transaction
@@ -62,6 +84,7 @@ import re
 import statistics
 import requests as req_lib
 import time
+from datetime import timedelta
 
 
 def _json_out(obj):
@@ -295,10 +318,18 @@ def cmd_push_discovery(p):
         )
         if existing:
             _merge_context(existing, ctx)
+            work_info = {}
+            try:
+                work = ensure_work_item_for_node(existing)
+                work_info = {"work_id": str(work.work_id), "work_type": work.work_type}
+            except Exception as e:
+                work_info = {"work_enqueue_error": str(e)}
             _json_out({
                 "node_id": str(existing.node_id),
                 "depth": existing.depth,
                 "node_type": existing.node_type,
+                **node_queue_summary(existing),
+                **work_info,
                 "deduped": True,
                 "context_merged": bool(ctx),
                 "deduped_reason": "same scan+endpoint+vuln_type+node_type already exists",
@@ -308,6 +339,14 @@ def cmd_push_discovery(p):
     store_ep = raw_ep or (parent.endpoint if parent else "")
     if store_ep:
         store_ep = _normalize_ep(store_ep, target_url)
+
+    queue_meta = build_queue_metadata(
+        node_type=ntype,
+        vuln_type=vuln_type,
+        context=ctx,
+        depth=depth,
+        parent_status=parent.status if parent else "",
+    )
 
     node = DiscoveryNode.objects.create(
         scan_run_id=scan_run_id,
@@ -319,17 +358,17 @@ def cmd_push_discovery(p):
         summary=p.get("summary", ""),
         context=ctx,
         status=p.get("status", "pending"),
+        **queue_meta,
     )
 
-    result = {"node_id": str(node.node_id), "depth": depth}
+    result = {"node_id": str(node.node_id), "depth": depth, **node_queue_summary(node)}
 
     if ntype in ("vuln", "exploit_step", "clue"):
-        score = {"vuln": 0.7, "exploit_step": 0.85, "clue": 0.5}.get(ntype, 0.5)
         cand = Candidate.objects.create(
             scan_run_id=scan_run_id,
             vuln_type=vuln_type or "signal_stub",
             hypothesis=p.get("summary", ""),
-            priority_score=score,
+            priority_score=node.priority_score or 0.5,
             detection_stage="llm_deep",
             status="open",
             features={
@@ -337,9 +376,18 @@ def cmd_push_discovery(p):
                 "node_type": ntype,
                 "endpoint": store_ep,
                 "depth": depth,
+                "queue_lane": node.queue_lane,
+                "provider_hint": node.provider_hint,
             },
         )
         result["cand_id"] = str(cand.cand_id)
+
+    try:
+        work = ensure_work_item_for_node(node)
+        result["work_id"] = str(work.work_id)
+        result["work_type"] = work.work_type
+    except Exception as e:
+        result["work_enqueue_error"] = str(e)
 
     _json_out(result)
 
@@ -384,7 +432,9 @@ def cmd_mark_dead_end(p):
 
     node.status = "dead_end"
     node.explored_at = timezone.now()
-    node.save(update_fields=["status", "explored_at"])
+    node.lease_owner = None
+    node.leased_until = None
+    node.save(update_fields=["status", "explored_at", "lease_owner", "leased_until"])
     _json_out({"node_id": str(node.node_id), "status": "dead_end"})
 
 
@@ -408,8 +458,19 @@ def cmd_update_node_status(p):
     fields = ["status"]
     if new_status == "exploring":
         node.explored_at = timezone.now()
-        fields.append("explored_at")
+        if p.get("worker_id"):
+            node.worker_id = p.get("worker_id")
+            fields.append("worker_id")
+        node.lease_owner = p.get("worker_id") or node.worker_id
+        lease_seconds = int(os.environ.get("WATCHDOG_DISCOVERY_STALE_S", "300"))
+        node.leased_until = timezone.now() + timedelta(seconds=lease_seconds)
+        fields.extend(["explored_at", "lease_owner", "leased_until"])
+    elif new_status in {"explored", "dead_end", "confirmed"}:
+        node.lease_owner = None
+        node.leased_until = None
+        fields.extend(["lease_owner", "leased_until"])
     node.save(update_fields=fields)
+
     _json_out({
         "node_id": str(node.node_id),
         "old_status": old_status,
@@ -531,6 +592,7 @@ def cmd_create_scan(p):
 
 def cmd_create_root(p):
     run = ScanRun.objects.get(run_id=p["scan_run_id"])
+    ctx = {"target_url": p["target_url"]}
     node = DiscoveryNode.objects.create(
         scan_run=run,
         parent=None,
@@ -538,8 +600,9 @@ def cmd_create_root(p):
         node_type="target",
         endpoint=p["target_url"],
         summary=f"Root target: {p['target_url']}",
-        context={"target_url": p["target_url"]},
+        context=ctx,
         status="pending",
+        **build_queue_metadata(node_type="target", context=ctx, depth=0),
     )
 
     cfg = dict(run.config or {})
@@ -550,6 +613,12 @@ def cmd_create_root(p):
     run.save(update_fields=["config"])
 
     result = {"root_id": str(node.node_id)}
+    try:
+        work = ensure_work_item_for_node(node)
+        result["work_id"] = str(work.work_id)
+        result["work_type"] = work.work_type
+    except Exception as e:
+        result["work_enqueue_error"] = str(e)
 
     if prev_run_id:
         try:
@@ -716,7 +785,7 @@ def _embed_patterns(patterns):
 def cmd_list_nodes(p):
     nodes = DiscoveryNode.objects.filter(
         scan_run_id=p["scan_run_id"]
-    ).order_by("depth", "created_at")
+    ).order_by("-priority_score", "-depth", "created_at")
     items = []
     for n in nodes:
         items.append({
@@ -724,6 +793,10 @@ def cmd_list_nodes(p):
             "depth": n.depth,
             "type": n.node_type,
             "status": n.status,
+            "lane": n.queue_lane,
+            "priority_score": n.priority_score,
+            "provider_hint": n.provider_hint,
+            "attempt_count": n.attempt_count,
             "parent": str(n.parent_id)[:8] if n.parent_id else "root",
             "summary": n.summary[:80],
         })
@@ -1191,6 +1264,49 @@ def cmd_export_learned(p):
 
 
 # ═══════════════════════════════════════════════════════
+# Strategy Brain
+# ═══════════════════════════════════════════════════════
+
+def cmd_build_evidence_graph(p):
+    """Build a normalized Evidence Graph and strategy snapshot for a scan."""
+    _json_out(build_strategy_snapshot(
+        scan_run_id=p["scan_run_id"],
+        reset=_parse_bool(p.get("reset"), True),
+    ))
+
+
+def cmd_compose_chains(p):
+    """Compose and score chain candidates from the Evidence Graph."""
+    _json_out(build_strategy_snapshot(
+        scan_run_id=p["scan_run_id"],
+        reset=_parse_bool(p.get("reset"), True),
+    ))
+
+
+def cmd_get_strategy_snapshot(p):
+    """Return the latest Top-3 chain strategy snapshot, rebuilding if asked."""
+    scan_run_id = p["scan_run_id"]
+    if _parse_bool(p.get("rebuild"), False):
+        _json_out(build_strategy_snapshot(
+            scan_run_id=scan_run_id,
+            reset=_parse_bool(p.get("reset"), True),
+        ))
+        return
+    snapshot = latest_strategy_snapshot(scan_run_id)
+    if snapshot is None and _parse_bool(p.get("build_if_missing"), True):
+        snapshot = build_strategy_snapshot(scan_run_id=scan_run_id, reset=True)
+    _json_out(snapshot or {"scan_run_id": scan_run_id, "snapshot": None})
+
+
+def cmd_list_evidence_graph(p):
+    """List Evidence Graph counts and representative nodes for a scan."""
+    _json_out(list_evidence_graph(
+        scan_run_id=p["scan_run_id"],
+        limit=int(p.get("limit", 20)),
+    ))
+
+
+# ═══════════════════════════════════════════════════════
 # Orchestration — BFS Loop Driver + Validator
 # ═══════════════════════════════════════════════════════
 
@@ -1255,8 +1371,86 @@ _REQUIRED_ACTIONS = {
 }
 
 
+def _mission_packet(sr, node, actions=None, slot_hints=None):
+    actions = actions or _REQUIRED_ACTIONS.get(node.node_type, {})
+    packet = {
+        "scan_run_id": str(sr.run_id),
+        "target_url": sr.target_url,
+        "node_id": str(node.node_id),
+        "node_type": node.node_type,
+        "endpoint": node.endpoint or "",
+        "vuln_type": node.vuln_type or "",
+        "summary": node.summary,
+        "queue": node_queue_summary(node),
+        "required_init": actions.get("init", []),
+        "required_work": actions.get("work", []),
+        "required_finalize": actions.get("finalize", []),
+    }
+    if slot_hints:
+        packet["slot_hints"] = slot_hints
+    return packet
+
+
+def _candidate_packet(sr, node, rank, vuln_slot_hints=None):
+    parent_status = ""
+    if node.parent_id:
+        par = DiscoveryNode.objects.filter(node_id=node.parent_id).only("status").first()
+        parent_status = par.status if par else ""
+    reasons = [
+        f"priority rank {rank}",
+        f"score={node.priority_score:.4f}",
+        f"{node.node_type} @ depth={node.depth}",
+    ]
+    if parent_status == "dead_end":
+        reasons.append("parent is dead_end; lower value unless new angle exists")
+    elif parent_status == "confirmed":
+        reasons.append("parent confirmed; chain continuation is valuable")
+
+    cand = {
+        "rank": rank,
+        "node_id": str(node.node_id),
+        "node_type": node.node_type,
+        "depth": node.depth,
+        "summary": (node.summary or "")[:160],
+        "endpoint": node.endpoint or "",
+        "parent_id": str(node.parent_id)[:8] if node.parent_id else None,
+        "parent_status": parent_status,
+        "reason": " · ".join(reasons),
+        **node_queue_summary(node),
+    }
+    if vuln_slot_hints and node.endpoint and node.node_type in ("endpoint", "vuln", "exploit_step"):
+        try:
+            cand["slot_hints"] = vuln_slot_hints(sr, node.endpoint)
+        except Exception:
+            pass
+    return cand
+
+
+def _parse_jsonish(value, default):
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return json.loads(value)
+        except Exception:
+            return default
+    return default
+
+
+def _parse_bool(value, default=True):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
 def cmd_scan_next(p):
-    """BFS loop driver: pick next pending node, show required actions."""
+    """Priority frontier driver: show the best pending nodes and required actions."""
     sr = ScanRun.objects.get(run_id=p["scan_run_id"])
 
     # Check if any node is currently "exploring" (in-progress)
@@ -1270,6 +1464,8 @@ def cmd_scan_next(p):
             "node_type": exploring.node_type,
             "depth": exploring.depth,
             "summary": exploring.summary,
+            **node_queue_summary(exploring),
+            "mission_packet": _mission_packet(sr, exploring, actions),
             "required_work": actions.get("work", []),
             "required_finalize": actions.get("finalize", []),
         })
@@ -1280,7 +1476,7 @@ def cmd_scan_next(p):
     # 판단하면 그쪽으로 가도 OK. 강제는 안전망에만.
     pending_qs = DiscoveryNode.objects.filter(
         scan_run=sr, status="pending"
-    ).order_by("depth", "created_at")
+    ).order_by("-priority_score", "-depth", "created_at")
     pending_list = list(pending_qs[:8])
     pending = pending_list[0] if pending_list else None
 
@@ -1359,8 +1555,17 @@ def cmd_scan_next(p):
                 pass
         candidates.append(cand)
 
+    candidates = [
+        _candidate_packet(sr, n, idx, _vuln_slot_hints)
+        for idx, n in enumerate(pending_list)
+    ]
+
     _json_out({
         "action": "EXPLORE",
+        "scheduler_message": (
+            f"{len(candidates)} candidates; rank 0 is the priority-frontier recommendation. "
+            "Pick another only when chain context is clearly more valuable."
+        ),
         "message": (
             f"{len(candidates)}개 후보 — 0번이 BFS 추천. 다른 후보가 더 가치 있다고 "
             f"판단하면 자유롭게 그것을 선택. 선택 후 update_node_status(exploring) 먼저."
@@ -1373,6 +1578,14 @@ def cmd_scan_next(p):
         "depth": pending.depth,
         "summary": pending.summary,
         "parent_id": str(pending.parent_id)[:8] if pending.parent_id else None,
+        "scheduler": "priority_frontier",
+        **node_queue_summary(pending),
+        "mission_packet": _mission_packet(
+            sr,
+            pending,
+            actions,
+            candidates[0].get("slot_hints") if candidates else None,
+        ),
         "pending_siblings": siblings - 1,
         "step_1_init": actions.get("init", []),
         "step_2_work": actions.get("work", []),
@@ -1384,6 +1597,369 @@ def cmd_scan_next(p):
             "you have a new payload angle."
         ),
     })
+
+
+def cmd_lease_node(p):
+    """Atomically lease one DiscoveryNode for a subscription/API worker."""
+    sr = ScanRun.objects.get(run_id=p["scan_run_id"])
+    worker_kind = (p.get("worker_kind") or p.get("provider") or "external").strip().lower()
+    worker_id = p.get("worker_id") or f"{worker_kind}-{os.getpid()}"
+
+    node = pick_next_node(str(sr.run_id), worker_id)
+    if node is None:
+        pending = DiscoveryNode.objects.filter(scan_run=sr, status="pending").count()
+        exploring = DiscoveryNode.objects.filter(scan_run=sr, status="exploring").count()
+        action = "WAIT" if pending or exploring else "COMPLETE"
+        _json_out({
+            "action": action,
+            "scan_run_id": str(sr.run_id),
+            "target_url": sr.target_url,
+            "pending": pending,
+            "exploring": exploring,
+            "message": "No node leased. Wait for active leases or run scan_selfcheck/complete_scan.",
+        })
+        return
+
+    actions = _REQUIRED_ACTIONS.get(node.node_type, {})
+    slot_hints = None
+    try:
+        from watchdog_mcp.tools_discovery import _vuln_slot_hints
+        if node.endpoint and node.node_type in ("endpoint", "vuln", "exploit_step"):
+            slot_hints = _vuln_slot_hints(sr, node.endpoint)
+    except Exception:
+        slot_hints = None
+
+    mission = _mission_packet(sr, node, actions, slot_hints)
+    mission["worker_kind"] = worker_kind
+    mission["worker_id"] = worker_id
+    mission["finalize_contract"] = [
+        "record_trace with a non-empty tool_calls array",
+        "update_node_status to explored, confirmed, or dead_end",
+        "store_secret immediately for reusable secrets",
+    ]
+
+    _json_out({
+        "action": "LEASED",
+        "worker_id": worker_id,
+        "leased_node": str(node.node_id),
+        "lease_owner": node.lease_owner,
+        "leased_until": node.leased_until,
+        **node_queue_summary(node),
+        "mission_packet": mission,
+    })
+
+
+def _work_mission_with_actions(work):
+    packet = build_work_mission_packet(work)
+    node = work.node
+    actions = _REQUIRED_ACTIONS.get(node.node_type if node else "", {})
+    packet["required_init"] = actions.get("init", [])
+    packet["required_work"] = actions.get("work", [])
+    packet["required_finalize"] = actions.get("finalize", [])
+    return packet
+
+
+def cmd_enqueue_work(p):
+    """Create a WorkItem for a node/candidate/artifact."""
+    sr = ScanRun.objects.get(run_id=p["scan_run_id"])
+    node = None
+    candidate = None
+    if p.get("node_id"):
+        node = DiscoveryNode.objects.get(node_id=p["node_id"], scan_run=sr)
+    if p.get("cand_id") or p.get("candidate_id"):
+        candidate = Candidate.objects.get(cand_id=p.get("cand_id") or p.get("candidate_id"), scan_run=sr)
+
+    context = _parse_jsonish(p.get("context", p.get("context_json")), {})
+    work = enqueue_work_item(
+        sr,
+        work_type=p.get("work_type", "hypothesis_test"),
+        node=node,
+        candidate=candidate,
+        objective=p.get("objective", ""),
+        context=context,
+        priority_score=p.get("priority_score") if p.get("priority_score") not in ("", None) else None,
+        provider_hint=p.get("provider_hint", ""),
+    )
+    _json_out({
+        "action": "ENQUEUED",
+        **build_work_mission_packet(work),
+    })
+
+
+def cmd_lease_work(p):
+    """Atomically lease one WorkItem for a subscription/API worker."""
+    sr = ScanRun.objects.get(run_id=p["scan_run_id"])
+    worker_kind = (p.get("worker_kind") or p.get("provider") or "external").strip().lower()
+    worker_id = p.get("worker_id") or f"{worker_kind}-{os.getpid()}"
+    work = lease_next_work_item(
+        str(sr.run_id),
+        worker_id,
+        worker_kind=worker_kind,
+        queue_lane=p.get("queue_lane", ""),
+        work_type=p.get("work_type", ""),
+    )
+    if work is None:
+        pending = WorkItem.objects.filter(scan_run=sr, status="pending").count()
+        leased = WorkItem.objects.filter(scan_run=sr, status="leased").count()
+        blocked = WorkItem.objects.filter(scan_run=sr, status="blocked").count()
+        _json_out({
+            "action": "WAIT" if pending or leased else "COMPLETE",
+            "scan_run_id": str(sr.run_id),
+            "target_url": sr.target_url,
+            "pending": pending,
+            "leased": leased,
+            "blocked": blocked,
+            "message": "No work item leased. Wait, unblock prerequisites, or run scan_selfcheck/complete_scan.",
+        })
+        return
+
+    _json_out({
+        "action": "LEASED",
+        "worker_id": worker_id,
+        "leased_work": str(work.work_id),
+        "mission_packet": _work_mission_with_actions(work),
+    })
+
+
+def cmd_complete_work(p):
+    result = _parse_jsonish(p.get("result", p.get("result_json")), {})
+    work = complete_work_item(
+        p["work_id"],
+        result=result,
+        node_status=p.get("node_status", ""),
+    )
+    _json_out({
+        "action": "COMPLETED",
+        "work_id": str(work.work_id),
+        "node_id": str(work.node_id) if work.node_id else "",
+        "status": work.status,
+        "node_status": work.node.status if work.node else "",
+    })
+
+
+def cmd_fail_work(p):
+    work = fail_work_item(
+        p["work_id"],
+        error=p.get("error", p.get("reason", "")),
+        retry=_parse_bool(p.get("retry"), True),
+    )
+    node_status = p.get("node_status", "")
+    if work.node and node_status in {"explored", "dead_end", "confirmed"}:
+        work.node.status = node_status
+        work.node.lease_owner = None
+        work.node.leased_until = None
+        work.node.explored_at = timezone.now()
+        work.node.save(update_fields=["status", "lease_owner", "leased_until", "explored_at"])
+    _json_out({
+        "action": "RETRY" if work.status == "pending" else "FAILED",
+        "work_id": str(work.work_id),
+        "status": work.status,
+        "node_status": work.node.status if work.node else "",
+        "attempt_count": work.attempt_count,
+        "max_attempts": work.max_attempts,
+        "last_error": work.last_error,
+        "warning": "" if node_status or work.status == "pending" else "node_status not changed; finalize the DiscoveryNode separately",
+    })
+
+
+def cmd_block_work(p):
+    preconditions = _parse_jsonish(p.get("preconditions"), [])
+    if isinstance(preconditions, str):
+        preconditions = [preconditions]
+    work = block_work_item(
+        p["work_id"],
+        preconditions=preconditions,
+        error=p.get("error", p.get("reason", "")),
+    )
+    _json_out({
+        "action": "BLOCKED",
+        "work_id": str(work.work_id),
+        "status": work.status,
+        "preconditions": work.preconditions,
+    })
+
+
+def cmd_unblock_work(p):
+    work = unblock_work_item(p["work_id"], note=p.get("note", "preconditions satisfied"))
+    _json_out({
+        "action": "UNBLOCKED",
+        "work_id": str(work.work_id),
+        "status": work.status,
+        "preconditions": work.preconditions,
+    })
+
+
+def cmd_list_work(p):
+    qs = WorkItem.objects.filter(scan_run_id=p["scan_run_id"])
+    if p.get("status"):
+        qs = qs.filter(status=p["status"])
+    if p.get("work_type"):
+        qs = qs.filter(work_type=p["work_type"])
+    if p.get("queue_lane"):
+        qs = qs.filter(queue_lane=p["queue_lane"])
+    limit = int(p.get("limit", 30))
+    items = []
+    for work in qs.select_related("node").order_by("-priority_score", "created_at")[:limit]:
+        items.append({
+            "work_id": str(work.work_id),
+            "work_type": work.work_type,
+            "status": work.status,
+            "queue_lane": work.queue_lane,
+            "priority_score": work.priority_score,
+            "provider_hint": work.provider_hint,
+            "node_id": str(work.node_id)[:8] if work.node_id else "",
+            "node_type": work.node.node_type if work.node else "",
+            "endpoint": work.node.endpoint if work.node else "",
+            "objective": work.objective[:180],
+            "attempt_count": work.attempt_count,
+            "preconditions": work.preconditions,
+        })
+    _json_out({"count": len(items), "work_items": items})
+
+
+def _resolve_exchange_scope(p):
+    sr = None
+    work = None
+    node = None
+
+    if p.get("work_id"):
+        work = WorkItem.objects.select_related("scan_run", "node").get(work_id=p["work_id"])
+        sr = work.scan_run
+        node = work.node
+
+    if p.get("node_id") and node is None:
+        node = DiscoveryNode.objects.select_related("scan_run").get(node_id=p["node_id"])
+        sr = sr or node.scan_run
+
+    if p.get("scan_run_id"):
+        scan_run_id = p["scan_run_id"]
+        if sr and str(sr.run_id) != str(scan_run_id):
+            raise ValueError("scan_run_id does not match work_id/node_id")
+        sr = ScanRun.objects.get(run_id=scan_run_id)
+
+    if sr is None:
+        raise ValueError("scan_run_id, work_id, or node_id is required")
+
+    return sr, work, node
+
+
+def _opposite_provider(provider):
+    provider = (provider or "").strip().lower()
+    if provider == "claude":
+        return "codex"
+    if provider == "codex":
+        return "claude"
+    return ""
+
+
+def cmd_add_agent_exchange(p):
+    """Append a structured claim/evidence/counterargument/handoff to a WorkItem."""
+    try:
+        sr, work, node = _resolve_exchange_scope(p)
+    except Exception as e:
+        _json_out({"error": str(e)})
+        return
+
+    parent_exchange = None
+    if p.get("parent_exchange_id"):
+        parent_exchange = AgentExchange.objects.get(exchange_id=p["parent_exchange_id"], scan_run=sr)
+
+    evidence_refs = _parse_jsonish(p.get("evidence_refs"), [])
+    metadata = _parse_jsonish(p.get("metadata", p.get("metadata_json")), {})
+    exchange = add_agent_exchange(
+        scan_run=sr,
+        work=work,
+        node=node,
+        parent_exchange=parent_exchange,
+        agent_name=p.get("agent_name") or p.get("worker_id", ""),
+        provider=p.get("provider", "unknown"),
+        message_type=p.get("message_type", "handoff"),
+        stance=p.get("stance", "neutral"),
+        content=p["content"],
+        confidence=p.get("confidence", 0.0),
+        evidence_refs=evidence_refs,
+        requested_action=p.get("requested_action", ""),
+        resolution_status=p.get("resolution_status", "open"),
+        metadata=metadata,
+    )
+
+    result = {
+        "action": "ADDED",
+        "scan_run_id": str(sr.run_id),
+        "work_id": str(work.work_id) if work else "",
+        "node_id": str(node.node_id) if node else "",
+        "exchange": exchange_summary(exchange),
+    }
+
+    if _parse_bool(p.get("enqueue_recheck"), False):
+        context = {
+            "source_exchange_id": str(exchange.exchange_id),
+            "requested_by_provider": exchange.provider,
+            "claim": exchange.content[:1200],
+            "technique": f"exchange:{exchange.exchange_id}",
+        }
+        recheck = enqueue_work_item(
+            sr,
+            work_type="recheck",
+            node=node,
+            objective=p.get("recheck_objective") or f"Recheck {exchange.provider} exchange: {exchange.content[:180]}",
+            context=context,
+            provider_hint=p.get("recheck_provider_hint") or _opposite_provider(exchange.provider),
+        )
+        result["recheck_work_id"] = str(recheck.work_id)
+        result["recheck_provider_hint"] = recheck.provider_hint
+
+    _json_out(result)
+
+
+def cmd_list_agent_exchanges(p):
+    try:
+        sr, work, node = _resolve_exchange_scope(p)
+    except Exception as e:
+        _json_out({"error": str(e)})
+        return
+
+    if work:
+        exchanges = summarize_work_exchanges(work, limit=int(p.get("limit", 30)))
+    else:
+        qs = AgentExchange.objects.filter(scan_run=sr)
+        if node:
+            qs = qs.filter(node=node)
+        if p.get("provider"):
+            qs = qs.filter(provider=p["provider"])
+        if p.get("message_type"):
+            qs = qs.filter(message_type=p["message_type"])
+        if p.get("resolution_status"):
+            qs = qs.filter(resolution_status=p["resolution_status"])
+        limit = int(p.get("limit", 30))
+        recent = qs.select_related("work", "node", "parent_exchange").order_by("-created_at")[:limit]
+        exchanges = [exchange_summary(exchange) for exchange in reversed(list(recent))]
+
+    _json_out({
+        "scan_run_id": str(sr.run_id),
+        "work_id": str(work.work_id) if work else "",
+        "node_id": str(node.node_id) if node else "",
+        "count": len(exchanges),
+        "exchanges": exchanges,
+    })
+
+
+def cmd_resolve_agent_exchange(p):
+    exchange = AgentExchange.objects.get(exchange_id=p["exchange_id"])
+    status = p.get("resolution_status", "resolved")
+    if status not in {"open", "resolved", "superseded"}:
+        _json_out({"error": "resolution_status must be open, resolved, or superseded"})
+        return
+    metadata = dict(exchange.metadata or {})
+    if p.get("note"):
+        metadata.setdefault("resolution_notes", []).append({
+            "note": p["note"],
+            "ts": str(timezone.now()),
+        })
+    exchange.resolution_status = status
+    exchange.metadata = metadata
+    exchange.save(update_fields=["resolution_status", "metadata"])
+    _json_out({"action": "RESOLVED", "exchange": exchange_summary(exchange)})
 
 
 def cmd_validate_node(p):
@@ -1530,6 +2106,17 @@ def cmd_scan_selfcheck(p):
     if open_cands > 0:
         warnings.append(f"{open_cands} candidates still 'open'. Confirm or dismiss them all.")
 
+    work_items = WorkItem.objects.filter(scan_run=sr)
+    pending_work = work_items.filter(status="pending").count()
+    leased_work = work_items.filter(status="leased").count()
+    blocked_work = work_items.filter(status="blocked").count()
+    if pending_work > 0:
+        warnings.append(f"{pending_work} WorkItems still pending. Lease or cancel them before complete_scan.")
+    if leased_work > 0:
+        warnings.append(f"{leased_work} WorkItems still leased. Complete/fail them or wait for stale recovery.")
+    if blocked_work > 0:
+        warnings.append(f"{blocked_work} WorkItems blocked on prerequisites.")
+
     # 11. learn_dead_end check
     learned_de = DeadEnd.objects.filter(target_host__icontains=target_host[:20]).count() if target_host else 0
     if dead_ends and learned_de == 0:
@@ -1558,6 +2145,10 @@ def cmd_scan_selfcheck(p):
             "findings": findings.count(),
             "candidates": cands.count(),
             "open_candidates": open_cands,
+            "work_items": work_items.count(),
+            "work_pending": pending_work,
+            "work_leased": leased_work,
+            "work_blocked": blocked_work,
             "traces": traces,
             "secrets": len(secrets),
             "notes": len(notes),
@@ -1634,8 +2225,24 @@ TOOLS = {
     "record_trace":           cmd_record_trace,
     # Export
     "export_learned":         cmd_export_learned,
+    # Strategy Brain
+    "build_evidence_graph":   cmd_build_evidence_graph,
+    "compose_chains":         cmd_compose_chains,
+    "get_strategy_snapshot":  cmd_get_strategy_snapshot,
+    "list_evidence_graph":    cmd_list_evidence_graph,
     # Orchestration
     "scan_next":              cmd_scan_next,
+    "lease_node":             cmd_lease_node,
+    "enqueue_work":           cmd_enqueue_work,
+    "lease_work":             cmd_lease_work,
+    "complete_work":          cmd_complete_work,
+    "fail_work":              cmd_fail_work,
+    "block_work":             cmd_block_work,
+    "unblock_work":           cmd_unblock_work,
+    "list_work":              cmd_list_work,
+    "add_agent_exchange":     cmd_add_agent_exchange,
+    "list_agent_exchanges":   cmd_list_agent_exchanges,
+    "resolve_agent_exchange": cmd_resolve_agent_exchange,
     "validate_node":          cmd_validate_node,
     "scan_selfcheck":         cmd_scan_selfcheck,
 }
@@ -1649,8 +2256,10 @@ def cmd_list_tools(_):
 
 
 _TRACE_SKIP_TOOLS = frozenset({
-    "record_trace", "scan_next", "scan_selfcheck", "list_tools",
-    "export_learned", "validate_node",
+    "record_trace", "scan_next", "lease_node", "lease_work", "list_work",
+    "list_agent_exchanges", "scan_selfcheck", "list_tools", "export_learned",
+    "validate_node", "build_evidence_graph", "compose_chains",
+    "get_strategy_snapshot", "list_evidence_graph",
 })
 
 

@@ -56,7 +56,7 @@ A Model Context Protocol (MCP) server exposing 28+ tools for HTTP requests, KB s
 | **Frontend** | React 18, Canvas API | Discovery Tree graph, live dashboard |
 | **Backend** | Django 5, DRF, Channels | REST API, WebSocket, scan orchestration |
 | **Database** | PostgreSQL 16 + pgvector | Models, embeddings, full-text search |
-| **Agent** | Anthropic Claude API | Multi-agent LLM swarm (Planner → Explorer → Executor) |
+| **Agent** | Anthropic/OpenAI APIs, Claude/Codex CLI workers | Multi-agent LLM swarm (Planner → Explorer → Executor) |
 | **MCP** | SSE transport | Tool server for agent ↔ backend communication |
 | **Infra** | Docker Compose | One-command local deployment |
 
@@ -67,6 +67,7 @@ A Model Context Protocol (MCP) server exposing 28+ tools for HTTP requests, KB s
 ### Prerequisites
 - Docker & Docker Compose
 - (Optional) `ANTHROPIC_API_KEY` for autonomous agent mode
+- (Optional) `OPENAI_API_KEY` for OpenAI/Codex-compatible provider experiments
 
 ### Run
 
@@ -105,6 +106,23 @@ curl -X POST http://localhost:8000/api/scan-runs/ \
 - `Balanced`: Uses Sonnet for most discovery and verification steps, with lighter models for support roles.
 - `High Performance`: Uses stronger models for complex hypotheses, exploit execution, and confirmation.
 - `Advanced Settings`: You can customize the model for each discovery role individually.
+
+Role models can also be configured as provider-qualified strings such as
+`anthropic:claude-opus-4-1-20250805` or `openai:gpt-5.5`, or as objects like
+`{"provider":"anthropic","model":"claude-opus-4-1-20250805"}`.
+
+For high-performance bug bounty runs, keep exploit, hypothesis, and route
+reasoning on Claude Opus, and use `openai:gpt-5.5` for Codex-style
+critic, confirmer, source-audit, and report-quality review work.
+
+Subscription-based Claude Code and Codex sessions can also join a scan as
+external workers through WorkItem leases (`lease_work`) and structured
+AgentExchange handoffs/debates. See
+[subscription workers](docs/subscription-workers.md).
+
+The read-only Strategy Brain can now build an Evidence Graph, extract exploit
+primitives, compose Top-3 chain candidates, and return advisory queue plans.
+See [strategy brain](docs/strategy-brain.md).
 
 
 ## Knowledge Base

@@ -47,6 +47,19 @@ CLI-only tools include:
 - `fail_scan`
 - `record_trace`
 - `scan_next`
+- `lease_node`
+- `lease_work`
+- `complete_work`
+- `fail_work`
+- `block_work`
+- `unblock_work`
+- `add_agent_exchange`
+- `list_agent_exchanges`
+- `resolve_agent_exchange`
+- `build_evidence_graph`
+- `compose_chains`
+- `get_strategy_snapshot`
+- `list_evidence_graph`
 - `validate_node`
 - `scan_selfcheck`
 
@@ -56,6 +69,18 @@ CLI call pattern:
 docker cp watchdog_cli.py watchdog-backend-1:/tmp/watchdog_cli.py
 echo '<JSON>' | docker exec -i -e PYTHONPATH=/app -e DJANGO_SETTINGS_MODULE=config.settings watchdog-backend-1 python /tmp/watchdog_cli.py <tool_name>
 ```
+
+External subscription workers use the same CLI state machine. Prefer
+`lease_work`, which atomically assigns one WorkItem and returns a mission
+packet; the worker must record traces and call `complete_work` or `fail_work`
+before requesting another lease. Workers should use `add_agent_exchange` to
+leave claims, evidence, counterarguments, consensus, handoff notes, and recheck
+requests for the other provider. `lease_node` remains for compatibility.
+
+The strategy brain CLI tools are advisory in the current phase. They build an
+Evidence Graph, extract primitive capabilities, compose Top-3 chain candidates,
+and return queue-plan suggestions with `provider_hint`; they do not rewrite or
+cancel WorkItems yet.
 
 ## Operating Model
 

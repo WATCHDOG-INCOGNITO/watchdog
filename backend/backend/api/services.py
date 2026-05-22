@@ -333,9 +333,21 @@ def run_llm_screen(scan_run: ScanRun, max_candidates=9999):
     규칙 기반으로 뽑힌 candidate 중 상위 N개를 Claude로 분석한다.
     결과에 따라 candidate의 detection_stage, priority_score, features를 업데이트.
     """
-    import os
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        logger.warning(f"[{scan_run.run_id}] ANTHROPIC_API_KEY 없음, LLM 분석 건너뜀")
+    from .llm_provider import (
+        DEFAULT_MODEL,
+        DEFAULT_PROVIDER,
+        is_provider_configured,
+        missing_provider_message,
+        resolve_model_spec,
+    )
+    scan_config = scan_run.config or {}
+    spec = resolve_model_spec(
+        scan_config.get("llm_screen_model"),
+        default_model=DEFAULT_MODEL,
+        default_provider=scan_config.get("llm_screen_provider") or DEFAULT_PROVIDER,
+    )
+    if not is_provider_configured(spec):
+        logger.warning(f"[{scan_run.run_id}] {missing_provider_message(spec)}, LLM screen skipped")
         return
 
     from .llm_router import batch_analyze_candidates
@@ -368,9 +380,9 @@ def run_llm_screen(scan_run: ScanRun, max_candidates=9999):
         })
         cand_objects.append(cand)
 
-    # Claude 분석
+    # LLM 분석
     call_base = scan_run.llm_calls_count
-    results = batch_analyze_candidates(cand_data_list, max_count=max_candidates)
+    results = batch_analyze_candidates(cand_data_list, max_count=max_candidates, model_spec=spec)
 
     # 결과 반영
     total_tokens = 0
@@ -410,7 +422,7 @@ def run_llm_screen(scan_run: ScanRun, max_candidates=9999):
             scan_run=scan_run,
             call_index=call_base + offset,
             stage="llm_screen",
-            model="claude-sonnet-4-20250514",
+            model=f"{usage.get('provider', spec.provider)}:{usage.get('model', spec.model)}",
             prompt_preview=result.get("_trace_prompt", ""),
             response_preview=result.get("_trace_response_preview", ""),
             stop_reason="end_turn",
@@ -431,8 +443,11 @@ def run_llm_screen(scan_run: ScanRun, max_candidates=9999):
     from decimal import Decimal
     scan_run.llm_calls_count += len(results)
     scan_run.llm_tokens_used += total_tokens
-    # 대략적 비용 계산 (Sonnet 기준: input $3/MTok, output $15/MTok)
-    scan_run.llm_cost_usd += Decimal(str(round(total_tokens * 0.005 / 1000, 4)))
+    # Provider-specific cost is included in each result usage.
+    for result in results:
+        usage = result.get("_usage", {})
+        if usage.get("cost_usd") is not None:
+            scan_run.llm_cost_usd += Decimal(str(usage.get("cost_usd")))
     scan_run.save(update_fields=["llm_calls_count", "llm_tokens_used", "llm_cost_usd"])
 
     logger.info(f"[{scan_run.run_id}] LLM 스크리닝 완료: "

@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 dist/
+.watchdog-missions/
 
 # Python venv
 .venv/
