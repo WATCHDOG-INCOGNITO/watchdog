@@ -29,6 +29,7 @@ The response contains a `mission_packet` with:
   oracle hint, and provider hint
 - target and node identity
 - queue lane, priority score, provider hint, score breakdown, and lease data
+- recent `agent_exchanges` for the leased WorkItem plus a dialogue contract
 - required init/work/finalize checklist
 - slot hints when endpoint/vulnerability history exists
 - a finalize contract requiring `record_trace`, `complete_work` or `fail_work`,
@@ -43,6 +44,37 @@ can be reclaimed.
 If a work item is missing a prerequisite such as a credential, token, or
 baseline response, use `block_work`. When the prerequisite is later stored,
 use `unblock_work` so the scheduler can lease it again.
+
+## Agent Exchanges
+
+Claude and Codex do not need a shared chat room. They talk through structured
+`AgentExchange` records attached to the WorkItem:
+
+```powershell
+echo '{
+  "scan_run_id":"<RUN_ID>",
+  "work_id":"<WORK_ID>",
+  "provider":"claude",
+  "agent_name":"claude-local",
+  "message_type":"claim",
+  "stance":"supports",
+  "confidence":0.72,
+  "content":"The endpoint likely has IDOR because the numeric id is accepted without an ownership check.",
+  "evidence_refs":["trace:<TRACE_ID>"]
+}' |
+  docker exec -i -e PYTHONPATH=/app -e DJANGO_SETTINGS_MODULE=config.settings `
+    watchdog-backend-1 python /tmp/watchdog_cli.py add_agent_exchange
+```
+
+Supported message types are `claim`, `question`, `counterargument`, `evidence`,
+`decision`, `handoff`, `recheck_request`, and `consensus`. Use
+`list_agent_exchanges` to inspect the thread and `resolve_agent_exchange` when
+an objection or recheck request has been handled.
+
+To force the other model to verify a claim, set `enqueue_recheck=true` on
+`add_agent_exchange`. The CLI creates a `recheck` WorkItem with the opposite
+provider hint when possible, so a Claude claim becomes Codex recheck work and
+a Codex claim becomes Claude recheck work.
 
 ## Local Runners
 
@@ -65,7 +97,8 @@ Recommended role split:
   scoring changes, and report-quality evidence review.
 
 Both workers share state only through Watchdog: DiscoveryNode rows, traces,
-findings, secrets, endpoint specs, dead ends, and scan notes.
+WorkItems, AgentExchanges, findings, secrets, endpoint specs, dead ends, and
+scan notes.
 
 ## Safety
 

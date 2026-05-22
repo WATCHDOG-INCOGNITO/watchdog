@@ -54,6 +54,8 @@ Use watchdog_cli.py through the documented docker exec pattern to gather context
 record trace entries, push discoveries before testing, store secrets immediately,
 and finalize the leased node as explored, confirmed, or dead_end.
 Finish by calling complete_work or fail_work for the leased work item.
+Use add_agent_exchange to record claims, evidence, counterarguments, consensus,
+handoffs, or recheck requests for Claude/Codex collaboration.
 
 Prefer Claude strengths: live target exploration, hypothesis generation,
 multi-step chain reasoning, and concise handoff notes. Stay inside the target

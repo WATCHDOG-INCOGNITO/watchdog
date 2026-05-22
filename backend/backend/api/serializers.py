@@ -4,7 +4,7 @@ from .models import (
     FindingEvidenceLink, AgentTask, VerificationLoop, Hypothesis,
     VisualAnalysis, IDORTestSession, WAFBypassAttempt,
     VulnerabilityEntry, PayloadPattern, ReportArchive,
-    DiscoveryNode, WorkItem,
+    DiscoveryNode, WorkItem, AgentExchange,
 )
 
 
@@ -141,3 +141,10 @@ class WorkItemSerializer(serializers.ModelSerializer):
         model = WorkItem
         fields = "__all__"
         read_only_fields = ["work_id", "created_at", "updated_at", "completed_at"]
+
+
+class AgentExchangeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AgentExchange
+        fields = "__all__"
+        read_only_fields = ["exchange_id", "created_at"]

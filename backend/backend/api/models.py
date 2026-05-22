@@ -643,6 +643,75 @@ class WorkItem(models.Model):
         ]
 
 
+class AgentExchange(models.Model):
+    """Structured handoff/debate message between subscription workers."""
+
+    class Provider(models.TextChoices):
+        CLAUDE = "claude"
+        CODEX = "codex"
+        DETERMINISTIC = "deterministic"
+        HUMAN = "human"
+        UNKNOWN = "unknown"
+
+    class MessageType(models.TextChoices):
+        CLAIM = "claim"
+        QUESTION = "question"
+        COUNTERARGUMENT = "counterargument"
+        EVIDENCE = "evidence"
+        DECISION = "decision"
+        HANDOFF = "handoff"
+        RECHECK_REQUEST = "recheck_request"
+        CONSENSUS = "consensus"
+
+    class Stance(models.TextChoices):
+        SUPPORTS = "supports"
+        DISPUTES = "disputes"
+        BLOCKS = "blocks"
+        NEUTRAL = "neutral"
+
+    class ResolutionStatus(models.TextChoices):
+        OPEN = "open"
+        RESOLVED = "resolved"
+        SUPERSEDED = "superseded"
+
+    exchange_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="agent_exchanges")
+    work = models.ForeignKey(
+        WorkItem, on_delete=models.CASCADE, null=True, blank=True, related_name="agent_exchanges",
+    )
+    node = models.ForeignKey(
+        DiscoveryNode, on_delete=models.CASCADE, null=True, blank=True, related_name="agent_exchanges",
+    )
+    parent_exchange = models.ForeignKey(
+        "self", on_delete=models.SET_NULL, null=True, blank=True, related_name="replies",
+    )
+
+    agent_name = models.CharField(max_length=128, blank=True, default="")
+    provider = models.CharField(max_length=32, choices=Provider.choices, default=Provider.UNKNOWN)
+    message_type = models.CharField(max_length=32, choices=MessageType.choices, default=MessageType.HANDOFF)
+    stance = models.CharField(max_length=16, choices=Stance.choices, default=Stance.NEUTRAL)
+    content = models.TextField()
+    confidence = models.FloatField(default=0.0)
+    evidence_refs = models.JSONField(default=list, blank=True)
+    requested_action = models.CharField(max_length=64, blank=True, default="")
+    resolution_status = models.CharField(
+        max_length=16, choices=ResolutionStatus.choices, default=ResolutionStatus.OPEN,
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "agent_exchanges"
+        ordering = ["created_at"]
+        indexes = [
+            models.Index(fields=["scan_run", "created_at"]),
+            models.Index(fields=["scan_run", "provider", "message_type", "created_at"]),
+            models.Index(fields=["scan_run", "work", "created_at"]),
+            models.Index(fields=["scan_run", "node", "created_at"]),
+            models.Index(fields=["scan_run", "resolution_status", "created_at"]),
+        ]
+
+
 class ReportArchive(models.Model):
     class ValidationStatus(models.TextChoices):
         UNVERIFIED = "unverified"

@@ -53,6 +53,9 @@ CLI-only tools include:
 - `fail_work`
 - `block_work`
 - `unblock_work`
+- `add_agent_exchange`
+- `list_agent_exchanges`
+- `resolve_agent_exchange`
 - `validate_node`
 - `scan_selfcheck`
 
@@ -66,7 +69,9 @@ echo '<JSON>' | docker exec -i -e PYTHONPATH=/app -e DJANGO_SETTINGS_MODULE=conf
 External subscription workers use the same CLI state machine. Prefer
 `lease_work`, which atomically assigns one WorkItem and returns a mission
 packet; the worker must record traces and call `complete_work` or `fail_work`
-before requesting another lease. `lease_node` remains for compatibility.
+before requesting another lease. Workers should use `add_agent_exchange` to
+leave claims, evidence, counterarguments, consensus, handoff notes, and recheck
+requests for the other provider. `lease_node` remains for compatibility.
 
 ## Operating Model
 

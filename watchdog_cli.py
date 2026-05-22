@@ -55,6 +55,11 @@ from api.work_scheduler import (
     lease_next_work_item,
     unblock_work_item,
 )
+from api.agent_exchange import (
+    add_agent_exchange,
+    exchange_summary,
+    summarize_work_exchanges,
+)
 from api.mcp_agent import (
     _gather_previous_knowledge,
     _seed_from_previous,
@@ -64,6 +69,7 @@ from api.mcp_agent import (
 from api.models import (
     ScanRun, DiscoveryNode, Candidate, Finding, RequestCatalog, LLMTrace,
     PayloadPattern, VulnerabilityEntry, DeadEnd, TargetProfile, WorkItem,
+    AgentExchange,
 )
 
 from django.db import transaction
@@ -1763,6 +1769,151 @@ def cmd_list_work(p):
     _json_out({"count": len(items), "work_items": items})
 
 
+def _resolve_exchange_scope(p):
+    sr = None
+    work = None
+    node = None
+
+    if p.get("work_id"):
+        work = WorkItem.objects.select_related("scan_run", "node").get(work_id=p["work_id"])
+        sr = work.scan_run
+        node = work.node
+
+    if p.get("node_id") and node is None:
+        node = DiscoveryNode.objects.select_related("scan_run").get(node_id=p["node_id"])
+        sr = sr or node.scan_run
+
+    if p.get("scan_run_id"):
+        scan_run_id = p["scan_run_id"]
+        if sr and str(sr.run_id) != str(scan_run_id):
+            raise ValueError("scan_run_id does not match work_id/node_id")
+        sr = ScanRun.objects.get(run_id=scan_run_id)
+
+    if sr is None:
+        raise ValueError("scan_run_id, work_id, or node_id is required")
+
+    return sr, work, node
+
+
+def _opposite_provider(provider):
+    provider = (provider or "").strip().lower()
+    if provider == "claude":
+        return "codex"
+    if provider == "codex":
+        return "claude"
+    return ""
+
+
+def cmd_add_agent_exchange(p):
+    """Append a structured claim/evidence/counterargument/handoff to a WorkItem."""
+    try:
+        sr, work, node = _resolve_exchange_scope(p)
+    except Exception as e:
+        _json_out({"error": str(e)})
+        return
+
+    parent_exchange = None
+    if p.get("parent_exchange_id"):
+        parent_exchange = AgentExchange.objects.get(exchange_id=p["parent_exchange_id"], scan_run=sr)
+
+    evidence_refs = _parse_jsonish(p.get("evidence_refs"), [])
+    metadata = _parse_jsonish(p.get("metadata", p.get("metadata_json")), {})
+    exchange = add_agent_exchange(
+        scan_run=sr,
+        work=work,
+        node=node,
+        parent_exchange=parent_exchange,
+        agent_name=p.get("agent_name") or p.get("worker_id", ""),
+        provider=p.get("provider", "unknown"),
+        message_type=p.get("message_type", "handoff"),
+        stance=p.get("stance", "neutral"),
+        content=p["content"],
+        confidence=p.get("confidence", 0.0),
+        evidence_refs=evidence_refs,
+        requested_action=p.get("requested_action", ""),
+        resolution_status=p.get("resolution_status", "open"),
+        metadata=metadata,
+    )
+
+    result = {
+        "action": "ADDED",
+        "scan_run_id": str(sr.run_id),
+        "work_id": str(work.work_id) if work else "",
+        "node_id": str(node.node_id) if node else "",
+        "exchange": exchange_summary(exchange),
+    }
+
+    if _parse_bool(p.get("enqueue_recheck"), False):
+        context = {
+            "source_exchange_id": str(exchange.exchange_id),
+            "requested_by_provider": exchange.provider,
+            "claim": exchange.content[:1200],
+            "technique": f"exchange:{exchange.exchange_id}",
+        }
+        recheck = enqueue_work_item(
+            sr,
+            work_type="recheck",
+            node=node,
+            objective=p.get("recheck_objective") or f"Recheck {exchange.provider} exchange: {exchange.content[:180]}",
+            context=context,
+            provider_hint=p.get("recheck_provider_hint") or _opposite_provider(exchange.provider),
+        )
+        result["recheck_work_id"] = str(recheck.work_id)
+        result["recheck_provider_hint"] = recheck.provider_hint
+
+    _json_out(result)
+
+
+def cmd_list_agent_exchanges(p):
+    try:
+        sr, work, node = _resolve_exchange_scope(p)
+    except Exception as e:
+        _json_out({"error": str(e)})
+        return
+
+    if work:
+        exchanges = summarize_work_exchanges(work, limit=int(p.get("limit", 30)))
+    else:
+        qs = AgentExchange.objects.filter(scan_run=sr)
+        if node:
+            qs = qs.filter(node=node)
+        if p.get("provider"):
+            qs = qs.filter(provider=p["provider"])
+        if p.get("message_type"):
+            qs = qs.filter(message_type=p["message_type"])
+        if p.get("resolution_status"):
+            qs = qs.filter(resolution_status=p["resolution_status"])
+        limit = int(p.get("limit", 30))
+        recent = qs.select_related("work", "node", "parent_exchange").order_by("-created_at")[:limit]
+        exchanges = [exchange_summary(exchange) for exchange in reversed(list(recent))]
+
+    _json_out({
+        "scan_run_id": str(sr.run_id),
+        "work_id": str(work.work_id) if work else "",
+        "node_id": str(node.node_id) if node else "",
+        "count": len(exchanges),
+        "exchanges": exchanges,
+    })
+
+
+def cmd_resolve_agent_exchange(p):
+    exchange = AgentExchange.objects.get(exchange_id=p["exchange_id"])
+    status = p.get("resolution_status", "resolved")
+    if status not in {"open", "resolved", "superseded"}:
+        _json_out({"error": "resolution_status must be open, resolved, or superseded"})
+        return
+    metadata = dict(exchange.metadata or {})
+    if p.get("note"):
+        metadata.setdefault("resolution_notes", []).append({
+            "note": p["note"],
+            "ts": str(timezone.now()),
+        })
+    exchange.resolution_status = status
+    exchange.metadata = metadata
+    exchange.save(update_fields=["resolution_status", "metadata"])
+    _json_out({"action": "RESOLVED", "exchange": exchange_summary(exchange)})
+
+
 def cmd_validate_node(p):
     """Validate a node has all required tool calls before finalize."""
     node = DiscoveryNode.objects.get(node_id=p["node_id"])
@@ -2036,6 +2187,9 @@ TOOLS = {
     "block_work":             cmd_block_work,
     "unblock_work":           cmd_unblock_work,
     "list_work":              cmd_list_work,
+    "add_agent_exchange":     cmd_add_agent_exchange,
+    "list_agent_exchanges":   cmd_list_agent_exchanges,
+    "resolve_agent_exchange": cmd_resolve_agent_exchange,
     "validate_node":          cmd_validate_node,
     "scan_selfcheck":         cmd_scan_selfcheck,
 }
@@ -2050,7 +2204,8 @@ def cmd_list_tools(_):
 
 _TRACE_SKIP_TOOLS = frozenset({
     "record_trace", "scan_next", "lease_node", "lease_work", "list_work",
-    "scan_selfcheck", "list_tools", "export_learned", "validate_node",
+    "list_agent_exchanges", "scan_selfcheck", "list_tools", "export_learned",
+    "validate_node",
 })
 
 
