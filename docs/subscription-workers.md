@@ -85,6 +85,13 @@ Codex worker:
 .\tools\run_codex_worker.ps1 -ScanRunId <RUN_ID> -Iterations 1 -CodexModel gpt-5.5
 ```
 
+If Claude is unavailable and a Claude-hinted WorkItem must be picked up by
+Codex, run Codex as an external fallback worker:
+
+```powershell
+.\tools\run_codex_worker.ps1 -ScanRunId <RUN_ID> -Iterations 1 -WorkerKind external
+```
+
 Claude worker:
 
 ```powershell

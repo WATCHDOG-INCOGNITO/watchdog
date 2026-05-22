@@ -24,10 +24,13 @@ function Invoke-WatchdogCli {
 
     docker cp watchdog_cli.py "$BackendContainer`:/tmp/watchdog_cli.py" | Out-Null
     $json = $Payload | ConvertTo-Json -Depth 40 -Compress
-    $json | docker exec -i `
-        -e PYTHONPATH=/app `
-        -e DJANGO_SETTINGS_MODULE=config.settings `
-        $BackendContainer python /tmp/watchdog_cli.py $Tool
+    $payloadPath = Join-Path $env:TEMP "watchdog-$Tool-$([guid]::NewGuid().ToString('N')).json"
+    [System.IO.File]::WriteAllText($payloadPath, $json, [System.Text.UTF8Encoding]::new($false))
+    try {
+        cmd /c "type ""$payloadPath"" | docker exec -i -e PYTHONPATH=/app -e DJANGO_SETTINGS_MODULE=config.settings $BackendContainer python /tmp/watchdog_cli.py $Tool"
+    } finally {
+        Remove-Item -LiteralPath $payloadPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 for ($i = 0; $i -lt $Iterations; $i++) {
