@@ -285,7 +285,7 @@ def unblock_work_item(work_id: str, *, note: str = "") -> WorkItem:
 
 
 def build_work_mission_packet(work: WorkItem) -> dict[str, Any]:
-    from .agent_exchange import summarize_work_exchanges
+    from .agent_exchange import summarize_related_exchanges
 
     node = work.node
     return {
@@ -305,7 +305,7 @@ def build_work_mission_packet(work: WorkItem) -> dict[str, Any]:
         "expected_outputs": work.expected_outputs,
         "oracle": work.oracle,
         "provider_hint": work.provider_hint,
-        "agent_exchanges": summarize_work_exchanges(work),
+        "agent_exchanges": summarize_related_exchanges(work),
         "dialogue_contract": [
             "Read prior agent_exchanges before deciding the next action",
             "Use add_agent_exchange for claims, evidence, counterarguments, handoffs, and recheck requests",

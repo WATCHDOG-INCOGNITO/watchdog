@@ -4,6 +4,7 @@ param(
 
     [int]$Iterations = 1,
     [string]$WorkerId = "",
+    [string]$CodexCommand = "codex",
     [string]$BackendContainer = "watchdog-backend-1"
 )
 
@@ -41,7 +42,9 @@ for ($i = 0; $i -lt $Iterations; $i++) {
         break
     }
 
-    $missionPath = Join-Path $env:TEMP "watchdog-codex-$($lease.leased_work).json"
+    $missionDir = Join-Path (Get-Location).Path ".watchdog-missions"
+    New-Item -ItemType Directory -Force -Path $missionDir | Out-Null
+    $missionPath = Join-Path $missionDir "watchdog-codex-$($lease.leased_work).json"
     $lease.mission_packet | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $missionPath -Encoding UTF8
 
     $prompt = @"
@@ -56,11 +59,13 @@ and finalize the leased node as explored, confirmed, or dead_end.
 Finish by calling complete_work or fail_work for the leased work item.
 Use add_agent_exchange to record claims, evidence, counterarguments, consensus,
 handoffs, or recheck requests for Claude/Codex collaboration.
+When handing work to Claude, call add_agent_exchange with enqueue_recheck=true
+and recheck_provider_hint="claude" so the scheduler creates Claude work.
 
 Prefer Codex strengths: source audit, critic/confirmer work, reproducibility checks,
 queue scoring improvements, and report-quality evidence. Do not add yourself as a
 git contributor or co-author.
 "@
 
-    codex exec $prompt
+    & $CodexCommand exec $prompt
 }

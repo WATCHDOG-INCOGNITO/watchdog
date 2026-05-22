@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.db.models import Q
+
 from .models import AgentExchange, DiscoveryNode, ScanRun, WorkItem
 
 
@@ -103,6 +105,31 @@ def summarize_work_exchanges(work: WorkItem, *, limit: int = 12) -> list[dict[st
         AgentExchange.objects
         .filter(scan_run=work.scan_run)
         .filter(work=work)
+        .select_related("parent_exchange")
+        .order_by("-created_at")[:limit]
+    )
+    return [exchange_summary(exchange) for exchange in reversed(list(exchanges))]
+
+
+def summarize_related_exchanges(work: WorkItem, *, limit: int = 16) -> list[dict[str, Any]]:
+    """Summarize exchange context a worker should read before acting.
+
+    A recheck WorkItem is often new, so filtering by work alone loses the
+    original handoff. Include exchanges on the same node plus explicit
+    source_exchange_id links from the WorkItem context.
+    """
+    query = Q(work=work)
+    if work.node_id:
+        query |= Q(node_id=work.node_id)
+
+    source_exchange_id = (work.context or {}).get("source_exchange_id")
+    if source_exchange_id:
+        query |= Q(exchange_id=source_exchange_id) | Q(parent_exchange_id=source_exchange_id)
+
+    exchanges = (
+        AgentExchange.objects
+        .filter(scan_run=work.scan_run)
+        .filter(query)
         .select_related("parent_exchange")
         .order_by("-created_at")[:limit]
     )

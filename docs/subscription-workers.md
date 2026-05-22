@@ -29,7 +29,8 @@ The response contains a `mission_packet` with:
   oracle hint, and provider hint
 - target and node identity
 - queue lane, priority score, provider hint, score breakdown, and lease data
-- recent `agent_exchanges` for the leased WorkItem plus a dialogue contract
+- recent related `agent_exchanges` for the leased WorkItem, node, and linked
+  recheck source plus a dialogue contract
 - required init/work/finalize checklist
 - slot hints when endpoint/vulnerability history exists
 - a finalize contract requiring `record_trace`, `complete_work` or `fail_work`,

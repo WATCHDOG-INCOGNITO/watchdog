@@ -4,6 +4,7 @@ param(
 
     [int]$Iterations = 1,
     [string]$WorkerId = "",
+    [string]$ClaudeCommand = "claude",
     [string]$BackendContainer = "watchdog-backend-1"
 )
 
@@ -41,7 +42,9 @@ for ($i = 0; $i -lt $Iterations; $i++) {
         break
     }
 
-    $missionPath = Join-Path $env:TEMP "watchdog-claude-$($lease.leased_work).json"
+    $missionDir = Join-Path (Get-Location).Path ".watchdog-missions"
+    New-Item -ItemType Directory -Force -Path $missionDir | Out-Null
+    $missionPath = Join-Path $missionDir "watchdog-claude-$($lease.leased_work).json"
     $lease.mission_packet | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $missionPath -Encoding UTF8
 
     $prompt = @"
@@ -56,11 +59,13 @@ and finalize the leased node as explored, confirmed, or dead_end.
 Finish by calling complete_work or fail_work for the leased work item.
 Use add_agent_exchange to record claims, evidence, counterarguments, consensus,
 handoffs, or recheck requests for Claude/Codex collaboration.
+When handing work to Codex, call add_agent_exchange with enqueue_recheck=true
+and recheck_provider_hint="codex" so the scheduler creates Codex work.
 
 Prefer Claude strengths: live target exploration, hypothesis generation,
 multi-step chain reasoning, and concise handoff notes. Stay inside the target
 scope described in the mission.
 "@
 
-    claude -p $prompt
+    & $ClaudeCommand --permission-mode bypassPermissions --dangerously-skip-permissions --add-dir (Get-Location).Path -p $prompt
 }
