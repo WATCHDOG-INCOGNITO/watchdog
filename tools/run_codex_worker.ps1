@@ -29,7 +29,7 @@ function Invoke-WatchdogCli {
 }
 
 for ($i = 0; $i -lt $Iterations; $i++) {
-    $leaseRaw = Invoke-WatchdogCli -Tool "lease_node" -Payload @{
+    $leaseRaw = Invoke-WatchdogCli -Tool "lease_work" -Payload @{
         scan_run_id = $ScanRunId
         worker_kind = "codex"
         worker_id = $WorkerId
@@ -41,7 +41,7 @@ for ($i = 0; $i -lt $Iterations; $i++) {
         break
     }
 
-    $missionPath = Join-Path $env:TEMP "watchdog-codex-$($lease.leased_node).json"
+    $missionPath = Join-Path $env:TEMP "watchdog-codex-$($lease.leased_work).json"
     $lease.mission_packet | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $missionPath -Encoding UTF8
 
     $prompt = @"
@@ -53,6 +53,7 @@ $missionPath
 Use watchdog_cli.py through the documented docker exec pattern to gather context,
 record trace entries, push discoveries before testing, store secrets immediately,
 and finalize the leased node as explored, confirmed, or dead_end.
+Finish by calling complete_work or fail_work for the leased work item.
 
 Prefer Codex strengths: source audit, critic/confirmer work, reproducibility checks,
 queue scoring improvements, and report-quality evidence. Do not add yourself as a

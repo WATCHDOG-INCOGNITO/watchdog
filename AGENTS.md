@@ -48,6 +48,11 @@ CLI-only tools include:
 - `record_trace`
 - `scan_next`
 - `lease_node`
+- `lease_work`
+- `complete_work`
+- `fail_work`
+- `block_work`
+- `unblock_work`
 - `validate_node`
 - `scan_selfcheck`
 
@@ -58,9 +63,10 @@ docker cp watchdog_cli.py watchdog-backend-1:/tmp/watchdog_cli.py
 echo '<JSON>' | docker exec -i -e PYTHONPATH=/app -e DJANGO_SETTINGS_MODULE=config.settings watchdog-backend-1 python /tmp/watchdog_cli.py <tool_name>
 ```
 
-External subscription workers use the same CLI state machine. `lease_node`
-atomically assigns one pending node and returns a mission packet; the worker
-must record traces and finalize the node before requesting another lease.
+External subscription workers use the same CLI state machine. Prefer
+`lease_work`, which atomically assigns one WorkItem and returns a mission
+packet; the worker must record traces and call `complete_work` or `fail_work`
+before requesting another lease. `lease_node` remains for compatibility.
 
 ## Operating Model
 

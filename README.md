@@ -112,7 +112,8 @@ Role models can also be configured as provider-qualified strings such as
 `{"provider":"anthropic","model":"claude-sonnet-4-20250514"}`.
 
 Subscription-based Claude Code and Codex sessions can also join a scan as
-external workers through `lease_node`. See [subscription workers](docs/subscription-workers.md).
+external workers through WorkItem leases (`lease_work`). See
+[subscription workers](docs/subscription-workers.md).
 
 
 ## Knowledge Base

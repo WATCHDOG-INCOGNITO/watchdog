@@ -14,26 +14,35 @@ backend should not call that provider API directly.
 
 ## Queue Contract
 
-`lease_node` is the handoff point for external workers:
+`lease_work` is the preferred handoff point for external workers:
 
 ```powershell
 docker cp watchdog_cli.py watchdog-backend-1:/tmp/watchdog_cli.py
 echo '{"scan_run_id":"<RUN_ID>","worker_kind":"codex","worker_id":"codex-local"}' |
   docker exec -i -e PYTHONPATH=/app -e DJANGO_SETTINGS_MODULE=config.settings `
-    watchdog-backend-1 python /tmp/watchdog_cli.py lease_node
+    watchdog-backend-1 python /tmp/watchdog_cli.py lease_work
 ```
 
 The response contains a `mission_packet` with:
 
+- WorkItem identity, work type, objective, preconditions, expected outputs,
+  oracle hint, and provider hint
 - target and node identity
 - queue lane, priority score, provider hint, score breakdown, and lease data
 - required init/work/finalize checklist
 - slot hints when endpoint/vulnerability history exists
-- a finalize contract requiring `record_trace` and a terminal node status
+- a finalize contract requiring `record_trace`, `complete_work` or `fail_work`,
+  and a terminal node status when the WorkItem closes a DiscoveryNode
 
-Workers must finalize leased nodes with `update_node_status` or
-`mark_dead_end`. Leases expire through the same stale recovery window used by
-the Discovery Queue, so interrupted workers can be reclaimed.
+Workers should finalize leased work with `complete_work` or `fail_work`.
+When the work closes a DiscoveryNode, pass `node_status` to `complete_work` or
+also call `update_node_status` / `mark_dead_end`. Leases expire through the
+same stale recovery window used by the Discovery Queue, so interrupted workers
+can be reclaimed.
+
+If a work item is missing a prerequisite such as a credential, token, or
+baseline response, use `block_work`. When the prerequisite is later stored,
+use `unblock_work` so the scheduler can lease it again.
 
 ## Local Runners
 

@@ -45,6 +45,16 @@ from api.storage_service import (
 from api.services import analyze_params, analyze_path, calculate_priority
 from api.llm_trace_store import record_llm_trace as _record_llm_trace
 from api.discovery_queue import build_queue_metadata, node_queue_summary
+from api.work_scheduler import (
+    block_work_item,
+    build_work_mission_packet,
+    complete_work_item,
+    enqueue_work_item,
+    ensure_work_item_for_node,
+    fail_work_item,
+    lease_next_work_item,
+    unblock_work_item,
+)
 from api.mcp_agent import (
     _gather_previous_knowledge,
     _seed_from_previous,
@@ -53,7 +63,7 @@ from api.mcp_agent import (
 
 from api.models import (
     ScanRun, DiscoveryNode, Candidate, Finding, RequestCatalog, LLMTrace,
-    PayloadPattern, VulnerabilityEntry, DeadEnd, TargetProfile,
+    PayloadPattern, VulnerabilityEntry, DeadEnd, TargetProfile, WorkItem,
 )
 
 from django.db import transaction
@@ -297,11 +307,18 @@ def cmd_push_discovery(p):
         )
         if existing:
             _merge_context(existing, ctx)
+            work_info = {}
+            try:
+                work = ensure_work_item_for_node(existing)
+                work_info = {"work_id": str(work.work_id), "work_type": work.work_type}
+            except Exception as e:
+                work_info = {"work_enqueue_error": str(e)}
             _json_out({
                 "node_id": str(existing.node_id),
                 "depth": existing.depth,
                 "node_type": existing.node_type,
                 **node_queue_summary(existing),
+                **work_info,
                 "deduped": True,
                 "context_merged": bool(ctx),
                 "deduped_reason": "same scan+endpoint+vuln_type+node_type already exists",
@@ -353,6 +370,13 @@ def cmd_push_discovery(p):
             },
         )
         result["cand_id"] = str(cand.cand_id)
+
+    try:
+        work = ensure_work_item_for_node(node)
+        result["work_id"] = str(work.work_id)
+        result["work_type"] = work.work_type
+    except Exception as e:
+        result["work_enqueue_error"] = str(e)
 
     _json_out(result)
 
@@ -578,6 +602,12 @@ def cmd_create_root(p):
     run.save(update_fields=["config"])
 
     result = {"root_id": str(node.node_id)}
+    try:
+        work = ensure_work_item_for_node(node)
+        result["work_id"] = str(work.work_id)
+        result["work_type"] = work.work_type
+    except Exception as e:
+        result["work_enqueue_error"] = str(e)
 
     if prev_run_id:
         try:
@@ -1342,6 +1372,29 @@ def _candidate_packet(sr, node, rank, vuln_slot_hints=None):
     return cand
 
 
+def _parse_jsonish(value, default):
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return json.loads(value)
+        except Exception:
+            return default
+    return default
+
+
+def _parse_bool(value, default=True):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
 def cmd_scan_next(p):
     """Priority frontier driver: show the best pending nodes and required actions."""
     sr = ScanRun.objects.get(run_id=p["scan_run_id"])
@@ -1542,6 +1595,174 @@ def cmd_lease_node(p):
     })
 
 
+def _work_mission_with_actions(work):
+    packet = build_work_mission_packet(work)
+    node = work.node
+    actions = _REQUIRED_ACTIONS.get(node.node_type if node else "", {})
+    packet["required_init"] = actions.get("init", [])
+    packet["required_work"] = actions.get("work", [])
+    packet["required_finalize"] = actions.get("finalize", [])
+    return packet
+
+
+def cmd_enqueue_work(p):
+    """Create a WorkItem for a node/candidate/artifact."""
+    sr = ScanRun.objects.get(run_id=p["scan_run_id"])
+    node = None
+    candidate = None
+    if p.get("node_id"):
+        node = DiscoveryNode.objects.get(node_id=p["node_id"], scan_run=sr)
+    if p.get("cand_id") or p.get("candidate_id"):
+        candidate = Candidate.objects.get(cand_id=p.get("cand_id") or p.get("candidate_id"), scan_run=sr)
+
+    context = _parse_jsonish(p.get("context", p.get("context_json")), {})
+    work = enqueue_work_item(
+        sr,
+        work_type=p.get("work_type", "hypothesis_test"),
+        node=node,
+        candidate=candidate,
+        objective=p.get("objective", ""),
+        context=context,
+        priority_score=p.get("priority_score") if p.get("priority_score") not in ("", None) else None,
+        provider_hint=p.get("provider_hint", ""),
+    )
+    _json_out({
+        "action": "ENQUEUED",
+        **build_work_mission_packet(work),
+    })
+
+
+def cmd_lease_work(p):
+    """Atomically lease one WorkItem for a subscription/API worker."""
+    sr = ScanRun.objects.get(run_id=p["scan_run_id"])
+    worker_kind = (p.get("worker_kind") or p.get("provider") or "external").strip().lower()
+    worker_id = p.get("worker_id") or f"{worker_kind}-{os.getpid()}"
+    work = lease_next_work_item(
+        str(sr.run_id),
+        worker_id,
+        worker_kind=worker_kind,
+        queue_lane=p.get("queue_lane", ""),
+        work_type=p.get("work_type", ""),
+    )
+    if work is None:
+        pending = WorkItem.objects.filter(scan_run=sr, status="pending").count()
+        leased = WorkItem.objects.filter(scan_run=sr, status="leased").count()
+        blocked = WorkItem.objects.filter(scan_run=sr, status="blocked").count()
+        _json_out({
+            "action": "WAIT" if pending or leased else "COMPLETE",
+            "scan_run_id": str(sr.run_id),
+            "target_url": sr.target_url,
+            "pending": pending,
+            "leased": leased,
+            "blocked": blocked,
+            "message": "No work item leased. Wait, unblock prerequisites, or run scan_selfcheck/complete_scan.",
+        })
+        return
+
+    _json_out({
+        "action": "LEASED",
+        "worker_id": worker_id,
+        "leased_work": str(work.work_id),
+        "mission_packet": _work_mission_with_actions(work),
+    })
+
+
+def cmd_complete_work(p):
+    result = _parse_jsonish(p.get("result", p.get("result_json")), {})
+    work = complete_work_item(
+        p["work_id"],
+        result=result,
+        node_status=p.get("node_status", ""),
+    )
+    _json_out({
+        "action": "COMPLETED",
+        "work_id": str(work.work_id),
+        "node_id": str(work.node_id) if work.node_id else "",
+        "status": work.status,
+        "node_status": work.node.status if work.node else "",
+    })
+
+
+def cmd_fail_work(p):
+    work = fail_work_item(
+        p["work_id"],
+        error=p.get("error", p.get("reason", "")),
+        retry=_parse_bool(p.get("retry"), True),
+    )
+    node_status = p.get("node_status", "")
+    if work.node and node_status in {"explored", "dead_end", "confirmed"}:
+        work.node.status = node_status
+        work.node.lease_owner = None
+        work.node.leased_until = None
+        work.node.explored_at = timezone.now()
+        work.node.save(update_fields=["status", "lease_owner", "leased_until", "explored_at"])
+    _json_out({
+        "action": "RETRY" if work.status == "pending" else "FAILED",
+        "work_id": str(work.work_id),
+        "status": work.status,
+        "node_status": work.node.status if work.node else "",
+        "attempt_count": work.attempt_count,
+        "max_attempts": work.max_attempts,
+        "last_error": work.last_error,
+        "warning": "" if node_status or work.status == "pending" else "node_status not changed; finalize the DiscoveryNode separately",
+    })
+
+
+def cmd_block_work(p):
+    preconditions = _parse_jsonish(p.get("preconditions"), [])
+    if isinstance(preconditions, str):
+        preconditions = [preconditions]
+    work = block_work_item(
+        p["work_id"],
+        preconditions=preconditions,
+        error=p.get("error", p.get("reason", "")),
+    )
+    _json_out({
+        "action": "BLOCKED",
+        "work_id": str(work.work_id),
+        "status": work.status,
+        "preconditions": work.preconditions,
+    })
+
+
+def cmd_unblock_work(p):
+    work = unblock_work_item(p["work_id"], note=p.get("note", "preconditions satisfied"))
+    _json_out({
+        "action": "UNBLOCKED",
+        "work_id": str(work.work_id),
+        "status": work.status,
+        "preconditions": work.preconditions,
+    })
+
+
+def cmd_list_work(p):
+    qs = WorkItem.objects.filter(scan_run_id=p["scan_run_id"])
+    if p.get("status"):
+        qs = qs.filter(status=p["status"])
+    if p.get("work_type"):
+        qs = qs.filter(work_type=p["work_type"])
+    if p.get("queue_lane"):
+        qs = qs.filter(queue_lane=p["queue_lane"])
+    limit = int(p.get("limit", 30))
+    items = []
+    for work in qs.select_related("node").order_by("-priority_score", "created_at")[:limit]:
+        items.append({
+            "work_id": str(work.work_id),
+            "work_type": work.work_type,
+            "status": work.status,
+            "queue_lane": work.queue_lane,
+            "priority_score": work.priority_score,
+            "provider_hint": work.provider_hint,
+            "node_id": str(work.node_id)[:8] if work.node_id else "",
+            "node_type": work.node.node_type if work.node else "",
+            "endpoint": work.node.endpoint if work.node else "",
+            "objective": work.objective[:180],
+            "attempt_count": work.attempt_count,
+            "preconditions": work.preconditions,
+        })
+    _json_out({"count": len(items), "work_items": items})
+
+
 def cmd_validate_node(p):
     """Validate a node has all required tool calls before finalize."""
     node = DiscoveryNode.objects.get(node_id=p["node_id"])
@@ -1686,6 +1907,17 @@ def cmd_scan_selfcheck(p):
     if open_cands > 0:
         warnings.append(f"{open_cands} candidates still 'open'. Confirm or dismiss them all.")
 
+    work_items = WorkItem.objects.filter(scan_run=sr)
+    pending_work = work_items.filter(status="pending").count()
+    leased_work = work_items.filter(status="leased").count()
+    blocked_work = work_items.filter(status="blocked").count()
+    if pending_work > 0:
+        warnings.append(f"{pending_work} WorkItems still pending. Lease or cancel them before complete_scan.")
+    if leased_work > 0:
+        warnings.append(f"{leased_work} WorkItems still leased. Complete/fail them or wait for stale recovery.")
+    if blocked_work > 0:
+        warnings.append(f"{blocked_work} WorkItems blocked on prerequisites.")
+
     # 11. learn_dead_end check
     learned_de = DeadEnd.objects.filter(target_host__icontains=target_host[:20]).count() if target_host else 0
     if dead_ends and learned_de == 0:
@@ -1714,6 +1946,10 @@ def cmd_scan_selfcheck(p):
             "findings": findings.count(),
             "candidates": cands.count(),
             "open_candidates": open_cands,
+            "work_items": work_items.count(),
+            "work_pending": pending_work,
+            "work_leased": leased_work,
+            "work_blocked": blocked_work,
             "traces": traces,
             "secrets": len(secrets),
             "notes": len(notes),
@@ -1793,6 +2029,13 @@ TOOLS = {
     # Orchestration
     "scan_next":              cmd_scan_next,
     "lease_node":             cmd_lease_node,
+    "enqueue_work":           cmd_enqueue_work,
+    "lease_work":             cmd_lease_work,
+    "complete_work":          cmd_complete_work,
+    "fail_work":              cmd_fail_work,
+    "block_work":             cmd_block_work,
+    "unblock_work":           cmd_unblock_work,
+    "list_work":              cmd_list_work,
     "validate_node":          cmd_validate_node,
     "scan_selfcheck":         cmd_scan_selfcheck,
 }
@@ -1806,8 +2049,8 @@ def cmd_list_tools(_):
 
 
 _TRACE_SKIP_TOOLS = frozenset({
-    "record_trace", "scan_next", "lease_node", "scan_selfcheck", "list_tools",
-    "export_learned", "validate_node",
+    "record_trace", "scan_next", "lease_node", "lease_work", "list_work",
+    "scan_selfcheck", "list_tools", "export_learned", "validate_node",
 })
 
 

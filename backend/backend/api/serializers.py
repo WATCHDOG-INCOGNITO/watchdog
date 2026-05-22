@@ -4,7 +4,7 @@ from .models import (
     FindingEvidenceLink, AgentTask, VerificationLoop, Hypothesis,
     VisualAnalysis, IDORTestSession, WAFBypassAttempt,
     VulnerabilityEntry, PayloadPattern, ReportArchive,
-    DiscoveryNode,
+    DiscoveryNode, WorkItem,
 )
 
 
@@ -127,8 +127,17 @@ class DiscoveryNodeSerializer(serializers.ModelSerializer):
             "node_id", "parent", "depth", "node_type",
             "endpoint", "vuln_type", "summary", "context",
             "status", "worker_id", "created_at", "explored_at",
+            "queue_lane", "priority_score", "provider_hint",
+            "lease_owner", "leased_until", "attempt_count",
             "children_count",
         ]
 
     def get_children_count(self, obj):
         return obj._children_count if hasattr(obj, "_children_count") else 0
+
+
+class WorkItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = WorkItem
+        fields = "__all__"
+        read_only_fields = ["work_id", "created_at", "updated_at", "completed_at"]

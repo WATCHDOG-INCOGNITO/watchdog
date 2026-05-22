@@ -30,6 +30,33 @@ PROVIDER_HINTS_BY_LANE = {
     "report": "codex",
 }
 
+WORK_TYPE_BY_NODE_TYPE = {
+    "target": "recon",
+    "endpoint": "endpoint_analysis",
+    "vuln": "hypothesis_test",
+    "clue": "hypothesis_test",
+    "exploit_step": "chain",
+    "flag": "proof",
+    "dead_end": "report",
+}
+
+QUEUE_LANE_BY_WORK_TYPE = {
+    "recon": "recon",
+    "endpoint_analysis": "endpoint",
+    "hypothesis_test": "hypothesis",
+    "proof": "proof",
+    "chain": "chain",
+    "recheck": "recheck",
+    "report": "report",
+}
+
+ORACLE_BY_WORK_TYPE = {
+    "hypothesis_test": "best_available_oracle",
+    "proof": "deterministic_replay",
+    "chain": "chain_progress_oracle",
+    "recheck": "deterministic_replay",
+}
+
 BASE_SCORE_BY_TYPE = {
     "target": 0.35,
     "endpoint": 0.45,
@@ -74,6 +101,12 @@ def default_queue_lane(node_type: str, context: dict[str, Any] | None = None) ->
     context = context or {}
     lane = str(context.get("queue_lane") or context.get("lane") or "").strip().lower()
     return lane or QUEUE_LANES_BY_TYPE.get(node_type, "hypothesis")
+
+
+def default_work_type(node_type: str, context: dict[str, Any] | None = None) -> str:
+    context = context or {}
+    explicit = str(context.get("work_type") or "").strip().lower()
+    return explicit or WORK_TYPE_BY_NODE_TYPE.get(node_type, "hypothesis_test")
 
 
 def default_provider_hint(queue_lane: str, node_type: str, context: dict[str, Any] | None = None) -> str:
@@ -140,6 +173,78 @@ def build_queue_metadata(
     }
 
 
+def build_work_item_metadata(
+    *,
+    node_type: str,
+    work_type: str = "",
+    vuln_type: str = "",
+    endpoint: str = "",
+    context: dict[str, Any] | None = None,
+    depth: int = 0,
+    parent_status: str = "",
+) -> dict[str, Any]:
+    context = context or {}
+    selected_work_type = work_type or default_work_type(node_type, context)
+    queue_lane = QUEUE_LANE_BY_WORK_TYPE.get(selected_work_type) or default_queue_lane(node_type, context)
+    preconditions = context.get("preconditions") or context.get("blocked_by") or []
+    if isinstance(preconditions, str):
+        preconditions = [preconditions] if preconditions else []
+    score_context = {**context, "queue_lane": queue_lane}
+    if preconditions and not score_context.get("blocked_by"):
+        score_context["blocked_by"] = preconditions
+    queue_meta = build_queue_metadata(
+        node_type=node_type,
+        vuln_type=vuln_type,
+        context=score_context,
+        depth=depth,
+        parent_status=parent_status,
+    )
+
+    expected_outputs = context.get("expected_outputs")
+    if expected_outputs is None:
+        expected_outputs = {
+            "recon": ["endpoint", "scan_note", "target_profile"],
+            "endpoint_analysis": ["candidate", "vuln_node", "endpoint_spec"],
+            "hypothesis_test": ["evidence", "candidate_verdict", "dead_end"],
+            "proof": ["finding", "evidence_bundle", "secret_if_present"],
+            "chain": ["exploit_step", "secret", "flag_node"],
+            "recheck": ["verdict", "evidence_bundle"],
+            "report": ["report_item", "kb_update"],
+        }.get(selected_work_type, ["trace", "node_status"])
+
+    return {
+        "work_type": selected_work_type,
+        "queue_lane": queue_lane,
+        "priority_score": queue_meta["priority_score"],
+        "score_breakdown": queue_meta["score_breakdown"],
+        "provider_hint": queue_meta["provider_hint"],
+        "preconditions": preconditions,
+        "expected_outputs": expected_outputs,
+        "oracle": context.get("oracle") or ORACLE_BY_WORK_TYPE.get(selected_work_type, ""),
+        "objective": context.get("objective") or queue_meta["mission"]["objective"],
+        "diversity_key": build_diversity_key(
+            work_type=selected_work_type,
+            endpoint=endpoint,
+            vuln_type=vuln_type,
+            context=context,
+        ),
+        "mission": queue_meta["mission"],
+    }
+
+
+def build_diversity_key(
+    *,
+    work_type: str,
+    endpoint: str = "",
+    vuln_type: str = "",
+    context: dict[str, Any] | None = None,
+) -> str:
+    context = context or {}
+    technique = context.get("technique") or context.get("sub_technique") or context.get("pattern_id") or ""
+    pieces = [work_type, endpoint or "-", vuln_type or "-", str(technique or "-")]
+    return ":".join(piece.strip().lower()[:160] for piece in pieces)
+
+
 def build_mission(*, node_type: str, queue_lane: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
     context = context or {}
     objective_by_type = {
@@ -176,4 +281,32 @@ def node_queue_summary(node: Any) -> dict[str, Any]:
         "lease_owner": getattr(node, "lease_owner", "") or "",
         "leased_until": leased_until,
         "mission": getattr(node, "mission", None) or {},
+    }
+
+
+def work_item_summary(work: Any) -> dict[str, Any]:
+    leased_until = getattr(work, "leased_until", None)
+    if hasattr(leased_until, "isoformat"):
+        leased_until = leased_until.isoformat()
+    completed_at = getattr(work, "completed_at", None)
+    if hasattr(completed_at, "isoformat"):
+        completed_at = completed_at.isoformat()
+    return {
+        "work_id": str(getattr(work, "work_id", "")),
+        "work_type": getattr(work, "work_type", "") or "",
+        "status": getattr(work, "status", "") or "",
+        "queue_lane": getattr(work, "queue_lane", "") or "",
+        "priority_score": getattr(work, "priority_score", 0.0) or 0.0,
+        "provider_hint": getattr(work, "provider_hint", "") or "",
+        "preconditions": getattr(work, "preconditions", None) or [],
+        "expected_outputs": getattr(work, "expected_outputs", None) or [],
+        "oracle": getattr(work, "oracle", "") or "",
+        "diversity_key": getattr(work, "diversity_key", "") or "",
+        "attempt_count": getattr(work, "attempt_count", 0) or 0,
+        "max_attempts": getattr(work, "max_attempts", 0) or 0,
+        "lease_owner": getattr(work, "lease_owner", "") or "",
+        "leased_until": leased_until,
+        "completed_at": completed_at,
+        "last_error": getattr(work, "last_error", "") or "",
+        "score_breakdown": getattr(work, "score_breakdown", None) or {},
     }

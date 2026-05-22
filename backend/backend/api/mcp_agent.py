@@ -40,6 +40,7 @@ for _p in _app_paths:
 
 from .error_utils import summarize_exception  # noqa: E402
 from .discovery_queue import build_queue_metadata  # noqa: E402
+from .work_scheduler import ensure_work_item_for_node  # noqa: E402
 from .guardrail_enforcer import guardrail_decision as shared_guardrail_decision  # noqa: E402
 from .llm_provider import (  # noqa: E402
     DEFAULT_PROVIDER,
@@ -1550,7 +1551,7 @@ def _auto_push_discovered_links(
                 "source": "auto_link_extraction",
                 "http_tool": tool_name,
             }
-            DiscoveryNode.objects.create(
+            node = DiscoveryNode.objects.create(
                 scan_run_id=scan_run_id,
                 parent=parent_node,
                 depth=parent_depth + 1,
@@ -1567,6 +1568,7 @@ def _auto_push_discovered_links(
                     parent_status=parent_node.status if parent_node else "",
                 ),
             )
+            ensure_work_item_for_node(node)
             pushed += 1
         except Exception:
             pass
@@ -1597,7 +1599,7 @@ def _auto_push_discovered_links(
                 "http_tool": tool_name,
                 "needs_browser": True,
             }
-            DiscoveryNode.objects.create(
+            node = DiscoveryNode.objects.create(
                 scan_run_id=scan_run_id,
                 parent=parent_node,
                 depth=parent_depth + 1,
@@ -1614,6 +1616,7 @@ def _auto_push_discovered_links(
                     parent_status=parent_node.status if parent_node else "",
                 ),
             )
+            ensure_work_item_for_node(node)
             pushed += 1
         except Exception:
             pass
@@ -4111,6 +4114,11 @@ def _seed_from_previous(scan_run, root_node, prev_knowledge: dict) -> dict:
         )
         id_map[prev.node_id] = new_node
         _seeded_key_to_node[seed_key] = new_node
+        if new_status == "pending":
+            try:
+                ensure_work_item_for_node(new_node)
+            except Exception:
+                pass
 
         if prev.node_type == "endpoint":
             counts["endpoints"] += 1
@@ -4302,6 +4310,7 @@ async def _run_discovery_loop(
         status="pending",
         **build_queue_metadata(node_type="target", context=root_context, depth=0),
     )
+    await sync_to_async(ensure_work_item_for_node)(root_node)
 
     # Store root_node_id in config so _auto_push_discovered_links can access it
     cfg = dict(scan_run.config or {})

@@ -572,6 +572,77 @@ class DiscoveryNode(models.Model):
             models.Index(fields=["scan_run", "queue_lane", "status", "-priority_score"]),
         ]
 
+
+class WorkItem(models.Model):
+    """Action queue item derived from artifacts such as DiscoveryNode.
+
+    DiscoveryNode remains the audit/chain graph. WorkItem is the schedulable
+    unit that a Claude, Codex, or deterministic worker leases and finalizes.
+    """
+
+    class WorkType(models.TextChoices):
+        RECON = "recon"
+        ENDPOINT_ANALYSIS = "endpoint_analysis"
+        HYPOTHESIS_TEST = "hypothesis_test"
+        PROOF = "proof"
+        CHAIN = "chain"
+        RECHECK = "recheck"
+        REPORT = "report"
+
+    class Status(models.TextChoices):
+        PENDING = "pending"
+        LEASED = "leased"
+        DONE = "done"
+        FAILED = "failed"
+        BLOCKED = "blocked"
+        CANCELLED = "cancelled"
+        EXPIRED = "expired"
+
+    work_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan_run = models.ForeignKey(ScanRun, on_delete=models.CASCADE, related_name="work_items")
+    node = models.ForeignKey(
+        DiscoveryNode, on_delete=models.CASCADE, null=True, blank=True, related_name="work_items",
+    )
+    candidate = models.ForeignKey(
+        Candidate, on_delete=models.SET_NULL, null=True, blank=True, related_name="work_items",
+    )
+
+    work_type = models.CharField(max_length=32, choices=WorkType.choices)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    queue_lane = models.CharField(max_length=32, default="hypothesis", blank=True)
+    objective = models.TextField(blank=True, default="")
+    context = models.JSONField(default=dict, blank=True)
+    result = models.JSONField(default=dict, blank=True)
+
+    preconditions = models.JSONField(default=list, blank=True)
+    expected_outputs = models.JSONField(default=list, blank=True)
+    oracle = models.CharField(max_length=64, default="", blank=True)
+    provider_hint = models.CharField(max_length=32, default="", blank=True)
+    diversity_key = models.CharField(max_length=512, default="", blank=True)
+
+    priority_score = models.FloatField(default=0.0)
+    score_breakdown = models.JSONField(default=dict, blank=True)
+    lease_owner = models.CharField(max_length=128, null=True, blank=True)
+    leased_until = models.DateTimeField(null=True, blank=True)
+    attempt_count = models.IntegerField(default=0)
+    max_attempts = models.IntegerField(default=3)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.TextField(blank=True, default="")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "work_items"
+        indexes = [
+            models.Index(fields=["scan_run", "status", "-priority_score", "created_at"]),
+            models.Index(fields=["scan_run", "queue_lane", "status", "-priority_score"]),
+            models.Index(fields=["scan_run", "work_type", "status", "-priority_score"]),
+            models.Index(fields=["scan_run", "diversity_key"]),
+        ]
+
+
 class ReportArchive(models.Model):
     class ValidationStatus(models.TextChoices):
         UNVERIFIED = "unverified"

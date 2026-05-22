@@ -17,6 +17,7 @@ import os
 from datetime import timedelta
 
 from api.discovery_queue import build_queue_metadata, node_queue_summary
+from api.work_scheduler import ensure_work_item_for_node
 
 DISCOVERY_MAX_DEPTH = int(os.environ.get("WATCHDOG_DISCOVERY_MAX_DEPTH", "50"))
 DISCOVERY_MAX_NODES = int(os.environ.get("WATCHDOG_DISCOVERY_MAX_NODES", "1000"))
@@ -497,11 +498,18 @@ def register(mcp):
             if existing:
                 # Merge new context into existing node (accumulate methods, sources)
                 _merge_context(existing, ctx)
+                work_info = {}
+                try:
+                    work = ensure_work_item_for_node(existing)
+                    work_info = {"work_id": str(work.work_id), "work_type": work.work_type}
+                except Exception as e:
+                    work_info = {"work_enqueue_error": str(e)}
                 return json.dumps({
                     "node_id": str(existing.node_id),
                     "depth": existing.depth,
                     "node_type": existing.node_type,
                     **node_queue_summary(existing),
+                    **work_info,
                     "deduped": True,
                     "context_merged": bool(ctx),
                     "deduped_reason": "same scan+endpoint+vuln_type+node_type already exists",
@@ -559,6 +567,12 @@ def register(mcp):
         }
         if cand_id:
             result["cand_id"] = str(cand_id)
+        try:
+            work = ensure_work_item_for_node(node)
+            result["work_id"] = str(work.work_id)
+            result["work_type"] = work.work_type
+        except Exception as e:
+            logger.warning(f"auto enqueue work item failed for node {node.node_id}: {e}")
         return json.dumps(result)
 
     @mcp.tool()
