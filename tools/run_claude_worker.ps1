@@ -4,7 +4,7 @@ param(
 
     [int]$Iterations = 1,
     [string]$WorkerId = "",
-    [string]$ClaudeModel = "claude-opus-4-7",
+    [string]$ClaudeModel = "opus",
     [string]$ClaudeCommand = "claude",
     [string]$BackendContainer = "watchdog-backend-1"
 )

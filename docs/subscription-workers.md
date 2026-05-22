@@ -88,11 +88,11 @@ Codex worker:
 Claude worker:
 
 ```powershell
-.\tools\run_claude_worker.ps1 -ScanRunId <RUN_ID> -Iterations 1 -ClaudeModel claude-opus-4-7
+.\tools\run_claude_worker.ps1 -ScanRunId <RUN_ID> -Iterations 1 -ClaudeModel opus
 ```
 
 These high-performance defaults are intentionally expensive: Codex uses
-`gpt-5.5`, and Claude uses `claude-opus-4-7` with maximum effort. Override the
+`gpt-5.5`, and Claude uses the latest `opus` alias with maximum effort. Override the
 model parameters only when a lower-cost or compatibility run is needed.
 
 Recommended role split:

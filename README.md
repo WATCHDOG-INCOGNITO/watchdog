@@ -108,11 +108,11 @@ curl -X POST http://localhost:8000/api/scan-runs/ \
 - `Advanced Settings`: You can customize the model for each discovery role individually.
 
 Role models can also be configured as provider-qualified strings such as
-`anthropic:claude-opus-4-7` or `openai:gpt-5.5`, or as objects like
-`{"provider":"anthropic","model":"claude-opus-4-7"}`.
+`anthropic:claude-opus-4-1-20250805` or `openai:gpt-5.5`, or as objects like
+`{"provider":"anthropic","model":"claude-opus-4-1-20250805"}`.
 
 For high-performance bug bounty runs, keep exploit, hypothesis, and route
-reasoning on `claude-opus-4-7`, and use `openai:gpt-5.5` for Codex-style
+reasoning on Claude Opus, and use `openai:gpt-5.5` for Codex-style
 critic, confirmer, source-audit, and report-quality review work.
 
 Subscription-based Claude Code and Codex sessions can also join a scan as
